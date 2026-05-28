@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.15
+// @version      3.16
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.15';
+    const VERSION   = '3.16';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -653,6 +653,13 @@
             ? new Map(contractDataList.map(cd => [(cd.meta && cd.meta.ref) || '', (cd.meta && cd.meta.site) || '']))
             : null;
 
+        // Contract URL map — links PM numbers in the table back to Joblogic
+        const contractUrlMap = new Map(
+            contractDataList
+                .filter(cd => cd.id)
+                .map(cd => [(cd.meta && cd.meta.ref) || '', `https://go.joblogic.com/PPMContract/Detail/${cd.id}`])
+        );
+
         // Month header cells
         const monthHeaders = sortedMonths.map(mk => {
             const isCur = mk === thisMonthKey;
@@ -680,7 +687,14 @@
             </tr>`;
 
             for (const row of catRows) {
-                const rowSite = showSite ? (contractSiteMap.get(row.contractRef) || '') : '';
+                const rowSite    = showSite ? (contractSiteMap.get(row.contractRef) || '') : '';
+                const contractUrl = contractUrlMap.get(row.contractRef) || null;
+                const refLabel    = contractUrl
+                    ? `<a href="${esc(contractUrl)}" target="_blank"
+                          style="color:inherit;text-decoration:underline;text-underline-offset:2px;
+                                 text-decoration-color:rgba(15,35,71,0.35);"
+                          title="Open ${esc(row.contractRef)} in Joblogic">${esc(row.contractRef)}</a>`
+                    : esc(row.contractRef);
                 tableRows += `<tr>
                     <td style="position:sticky;left:0;z-index:10;background:#fff;
                         font-size:10px;font-weight:700;color:#0f2347;
@@ -689,7 +703,7 @@
                         border-right:1px solid #e2e8f0;
                         border-bottom:1px solid #f1f5f9;
                         white-space:nowrap;overflow:hidden;width:90px;text-overflow:ellipsis;"
-                        title="${esc(row.contractRef)}${cpoContractRefs.has(row.contractRef) ? ' · Has Contract PO' : ''}${row.type === 'empty' ? ' · No visits or CPOs recorded' : ''}">${esc(row.contractRef)}${cpoContractRefs.has(row.contractRef) ? '<span style="display:inline-block;background:#f59e0b;color:#78350f;font-size:7px;font-weight:800;letter-spacing:0.06em;padding:1px 4px;border-radius:3px;vertical-align:middle;margin-left:3px;line-height:1.4;">CPO</span>' : ''}${row.type === 'empty' ? '<span style="display:inline-block;background:#fee2e2;color:#dc2626;font-size:10px;padding:0 3px;border-radius:3px;vertical-align:middle;margin-left:3px;line-height:1.5;" title="No visits or CPOs recorded">⚠</span>' : ''}</td>
+                        title="${esc(row.contractRef)}${cpoContractRefs.has(row.contractRef) ? ' · Has Contract PO' : ''}${row.type === 'empty' ? ' · No visits or CPOs recorded' : ''}">${refLabel}${cpoContractRefs.has(row.contractRef) ? '<span style="display:inline-block;background:#f59e0b;color:#78350f;font-size:7px;font-weight:800;letter-spacing:0.06em;padding:1px 4px;border-radius:3px;vertical-align:middle;margin-left:3px;line-height:1.4;">CPO</span>' : ''}${row.type === 'empty' ? '<span style="display:inline-block;background:#fee2e2;color:#dc2626;font-size:10px;padding:0 3px;border-radius:3px;vertical-align:middle;margin-left:3px;line-height:1.5;" title="No visits or CPOs recorded">⚠</span>' : ''}</td>
                     ${showSite ? `<td style="position:sticky;left:90px;z-index:10;background:#fff;
                         font-size:10px;font-weight:400;color:#475569;
                         padding:6px 8px;
@@ -1379,7 +1393,7 @@
 
         const contractDataList = st.contracts
             .filter(c => c.visited)
-            .map(c => ({ meta: c.meta || { ref: c.ref, site: c.site, customer: c.customer }, visits: c.visits, pos: c.pos || [] }));
+            .map(c => ({ id: c.id, meta: c.meta || { ref: c.ref, site: c.site, customer: c.customer }, visits: c.visits, pos: c.pos || [] }));
 
         if (!contractDataList.length) {
             setStatus('No visit data collected — check that the contracts have visits loaded.');
