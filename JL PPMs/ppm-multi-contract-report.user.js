@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.21
+// @version      3.22
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.21';
+    const VERSION   = '3.22';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -81,7 +81,19 @@
     }
 
     // ─── Persistent state ─────────────────────────────────────────────────────
-    function loadState()  { try { return JSON.parse(localStorage.getItem(STATE_KEY) || 'null'); } catch { return null; } }
+    function loadState() {
+        try {
+            const s = JSON.parse(localStorage.getItem(STATE_KEY) || 'null');
+            // State from a different script version may have a different schema.
+            // Discard it silently so stale state never causes a hang or crash.
+            if (s && s.stateVersion !== VERSION) {
+                console.warn(`[PPM-Multi] Discarding state from v${s.stateVersion || '?'} (current v${VERSION})`);
+                localStorage.removeItem(STATE_KEY);
+                return null;
+            }
+            return s;
+        } catch { return null; }
+    }
     function saveState(s) { try { localStorage.setItem(STATE_KEY, JSON.stringify(s)); } catch {} }
     function clearState() { localStorage.removeItem(STATE_KEY); }
 
@@ -595,16 +607,20 @@
             };
         }
 
-        // Fill every month between the earliest and latest so the table has no gaps —
-        // months with no visits show as blank calendar cells rather than missing columns
+        // Fill every month between the earliest and latest so the table has no gaps.
+        // Cap at 60 consecutive months to prevent far-future CPO dates or old historical
+        // visits from creating a table with hundreds of empty columns (which is slow to
+        // render). Months with actual data are always present regardless of the cap —
+        // they were added to monthSet during visit/CPO collection above.
         {
-            const existing  = [...monthSet].sort();
-            const [sy, sm]  = existing[0].split('-').map(Number);
-            const [ey, em]  = existing[existing.length - 1].split('-').map(Number);
-            let y = sy, m = sm;
-            while (y < ey || (y === ey && m <= em)) {
+            const existing = [...monthSet].sort();
+            const [sy, sm] = existing[0].split('-').map(Number);
+            const [ey, em] = existing[existing.length - 1].split('-').map(Number);
+            let y = sy, m = sm, filled = 0;
+            while ((y < ey || (y === ey && m <= em)) && filled < 60) {
                 monthSet.add(`${y}-${String(m).padStart(2, '0')}`);
                 m++; if (m > 12) { m = 1; y++; }
+                filled++;
             }
         }
 
@@ -1457,7 +1473,15 @@
             return;
         }
 
-        const html = generateFullReport(contractDataList, st.reportTitle || 'PPM Service Report');
+        let html;
+        try {
+            html = generateFullReport(contractDataList, st.reportTitle || 'PPM Service Report');
+        } catch (e) {
+            ppmWarn('[PPM-Multi] generateFullReport error:', e.message, e.stack || '');
+            setStatus(`⚠ Report generation failed: ${e.message}. Try Reset and run again.`);
+            return;
+        }
+
         const win  = window.open('', '_blank');
         if (!win) {
             setStatus('Pop-up blocked — allow pop-ups for go.joblogic.com and click the button again.');
@@ -1601,6 +1625,7 @@
 
             const st = {
                 phase:        'visiting',
+                stateVersion: VERSION,
                 reportTitle:  titleInput.value.trim() || 'PPM Service Report',
                 contracts:    contracts.map(c => ({ ...c, visited: false, error: null, visits: [], pos: [], meta: null })),
                 currentIndex: 0,
