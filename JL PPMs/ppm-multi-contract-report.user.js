@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.19
+// @version      3.21
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.19';
+    const VERSION   = '3.21';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -469,7 +469,7 @@
                 ? `<a href="${esc(v.jobUrl)}" target="_blank" style="text-decoration:none;line-height:0;" title="Open job — ${cfg.label} · ${v.day}">${inner}</a>`
                 : inner;
         }).join('');
-        return `<td style="background:${bg};border:1px solid #f1f5f9;padding:5px 3px;` +
+        return `<td class="mcol" style="background:${bg};border:1px solid #f1f5f9;padding:5px 3px;` +
             `vertical-align:middle;min-width:66px;` +
             `${isCur ? 'outline:2px solid #0097A7;outline-offset:-2px;' : ''}">` +
             `<div style="display:flex;flex-wrap:wrap;gap:2px;justify-content:center;align-items:center;">` +
@@ -610,6 +610,11 @@
 
         const sortedMonths = [...monthSet].sort();
 
+        // Months where no row has any visit or CPO dot — used to drive the "hide blank" toggle
+        const blankMonths = new Set(
+            sortedMonths.filter(mk => !rows.some(r => r.months[mk] && r.months[mk].visits.length > 0))
+        );
+
         // Group rows by category — PO rows now use the contract description's category,
         // so CAT_PO no longer needs its own section (it's a fallback only)
         const allCatDefs = [...CAT_RULES, CAT_GENERAL, CAT_PO];
@@ -680,8 +685,9 @@
 
         // Month header cells
         const monthHeaders = sortedMonths.map(mk => {
-            const isCur = mk === thisMonthKey;
-            return `<th style="background:${isCur ? '#162040' : '#09152b'};` +
+            const isCur  = mk === thisMonthKey;
+            const blankC = blankMonths.has(mk) ? ' m-blank' : '';
+            return `<th class="mcol${blankC}" style="background:${isCur ? '#162040' : '#09152b'};` +
                 `color:${isCur ? '#93c5fd' : '#c0cfe0'};` +
                 `font-size:10px;font-weight:600;padding:9px 4px;text-align:center;min-width:66px;` +
                 `border-left:1px solid #1a2e4a;border-bottom:2px solid #1a2e4a;white-space:nowrap;">` +
@@ -701,7 +707,7 @@
                     font-size:8px;font-weight:800;letter-spacing:0.14em;text-transform:uppercase;
                     padding:5px 14px;border-top:2px solid ${cat.accent};
                     border-right:1px solid ${cat.border};border-bottom:1px solid ${cat.border};">${esc(cat.name)}</td>
-                ${sortedMonths.map(() => `<td style="background:${cat.bg};border-top:2px solid ${cat.accent};border-bottom:1px solid ${cat.border};border-left:1px solid ${cat.border};min-width:66px;"></td>`).join('')}
+                ${sortedMonths.map(mk => `<td class="mcol${blankMonths.has(mk) ? ' m-blank' : ''}" style="background:${cat.bg};border-top:2px solid ${cat.accent};border-bottom:1px solid ${cat.border};border-left:1px solid ${cat.border};min-width:66px;"></td>`).join('')}
             </tr>`;
 
             for (const row of catRows) {
@@ -757,7 +763,7 @@
                         title="${row.description ? esc(row.description) : (row.type === 'empty' ? 'No visits or CPOs recorded' : '')}">${svcHtml}</td>
                     ${sortedMonths.map(mk => row.months[mk]
                         ? renderCell(mk, row.months[mk], thisMonthKey)
-                        : `<td style="background:#f8fafc;border:1px solid #f1f5f9;min-width:66px;"></td>`
+                        : `<td class="mcol${blankMonths.has(mk) ? ' m-blank' : ''}" style="background:#f8fafc;border:1px solid #f1f5f9;min-width:66px;"></td>`
                     ).join('')}
                 </tr>`;
             }
@@ -794,6 +800,17 @@
     function generateFullReport(contractDataList, reportTitle = 'PPM Service Report') {
         const today   = new Date(); today.setHours(0,0,0,0);
         const genDate = today.toLocaleDateString('en-GB', { day:'numeric', month:'long', year:'numeric' });
+
+        // Stat box — font size and width scale with the number so 3-digit values
+        // don't overflow their containers and bleed into neighbouring stats.
+        const statBox = (n, l, c) => {
+            const fs = n >= 1000 ? '19px' : n >= 100 ? '22px' : '26px';
+            const w  = n >= 1000 ? '64px' : n >= 100 ? '56px' : '52px';
+            return `<div style="text-align:center;width:${w};flex-shrink:0;">` +
+                `<div style="font-family:'Syne',sans-serif;font-size:${fs};font-weight:800;color:${c};line-height:1;">${n}</div>` +
+                `<div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">${l}</div>` +
+                `</div>`;
+        };
 
         const { tableHtml, total, complete, overdue, upcoming, pct, pctColor,
                 mTotal, mComplete, mOverdue, mUpcoming, mPct, thisMonthName } =
@@ -869,11 +886,8 @@
             <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;">
               ${[{n:total,l:'Visits',c:'#e2e8f0'},{n:complete,l:'Complete',c:'#4ade80'},
                  {n:overdue,l:'Overdue',c:'#f87171'},{n:upcoming,l:'Upcoming',c:'#7dd3fc'}]
-                .map(({n,l,c}) => `<div style="text-align:center;width:52px;flex-shrink:0;">
-                  <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:${c};line-height:1;">${n}</div>
-                  <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">${l}</div>
-                </div>`).join('')}
-              <div style="text-align:center;width:60px;flex-shrink:0;
+                .map(({n,l,c}) => statBox(n,l,c)).join('')}
+              <div style="text-align:center;min-width:60px;flex-shrink:0;
                   border-left:1px solid rgba(255,255,255,0.08);padding-left:12px;">
                 <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:${pctColor};line-height:1;">${pct}%</div>
                 <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">Done</div>
@@ -889,11 +903,8 @@
             <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;">
               ${[{n:mTotal,l:'Visits',c:'#e2e8f0'},{n:mComplete,l:'Complete',c:'#4ade80'},
                  {n:mOverdue,l:'Overdue',c:'#f87171'},{n:mUpcoming,l:'Upcoming',c:'#7dd3fc'}]
-                .map(({n,l,c}) => `<div style="text-align:center;width:52px;flex-shrink:0;">
-                  <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:${c};line-height:1;">${n}</div>
-                  <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">${l}</div>
-                </div>`).join('')}
-              <div style="text-align:center;width:60px;flex-shrink:0;
+                .map(({n,l,c}) => statBox(n,l,c)).join('')}
+              <div style="text-align:center;min-width:60px;flex-shrink:0;
                   border-left:1px solid rgba(255,255,255,0.08);padding-left:12px;">
                 <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:#0097A7;line-height:1;">${mPct}%</div>
                 <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">Done</div>
@@ -912,9 +923,21 @@
       display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;
       margin-bottom:20px;">
     <div style="display:flex;gap:16px;flex-wrap:wrap;">${legendItems}</div>
-    <span style="font-size:9.5px;color:rgba(255,255,255,0.25);">
-      Dot = one visit &nbsp;·&nbsp; Multiple dots = multiple visits in that month
-    </span>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      <span style="font-size:9.5px;color:rgba(255,255,255,0.25);">
+        Dot = one visit &nbsp;·&nbsp; Multiple dots = multiple visits in that month
+      </span>
+      ${blankMonths.size > 0 ? `<button id="hide-blank-btn" class="no-print"
+        onclick="(function(btn){
+          var hiding = btn.getAttribute('data-h') !== '1';
+          btn.setAttribute('data-h', hiding ? '1' : '0');
+          btn.textContent = hiding ? 'Show blank months' : 'Hide blank months (' + ${blankMonths.size} + ')';
+          document.querySelectorAll('.m-blank').forEach(function(el){ el.style.display = hiding ? 'none' : ''; });
+        })(this)"
+        style="padding:4px 11px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);
+          border-radius:5px;color:#94a3b8;font-size:10px;cursor:pointer;font-family:inherit;white-space:nowrap;">
+        Hide blank months (${blankMonths.size})</button>` : ''}
+    </div>
   </div>
 
   <!-- ── COMBINED MATRIX ── -->
