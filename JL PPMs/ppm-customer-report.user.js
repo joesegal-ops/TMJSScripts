@@ -2,8 +2,8 @@
 // @name         JL: PPM Contract Customer Report
 // @namespace    https://go.joblogic.com/
 // @version      4.0
-// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/ppm-customer-report.user.js
-// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/ppm-customer-report.user.js
+// @downloadURL https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-customer-report.user.js
+// @updateURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-customer-report.user.js
 // @description  Generate a branded Untitled Projects PPM matrix report — services as rows, months as columns, colour-coded completion status. Share with the customer monthly.
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
