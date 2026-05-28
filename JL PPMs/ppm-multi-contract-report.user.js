@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.18
+// @version      3.19
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.18';
+    const VERSION   = '3.19';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -595,6 +595,19 @@
             };
         }
 
+        // Fill every month between the earliest and latest so the table has no gaps —
+        // months with no visits show as blank calendar cells rather than missing columns
+        {
+            const existing  = [...monthSet].sort();
+            const [sy, sm]  = existing[0].split('-').map(Number);
+            const [ey, em]  = existing[existing.length - 1].split('-').map(Number);
+            let y = sy, m = sm;
+            while (y < ey || (y === ey && m <= em)) {
+                monthSet.add(`${y}-${String(m).padStart(2, '0')}`);
+                m++; if (m > 12) { m = 1; y++; }
+            }
+        }
+
         const sortedMonths = [...monthSet].sort();
 
         // Group rows by category — PO rows now use the contract description's category,
@@ -819,7 +832,7 @@
 
   <!-- ── MASTER HEADER ── -->
   <div style="background:linear-gradient(135deg,#09152b 0%,#0f2347 100%);
-      border-radius:10px 10px 0 0;padding:22px 28px 16px;margin-bottom:0;">
+      border-radius:10px 10px 0 0;padding:22px 44px 16px 28px;margin-bottom:0;">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap;">
 
       <!-- Title block -->
@@ -845,7 +858,7 @@
       </div>
 
       <!-- Stat blocks -->
-      <div style="display:flex;align-items:flex-start;gap:28px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:flex-start;gap:28px;flex-wrap:wrap;flex-shrink:0;">
 
         <div style="display:flex;flex-direction:column;gap:16px;">
 
