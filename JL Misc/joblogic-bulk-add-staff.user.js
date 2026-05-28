@@ -1,0 +1,316 @@
+// ==UserScript==
+// @name         JL Bulk Add Staff
+// @namespace    https://up-fm.com
+// @version      1.3
+// @description  Bulk-add staff to Joblogic by pasting Name/Email/Role from Google Sheets
+// @match        https://go.joblogic.com/Staff*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const VERSION    = '1.3';
+  const QUEUE_KEY  = 'jl_bs_queue';
+  const DONE_KEY   = 'jl_bs_done';
+  const FAILED_KEY = 'jl_bs_failed';
+  const PROC_KEY   = 'jl_bs_processing';
+
+  // Fields that mapDetails() serialises but we don't fill — must be '' not undefined
+  const BLANK_FIELDS = ['Mobile','FullMobile','Telephone','FullTelephone',
+                        'Address1','Address2','Address3','Address4',
+                        'PostCode','OtherInformation','Reference'];
+
+  // ── storage helpers ──────────────────────────────────────────────────────
+  function load(key, fallback) {
+    try { return JSON.parse(sessionStorage.getItem(key) ?? 'null') ?? fallback; }
+    catch { return fallback; }
+  }
+  function save(key, val) { sessionStorage.setItem(key, JSON.stringify(val)); }
+  function clear() {
+    [QUEUE_KEY, DONE_KEY, FAILED_KEY, PROC_KEY].forEach(k => sessionStorage.removeItem(k));
+  }
+
+  function waitFor(fn, timeout = 10000, interval = 150) {
+    return new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      const id = setInterval(() => {
+        const v = fn();
+        if (v) { clearInterval(id); resolve(v); }
+        else if (Date.now() - t0 > timeout) { clearInterval(id); reject(new Error('timeout')); }
+      }, interval);
+    });
+  }
+
+  // ── route dispatch ───────────────────────────────────────────────────────
+  const path = location.pathname;
+
+  if (path === '/Staff/CreateUser') return handleCreatePage();
+  if (/^\/Staff\/Detail\//.test(path)) return handleDetailPage();
+  if (/^\/Staff(\/|$|\?)/.test(path) || path === '/Staff') return injectPanel();
+
+  // ── CREATE PAGE ──────────────────────────────────────────────────────────
+  function handleCreatePage() {
+    // Page reloaded mid-save → treat as failure to avoid silent duplicates
+    if (load(PROC_KEY, null)) {
+      const q = load(QUEUE_KEY, []);
+      if (q[0]) markFailed(q[0], 'Page reloaded during save – check for duplicate');
+      sessionStorage.removeItem(PROC_KEY);
+      advanceQueue(q.slice(1));
+      return;
+    }
+
+    const queue = load(QUEUE_KEY, []);
+    if (!queue.length) return;
+
+    const user    = queue[0];
+    const doneLen = load(DONE_KEY, []).length;
+    const failLen = load(FAILED_KEY, []).length;
+    const total   = doneLen + failLen + queue.length;
+    const current = doneLen + failLen + 1;
+
+    injectProgressBanner(user, current, total);
+
+    waitFor(() => {
+      const el = document.querySelector('.initUsers');
+      const vm = el?.__vue__;
+      return (vm && vm.$data.RoleLists?.length > 0) ? vm : null;
+    }).then(vm => {
+
+      // Engineer → Mobile; everything else → Office
+      const isMobile = /^engineer$/i.test(user.role.trim());
+      if (isMobile) {
+        if (!vm.$data.UserType.Mobile) document.getElementById('IsMobile')?.click();
+      } else {
+        if (!vm.$data.UserType.User) document.getElementById('IsUser')?.click();
+      }
+
+      // Wait for Vue to re-render after UserType click
+      setTimeout(() => {
+        vm.$set(vm.$data.Details, 'Name',  user.name);
+        vm.$set(vm.$data.Details, 'Email', user.email);
+
+        // Blank every field mapDetails() serialises so they're '' not 'undefined'
+        BLANK_FIELDS.forEach(f => vm.$set(vm.$data.Details, f, ''));
+
+        // Open the role vue-select dropdown
+        const toggle = document.querySelector('.role-list .vs__dropdown-toggle');
+        if (!toggle) {
+          markFailed(user, 'Role dropdown not found after UserType click');
+          advanceQueue(queue.slice(1));
+          return;
+        }
+        ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(evt =>
+          toggle.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true }))
+        );
+
+        // Wait for dropdown options to render
+        setTimeout(() => {
+          const want = user.role.toLowerCase().trim();
+          const opts = document.querySelectorAll('.role-list .vs__dropdown-option');
+          const opt  = Array.from(opts).find(o => o.textContent.trim().toLowerCase() === want);
+
+          if (!opt) {
+            document.body.click();
+            const available = Array.from(opts).map(o => o.textContent.trim()).join(', ');
+            markFailed(user, `Role "${user.role}" not found. Available: ${available || 'none visible'}`);
+            advanceQueue(queue.slice(1));
+            return;
+          }
+
+          // vue-select commits on mousedown (sets RolesSelected via @input handler)
+          opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+
+          // Sync Role array (required by mapDetails validation) then save
+          setTimeout(() => {
+            if (vm.$data.RolesSelected) {
+              vm.$data.Role = [vm.$data.RolesSelected];
+            }
+
+            save(PROC_KEY, '1');
+            vm.addUserDetails();
+
+            // Watch for URL change (success) or timeout (validation error kept us on page)
+            const startUrl = location.href;
+            let ticks = 0;
+            const watchId = setInterval(() => {
+              if (location.href !== startUrl) { clearInterval(watchId); return; }
+              if (++ticks >= 50) {
+                clearInterval(watchId);
+                markFailed(user, 'Timed out – form may have a validation error');
+                sessionStorage.removeItem(PROC_KEY);
+                advanceQueue(queue.slice(1));
+              }
+            }, 200);
+          }, 400);
+
+        }, 400);
+
+      }, 800);
+
+    }).catch(() => {
+      markFailed(queue[0], 'Vue VM not found on CreateUser page');
+      advanceQueue(queue.slice(1));
+    });
+  }
+
+  function injectProgressBanner(user, current, total) {
+    const bar = document.createElement('div');
+    bar.style.cssText = [
+      'position:fixed','top:0','left:0','right:0','z-index:99999',
+      'background:#1a2e44','color:#fff','padding:9px 16px',
+      'font-family:-apple-system,BlinkMacSystemFont,sans-serif','font-size:13px',
+      'display:flex','justify-content:space-between','align-items:center',
+      'box-shadow:0 2px 8px rgba(0,0,0,.3)',
+    ].join(';');
+    bar.innerHTML = `
+      <span>⏳ <strong>Bulk import</strong> — creating <strong>${user.name}</strong>
+        <span style="opacity:.7">(${user.role})</span></span>
+      <span style="opacity:.8;font-size:12px">user ${current} of ${total}</span>`;
+    document.body.prepend(bar);
+  }
+
+  // ── DETAIL PAGE (successful save lands here) ─────────────────────────────
+  function handleDetailPage() {
+    if (!load(PROC_KEY, null)) return;
+    sessionStorage.removeItem(PROC_KEY);
+
+    const queue = load(QUEUE_KEY, []);
+    if (!queue.length) return;
+
+    const done = load(DONE_KEY, []);
+    done.push(queue[0]);
+    save(DONE_KEY, done);
+
+    const remaining = queue.slice(1);
+    save(QUEUE_KEY, remaining);
+
+    setTimeout(() => {
+      location.href = remaining.length ? '/Staff/CreateUser' : '/Staff';
+    }, 300);
+  }
+
+  // ── helpers ──────────────────────────────────────────────────────────────
+  function markFailed(user, error) {
+    const failed = load(FAILED_KEY, []);
+    failed.push({ ...user, error });
+    save(FAILED_KEY, failed);
+  }
+
+  function advanceQueue(remaining) {
+    save(QUEUE_KEY, remaining);
+    setTimeout(() => { location.href = remaining.length ? '/Staff/CreateUser' : '/Staff'; }, 300);
+  }
+
+  // ── LIST PAGE: panel ─────────────────────────────────────────────────────
+  function injectPanel() {
+    const queue   = load(QUEUE_KEY,  []);
+    const done    = load(DONE_KEY,   []);
+    const failed  = load(FAILED_KEY, []);
+    const running = queue.length > 0;
+
+    const panel = document.createElement('div');
+    panel.id = 'jl-bulk-staff';
+    panel.style.cssText = [
+      'position:fixed','bottom:20px','right:20px','z-index:99999',
+      'background:#fff','border:1px solid #d1d5db','border-radius:8px',
+      'box-shadow:0 4px 20px rgba(0,0,0,.15)','width:370px',
+      'font-family:-apple-system,BlinkMacSystemFont,sans-serif','font-size:13px',
+    ].join(';');
+
+    const hdr = el('div', {
+      style: 'background:#1a2e44;color:#fff;padding:10px 14px;border-radius:8px 8px 0 0;display:flex;justify-content:space-between;align-items:center;cursor:pointer',
+      innerHTML: `<span><strong>📋 Bulk Add Staff</strong> <span style="opacity:.55;font-size:11px;font-weight:normal">v${VERSION}</span></span><span id="jl-bs-chev" style="font-size:16px">▾</span>`,
+    });
+
+    const body = el('div', { id: 'jl-bs-body', style: 'padding:14px' });
+
+    if (running) {
+      body.innerHTML = `
+        <p style="margin:0 0 6px;color:#d97706;font-weight:600">⏳ Import in progress</p>
+        <p style="margin:0 0 10px;color:#374151">${done.length} added · ${failed.length} failed · ${queue.length} remaining</p>
+        <button id="jl-bs-cancel" style="${btnStyle('#dc3545')}">Cancel import</button>`;
+    } else {
+      const resultHtml = (done.length || failed.length) ? `
+        <div style="margin-bottom:10px;padding:8px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:4px;font-size:12px">
+          ✅ ${done.length} added${failed.length ? ` · ❌ ${failed.length} failed` : ''}
+          ${failed.length ? `<br><span style="color:#dc2626">Failed: ${failed.map(f=>`${f.name} (${f.error})`).join(' · ')}</span>` : ''}
+        </div>` : '';
+
+      body.innerHTML = `
+        ${resultHtml}
+        <p style="margin:0 0 4px;font-weight:600;color:#111">Paste from Google Sheets</p>
+        <p style="margin:0 0 8px;color:#6b7280;font-size:11px">
+          Columns: <strong>Name · Email Address · Job Role</strong><br>
+          Include/exclude a header row — it's detected automatically.<br>
+          Roles: Administrator, Costing User, Engineer, Job Desk User
+        </p>
+        <textarea id="jl-bs-ta" placeholder="Paste rows here…" style="width:100%;box-sizing:border-box;height:130px;border:1px solid #d1d5db;border-radius:4px;padding:6px 8px;font-size:12px;resize:vertical;font-family:monospace"></textarea>
+        <div id="jl-bs-preview" style="margin:5px 0 0;font-size:11px;color:#6b7280;min-height:16px"></div>
+        <button id="jl-bs-start" style="margin-top:10px;${btnStyle('#1a7a4a')}">▶ Start import</button>
+        ${(done.length || failed.length) ? `<button id="jl-bs-clear" style="margin-top:6px;${btnStyle('#6b7280', true)}">Clear results</button>` : ''}`;
+    }
+
+    panel.appendChild(hdr);
+    panel.appendChild(body);
+    document.body.appendChild(panel);
+
+    hdr.addEventListener('click', () => {
+      const collapsed = body.style.display === 'none';
+      body.style.display = collapsed ? '' : 'none';
+      document.getElementById('jl-bs-chev').textContent = collapsed ? '▾' : '▸';
+    });
+
+    if (running) {
+      document.getElementById('jl-bs-cancel').addEventListener('click', () => { clear(); location.reload(); });
+      return;
+    }
+
+    const ta      = document.getElementById('jl-bs-ta');
+    const preview = document.getElementById('jl-bs-preview');
+
+    ta.addEventListener('input', () => {
+      const rows = parsePaste(ta.value);
+      const bad  = rows.filter(r => !r.name || !r.email || !r.role);
+      if (!rows.length) { preview.textContent = ''; return; }
+      preview.textContent = `${rows.length} user${rows.length !== 1 ? 's' : ''} detected${bad.length ? ` (${bad.length} incomplete)` : ''}`;
+      preview.style.color = bad.length ? '#dc2626' : '#059669';
+    });
+
+    document.getElementById('jl-bs-start').addEventListener('click', () => {
+      const rows  = parsePaste(ta.value);
+      const valid = rows.filter(r => r.name && r.email && r.role);
+      const bad   = rows.length - valid.length;
+      if (!valid.length) { alert('No complete rows found.\nExpected columns: Name, Email Address, Job Role'); return; }
+      if (bad && !confirm(`${bad} row(s) are missing fields and will be skipped.\nImport ${valid.length} user(s)?`)) return;
+      clear();
+      save(QUEUE_KEY, valid);
+      save(DONE_KEY, []);
+      save(FAILED_KEY, []);
+      location.href = '/Staff/CreateUser';
+    });
+
+    document.getElementById('jl-bs-clear')?.addEventListener('click', () => { clear(); location.reload(); });
+  }
+
+  // ── paste parser ─────────────────────────────────────────────────────────
+  function parsePaste(text) {
+    const rows = text.trim().split('\n')
+      .map(line => {
+        const cols = line.split('\t');
+        return { name: (cols[0]||'').trim(), email: (cols[1]||'').trim(), role: (cols[2]||'').trim() };
+      })
+      .filter(r => r.name || r.email || r.role);
+    if (rows.length && /^name$/i.test(rows[0].name)) rows.shift();
+    return rows;
+  }
+
+  function el(tag, props) { const e = document.createElement(tag); Object.assign(e, props); return e; }
+
+  function btnStyle(bg, outline = false) {
+    return outline
+      ? 'width:100%;padding:6px;background:#f9fafb;color:#374151;border:1px solid #d1d5db;border-radius:4px;cursor:pointer;font-size:12px'
+      : `width:100%;padding:8px;background:${bg};color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600`;
+  }
+
+})();

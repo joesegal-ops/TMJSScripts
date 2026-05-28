@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(open -a \"TextEdit\" \"/Users/joesegal/Documents/Claude Code/PPMs/ppm-bulk-edit-visits.user.js\")",
+      "Bash(node --check \"/Users/joesegal/Documents/Claude Code/PPMs/ppm-bulk-edit-visits.user.js\")",
+      "Bash(osascript -l JavaScript -e 'try { var src = $.NSString.stringWithContentsOfFileEncodingError\\(\"/Users/joesegal/Documents/Claude Code/PPMs/ppm-bulk-edit-visits.user.js\", 4, null\\).js; new Function\\(src\\); \"OK\" } catch\\(e\\) { \"SYNTAX ERROR: \" + e.message }')",
+      "Bash(osascript -l JavaScript -e 'var src = $.NSString.stringWithContentsOfFileEncodingError\\(\"/Users/joesegal/Documents/Claude Code/PPMs/ppm-bulk-edit-visits.user.js\", 4, null\\).js; try { new Function\\(src\\); \"OK\" } catch\\(e\\) { \"SYNTAX ERROR: \" + e.message }')",
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "mcp__Claude_in_Chrome__navigate",
+      "mcp__Claude_in_Chrome__javascript_tool",
+      "Bash(ls \"/Users/joesegal/Documents/Claude Code/\")",
+      "Bash(python '/Users/joesegal/Library/Application Support/Claude/local-agent-mode-sessions/skills-plugin/e6d16999-305d-4502-9c19-03dd4ff77eef/d530a0af-90b1-403e-8c4e-2005bc324fb5/skills/pptx/scripts/thumbnail.py' '/Users/joesegal/Downloads/UP_WeWork -January_2026 - MBR.pptx')",
+      "Bash(python3 '/Users/joesegal/Library/Application Support/Claude/local-agent-mode-sessions/skills-plugin/e6d16999-305d-4502-9c19-03dd4ff77eef/d530a0af-90b1-403e-8c4e-2005bc324fb5/skills/pptx/scripts/thumbnail.py' '/Users/joesegal/Downloads/UP_WeWork -January_2026 - MBR.pptx')",
+      "Bash(mkdir -p /tmp/pptx_inspect)",
+      "Bash(cp \"/Users/joesegal/Downloads/UP_WeWork -January_2026 - MBR.pptx\" /tmp/pptx_inspect/deck.pptx)",
+      "Read(//tmp/**)",
+      "Bash(unzip -q deck.pptx -d unpacked)",
+      "mcp__Control_Chrome__list_tabs",
+      "mcp__Control_Chrome__execute_javascript",
+      "Bash(find ~/Downloads ~/Desktop ~/Documents -iname \"*untitled*\" -o -iname \"*UP*logo*\" -o -iname \"*up-fm*\" 2>/dev/null | grep -i \"png\\\\|jpg\\\\|svg\\\\|webp\" | head -20)",
+      "Bash(xargs ls -la)",
+      "Bash(find /Users/joesegal -name \"ppm_planner*\" 2>/dev/null)",
+      "Bash(python3)"
+    ]
+  }
+}
