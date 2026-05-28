@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.16
+// @version      3.18
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.16';
+    const VERSION   = '3.18';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -301,7 +301,8 @@
                             // from the DOM row — Joblogic renders the CPO ref as the link label
                             const linkEl = row.querySelector('a[href*="/ContractPurchaseOrder/"]');
                             if (linkEl) {
-                                po.poUrl = linkEl.getAttribute('href');
+                                const rawHref = linkEl.getAttribute('href') || '';
+                                po.poUrl = rawHref.startsWith('http') ? rawHref : `${location.origin}${rawHref}`;
                                 if (!po.poNumber && !po.reference)
                                     po.poNumber = (linkEl.textContent || '').trim();
                             }
@@ -376,7 +377,10 @@
                     // Capture the CPO detail link — also use its text as a last-resort identifier
                     // (Joblogic renders the CPO reference, e.g. "CPO00076", as the link label)
                     const cpoLinkEl = row.querySelector('a[href*="/ContractPurchaseOrder/"]');
-                    const poUrl     = cpoLinkEl ? cpoLinkEl.getAttribute('href') : null;
+                    const rawCpoHref = cpoLinkEl ? (cpoLinkEl.getAttribute('href') || '') : '';
+                    const poUrl      = rawCpoHref
+                        ? (rawCpoHref.startsWith('http') ? rawCpoHref : `${location.origin}${rawCpoHref}`)
+                        : null;
                     const linkText  = cpoLinkEl ? (cpoLinkEl.textContent || '').trim() : '';
                     // Use link text as identifier if the column-based parse gave nothing
                     const finalNum  = poNumber || linkText;
@@ -544,6 +548,7 @@
                     row = {
                         contractRef,
                         description: desc,
+                        poUrl: po.poUrl || null, // absolute URL — links the CPO ID in the Service column
                         category,
                         months: {},
                         type: 'po',
@@ -687,8 +692,25 @@
             </tr>`;
 
             for (const row of catRows) {
-                const rowSite    = showSite ? (contractSiteMap.get(row.contractRef) || '') : '';
+                const rowSite     = showSite ? (contractSiteMap.get(row.contractRef) || '') : '';
                 const contractUrl = contractUrlMap.get(row.contractRef) || null;
+
+                // Service column content — for CPO rows, link just the CPO identifier
+                // e.g. "Gas Servicing · <a>CPO00174</a>"
+                const svcHtml = (() => {
+                    if (row.type === 'po' && row.poUrl && row.description) {
+                        const lastDot = row.description.lastIndexOf(' · ');
+                        const base    = lastDot >= 0 ? row.description.slice(0, lastDot) : '';
+                        const cpoId   = lastDot >= 0 ? row.description.slice(lastDot + 3) : row.description;
+                        return (base ? esc(base) + ' · ' : '') +
+                            `<a href="${esc(row.poUrl)}" target="_blank"
+                                style="color:inherit;text-decoration:underline;text-underline-offset:2px;
+                                       text-decoration-color:rgba(30,41,59,0.4);"
+                                title="Open CPO in Joblogic">${esc(cpoId)}</a>`;
+                    }
+                    return row.description ? esc(row.description) : (row.type === 'empty' ? '—' : '');
+                })();
+
                 const refLabel    = contractUrl
                     ? `<a href="${esc(contractUrl)}" target="_blank"
                           style="color:inherit;text-decoration:underline;text-underline-offset:2px;
@@ -719,7 +741,7 @@
                         border-right:1px solid #e2e8f0;
                         border-bottom:1px solid #f1f5f9;
                         white-space:nowrap;overflow:hidden;max-width:220px;text-overflow:ellipsis;"
-                        title="${row.description ? esc(row.description) : (row.type === 'empty' ? 'No visits or CPOs recorded' : '')}">${row.description ? esc(row.description) : (row.type === 'empty' ? '—' : '')}</td>
+                        title="${row.description ? esc(row.description) : (row.type === 'empty' ? 'No visits or CPOs recorded' : '')}">${svcHtml}</td>
                     ${sortedMonths.map(mk => row.months[mk]
                         ? renderCell(mk, row.months[mk], thisMonthKey)
                         : `<td style="background:#f8fafc;border:1px solid #f1f5f9;min-width:66px;"></td>`
@@ -815,9 +837,14 @@
           </div>
           <span style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:${pctColor};">${pct}%</span>
         </div>
+        <!-- Print button — left side, below progress bar -->
+        <button class="no-print" onclick="window.print()"
+          style="margin-top:14px;padding:7px 16px;background:rgba(255,255,255,0.08);
+            border:1px solid rgba(255,255,255,0.15);border-radius:6px;color:#94a3b8;
+            font-size:11px;cursor:pointer;font-family:inherit;display:inline-block;">⎙ Print</button>
       </div>
 
-      <!-- Stat blocks + print -->
+      <!-- Stat blocks -->
       <div style="display:flex;align-items:flex-start;gap:28px;flex-wrap:wrap;">
 
         <div style="display:flex;flex-direction:column;gap:16px;">
@@ -862,12 +889,6 @@
           </div>` : ''}
 
         </div>
-
-        <!-- Print button — beside stats, aligned to bottom -->
-        <button class="no-print" onclick="window.print()"
-          style="align-self:flex-end;padding:7px 16px;background:rgba(255,255,255,0.08);
-            border:1px solid rgba(255,255,255,0.15);border-radius:6px;color:#94a3b8;
-            font-size:11px;cursor:pointer;font-family:inherit;">⎙ Print</button>
 
       </div>
     </div>
