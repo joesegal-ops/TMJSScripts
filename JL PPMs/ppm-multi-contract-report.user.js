@@ -808,7 +808,7 @@
             </table>
         </div>`;
 
-        return { tableHtml, monthHeaders, total, complete, overdue, upcoming, pct, pctColor,
+        return { tableHtml, monthHeaders, blankMonths, total, complete, overdue, upcoming, pct, pctColor,
                  mTotal, mComplete, mOverdue, mUpcoming, mPct, thisMonthName };
     }
 
@@ -828,7 +828,7 @@
                 `</div>`;
         };
 
-        const { tableHtml, total, complete, overdue, upcoming, pct, pctColor,
+        const { tableHtml, blankMonths, total, complete, overdue, upcoming, pct, pctColor,
                 mTotal, mComplete, mOverdue, mUpcoming, mPct, thisMonthName } =
             buildCombinedMatrix(contractDataList);
 
