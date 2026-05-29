@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         JobLogic Report Designer — Bulk Row Insert
 // @namespace    com.joesegal.joblogic
-// @version      1.0.0
+// @version      1.0.1
 // @description  Paste tab- or comma-separated data (3 columns: Location, Result, Comments) and bulk-insert rows into DataBand1 on Page 1 of the Stimulsoft Report Designer.
 // @match        https://go.joblogic.com/Form/Designer/*
 // @run-at       document-idle
 // @grant        none
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Forms/joblogic-report-bulk-rows.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Forms/joblogic-report-bulk-rows.user.js
 // ==/UserScript==
 
 (function () {
@@ -134,16 +136,26 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
   }
   function clearLog() { document.getElementById('jlbr-log').textContent = 'Ready.'; }
 
-  // --- CSV/TSV parsing (auto-detect separator; supports quoted commas) ---
+  // --- CSV/TSV parsing (auto-detect separator; supports quoted multi-line fields) ---
   function parseRows(text) {
     text = text.replace(/\r\n?/g, '\n').trim();
     if (!text) return [];
-    // Detect: if first line has tabs, use tabs; else use CSV parsing
-    const firstLine = text.split('\n', 1)[0];
-    if (firstLine.includes('\t')) {
-      return text.split('\n').map(line => line.split('\t'));
+    // Detect separator from the first unquoted character that's tab or comma.
+    // If a tab appears before any comma at top-level, treat as TSV; else CSV.
+    let sep = ',';
+    let scanQuote = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (scanQuote) {
+        if (c === '"' && text[i + 1] === '"') { i++; }
+        else if (c === '"') scanQuote = false;
+      } else {
+        if (c === '"') scanQuote = true;
+        else if (c === '\t') { sep = '\t'; break; }
+        else if (c === ',') { sep = ','; break; }
+      }
     }
-    // CSV (handles quoted fields with commas)
+
     const out = [];
     let row = [], field = '', inQuote = false;
     for (let i = 0; i < text.length; i++) {
@@ -153,8 +165,8 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
         else if (c === '"') inQuote = false;
         else field += c;
       } else {
-        if (c === '"') inQuote = true;
-        else if (c === ',') { row.push(field); field = ''; }
+        if (c === '"' && field === '') inQuote = true;
+        else if (c === sep) { row.push(field); field = ''; }
         else if (c === '\n') { row.push(field); out.push(row); row = []; field = ''; }
         else field += c;
       }
