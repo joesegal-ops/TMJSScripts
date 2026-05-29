@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.22
+// @version      3.23
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.22';
+    const VERSION   = '3.23';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -84,10 +84,13 @@
     function loadState() {
         try {
             const s = JSON.parse(localStorage.getItem(STATE_KEY) || 'null');
-            // State from a different script version may have a different schema.
+            // State from an incompatible script version may have a different schema.
             // Discard it silently so stale state never causes a hang or crash.
-            if (s && s.stateVersion !== VERSION) {
-                console.warn(`[PPM-Multi] Discarding state from v${s.stateVersion || '?'} (current v${VERSION})`);
+            // Allow 3.22 / 3.23 state to resume in either version — schema is identical.
+            const sv = s ? (s.stateVersion || '') : '';
+            const compatible = !s || sv === VERSION || /^3\.2[23]$/.test(sv);
+            if (!compatible) {
+                console.warn(`[PPM-Multi] Discarding state from v${sv || '?'} (current v${VERSION})`);
                 localStorage.removeItem(STATE_KEY);
                 return null;
             }
