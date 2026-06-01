@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.25
+// @version      3.26
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.25';
+    const VERSION   = '3.26';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -86,7 +86,7 @@
             const s = JSON.parse(localStorage.getItem(STATE_KEY) || 'null');
             // State from an incompatible script version may have a different schema.
             // Discard it silently so stale state never causes a hang or crash.
-            // Allow 3.22 / 3.25 state to resume in either version — schema is identical.
+            // Allow 3.22 / 3.26 state to resume in either version — schema is identical.
             const sv = s ? (s.stateVersion || '') : '';
             const compatible = !s || sv === VERSION || /^3\.2[23]$/.test(sv);
             if (!compatible) {
@@ -1025,6 +1025,33 @@
             });
         }
 
+        // ── Pre-step: switch to "All" tab before any strategy runs ────────────
+        // Without this, Strategy 1 reads from whichever tab is active
+        // (typically "Active") and returns early, missing Completed, Expired, etc.
+        // Clicking "All" first means every strategy sees the full contract list.
+        {
+            const navLinks = qsa(
+                'ul.nav-tabs a[data-toggle="tab"],ul.nav a[data-toggle="tab"],' +
+                'ul.nav-tabs a[data-bs-toggle="tab"],ul.nav a[data-bs-toggle="tab"]'
+            );
+            const allTabLink = navLinks.find(a => /^all\b/i.test((a.textContent || '').trim()));
+            if (allTabLink) {
+                const parentLi = allTabLink.closest('li');
+                const alreadyActive = parentLi && parentLi.classList.contains('active');
+                if (!alreadyActive) {
+                    ppmLog('[PPM-Multi] Pre-step: clicking All tab before scan…');
+                    statusEl.textContent = 'Switching to All tab…';
+                    allTabLink.click();
+                    await sleep(1400); // give AJAX time to reload the grid/table
+                    ppmLog('[PPM-Multi] Pre-step: All tab loaded');
+                } else {
+                    ppmLog('[PPM-Multi] Pre-step: already on All tab');
+                }
+            } else {
+                ppmLog('[PPM-Multi] Pre-step: no All tab found — scanning current tab');
+            }
+        }
+
         // ── Strategy 1: Kendo grid API — read ALL grids on the page ───────────
         // Joblogic often renders separate grids per contract-status group
         // (Active, Expired, Renewal, etc.). qs() only finds the first one.
@@ -1221,9 +1248,16 @@
             const tabIter = tabsToScan.length ? tabsToScan : [null]; // null = no tab switch
             for (const tabLink of tabIter) {
                 if (tabLink) {
-                    ppmLog('[PPM-Multi] Switching to tab:', tabLink.textContent.trim());
-                    tabLink.click();
-                    await sleep(1000); // wait for AJAX reload
+                    // Skip the click if pre-step already switched us to this tab
+                    const parentLi      = tabLink.closest('li');
+                    const alreadyActive = parentLi && parentLi.classList.contains('active');
+                    if (!alreadyActive) {
+                        ppmLog('[PPM-Multi] Switching to tab:', tabLink.textContent.trim());
+                        tabLink.click();
+                        await sleep(1200); // wait for AJAX reload
+                    } else {
+                        ppmLog('[PPM-Multi] Tab already active (pre-step did it):', tabLink.textContent.trim());
+                    }
                 }
                 const tabName = tabLink?.textContent.trim() || 'current tab';
                 let page = 1;
