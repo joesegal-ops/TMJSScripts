@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.23
+// @version      3.24
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.23';
+    const VERSION   = '3.24';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -86,7 +86,7 @@
             const s = JSON.parse(localStorage.getItem(STATE_KEY) || 'null');
             // State from an incompatible script version may have a different schema.
             // Discard it silently so stale state never causes a hang or crash.
-            // Allow 3.22 / 3.23 state to resume in either version — schema is identical.
+            // Allow 3.22 / 3.24 state to resume in either version — schema is identical.
             const sv = s ? (s.stateVersion || '') : '';
             const compatible = !s || sv === VERSION || /^3\.2[23]$/.test(sv);
             if (!compatible) {
@@ -1545,9 +1545,9 @@
 
         const resetBtn = document.createElement('button');
         resetBtn.textContent  = 'Reset';
-        resetBtn.style.cssText = 'background:transparent;color:#64748b;border:1px solid #cbd5e1;' +
-            'border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer;' +
-            'font-family:system-ui,sans-serif;';
+        resetBtn.style.cssText = 'background:#fff;color:#374151;border:1px solid #9ca3af;' +
+            'border-radius:4px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;' +
+            'font-family:system-ui,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,.15);';
 
         const titleInput = document.createElement('input');
         titleInput.type  = 'text';
