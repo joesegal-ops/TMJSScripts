@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.24
+// @version      3.25
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -16,7 +16,7 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.24';
+    const VERSION   = '3.25';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -86,7 +86,7 @@
             const s = JSON.parse(localStorage.getItem(STATE_KEY) || 'null');
             // State from an incompatible script version may have a different schema.
             // Discard it silently so stale state never causes a hang or crash.
-            // Allow 3.22 / 3.24 state to resume in either version — schema is identical.
+            // Allow 3.22 / 3.25 state to resume in either version — schema is identical.
             const sv = s ? (s.stateVersion || '') : '';
             const compatible = !s || sv === VERSION || /^3\.2[23]$/.test(sv);
             if (!compatible) {
@@ -1566,11 +1566,33 @@
         wrapper.appendChild(resetBtn);
         document.body.appendChild(wrapper);
 
-        // Restore any saved state
+        // Restore any saved state — show a clear indicator so the user knows cached data exists
         const existingBootSt = loadState();
         if (existingBootSt) {
             statusBox.style.display = 'block';
             if (existingBootSt.reportTitle) titleInput.value = existingBootSt.reportTitle;
+
+            if (existingBootSt.phase === 'done') {
+                const n = existingBootSt.contracts ? existingBootSt.contracts.filter(c => c.visited).length : 0;
+                // Green tint — data is ready, button click will instantly re-generate
+                statusBox.style.background   = 'rgba(5,90,55,0.92)';
+                statusBox.style.color        = '#6ee7b7';
+                statusBox.style.border       = '1px solid #059669';
+                statusBox.textContent        = `✓ Cached data ready — ${n} contract${n!==1?'s':''} · click to re-generate`;
+                btn.style.background         = '#065f46';
+                btn.style.borderColor        = '#059669';
+                btn.textContent              = `⟳ Re-generate Report  v${VERSION}`;
+            } else if (existingBootSt.phase === 'visiting') {
+                const done  = existingBootSt.contracts ? existingBootSt.contracts.filter(c => c.visited).length : 0;
+                const total = existingBootSt.contracts ? existingBootSt.contracts.length : 0;
+                // Amber tint — run was interrupted mid-way
+                statusBox.style.background   = 'rgba(120,53,15,0.92)';
+                statusBox.style.color        = '#fcd34d';
+                statusBox.style.border       = '1px solid #d97706';
+                statusBox.textContent        = `⚠ Run paused — ${done} / ${total} contracts collected · Reset to start fresh`;
+                btn.style.background         = '#78350f';
+                btn.style.borderColor        = '#d97706';
+            }
         }
 
         btn.addEventListener('click', async () => {
@@ -1642,9 +1664,14 @@
         resetBtn.addEventListener('click', () => {
             if (!confirm('Clear saved progress and start over?')) return;
             clearState();
-            statusBox.style.display = 'none';
-            btn.disabled = false;
-            setStatus('');
+            statusBox.style.display    = 'none';
+            statusBox.style.background = 'rgba(9,21,43,0.92)';
+            statusBox.style.color      = '#7dd3fc';
+            statusBox.style.border     = '';
+            btn.disabled               = false;
+            btn.style.background       = '#0f2347';
+            btn.style.borderColor      = '#1a3a6b';
+            btn.textContent            = `📋 Multi-Contract Report  v${VERSION}`;
         });
     }
 
