@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Joblogic - Bulk Close Jobs (API)
+// @name         Joblogic - Bulk Close Jobs & mark Solved on SF (API)
 // @namespace    http://tampermonkey.net/
 // @version      3.0
 // @description  Paste a list of job numbers; script tags them "Solved on SF" and completes them via API.
