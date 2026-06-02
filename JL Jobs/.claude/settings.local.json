@@ -40,7 +40,8 @@
       "mcp__Claude_in_Chrome__select_browser",
       "Bash(ls \"/Users/joesegal/Documents/Claude Code/\")",
       "mcp__Claude_in_Chrome__browser_batch",
-      "mcp__Claude_in_Chrome__read_console_messages"
+      "mcp__Claude_in_Chrome__read_console_messages",
+      "Read(//Users/joesegal/Documents/Claude Code/**)"
     ]
   }
 }

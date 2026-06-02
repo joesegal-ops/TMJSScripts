@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Joblogic - Bulk Close Jobs & mark Solved on SF (API)
+// @name         Joblogic - Bulk Close Jobs & mark Quoted and Closed (API)
 // @namespace    http://tampermonkey.net/
 // @version      3.0
-// @description  Paste a list of job numbers; script tags them "Solved on SF" and completes them via API.
+// @description  Paste a list of job numbers; script tags them "Quoted and Closed" and completes them via API.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -12,8 +12,8 @@
     'use strict';
 
     // --- CONFIG ---
-    const TAG_NAME = 'Solved on SF';
-    const SOLVED_ON_SF_ID = '54d76102-97da-455d-8e71-39f66fae6d27';
+    const TAG_NAME = 'Quoted and Closed';
+    const QUOTED_AND_CLOSED_ID = 'abc2e309-b7a1-4b8e-ab75-1e6c7549d063';
     const DELAY_BETWEEN_JOBS = 400;
     const HEADER_WORDS = [
         'job id', 'job no', 'job no.', 'jobid', 'job number', 'id',
@@ -31,10 +31,10 @@
     // UI
     // =======================================================================
     function createUI() {
-        if (document.getElementById('jl-bulkclose-panel')) return;
+        if (document.getElementById('jl-bulkclose-quoted-panel')) return;
 
         panel = document.createElement('div');
-        panel.id = 'jl-bulkclose-panel';
+        panel.id = 'jl-bulkclose-quoted-panel';
         const container = document.createElement('div');
         container.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99999;background:#1a1a2e;color:#eee;border-radius:8px;padding:16px;width:560px;max-height:85vh;display:flex;flex-direction:column;font-family:monospace;font-size:12px;box-shadow:0 4px 20px rgba(0,0,0,0.5);';
 
@@ -42,7 +42,7 @@
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;';
         const title = document.createElement('strong');
         title.style.fontSize = '14px';
-        title.textContent = 'Bulk Close Jobs (Solved on SF)';
+        title.textContent = 'Bulk Close Jobs (Quoted and Closed)';
         const closeBtn = document.createElement('button');
         closeBtn.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
         closeBtn.textContent = 'X';
@@ -80,7 +80,7 @@
         dryLabel.style.cssText = 'margin-left:8px;cursor:pointer;';
         dryCheck = document.createElement('input');
         dryCheck.type = 'checkbox';
-        dryCheck.id = 'jl-bulkclose-dryrun';
+        dryCheck.id = 'jl-bulkclose-quoted-dryrun';
         dryLabel.appendChild(dryCheck);
         dryLabel.appendChild(document.createTextNode(' Dry Run (log only, no changes)'));
 
@@ -127,24 +127,24 @@
             <div style="background:#fff;color:#111;border-radius:8px;width:520px;max-width:92vw;box-shadow:0 10px 40px rgba(0,0,0,.4);overflow:hidden;font-family:system-ui,sans-serif;">
                 <div style="padding:12px 16px;background:#111827;color:#f9fafb;font-weight:600;">Paste job numbers</div>
                 <div style="padding:14px 16px;">
-                    <textarea id="jl-paste-ta" style="width:100%;height:200px;font:13px monospace;padding:8px;border:1px solid #d1d5db;border-radius:4px;box-sizing:border-box;" placeholder="Paste comma-, tab-, or newline-separated job numbers"></textarea>
+                    <textarea id="jl-paste-quoted-ta" style="width:100%;height:200px;font:13px monospace;padding:8px;border:1px solid #d1d5db;border-radius:4px;box-sizing:border-box;" placeholder="Paste comma-, tab-, or newline-separated job numbers"></textarea>
                     <div style="color:#6b7280;font-size:12px;margin-top:6px;">Any separator works. Header row (e.g. "Job No") is ignored.</div>
-                    <div id="jl-paste-count" style="color:#2563eb;font-size:12px;margin-top:6px;font-weight:600;">0 job IDs detected</div>
+                    <div id="jl-paste-quoted-count" style="color:#2563eb;font-size:12px;margin-top:6px;font-weight:600;">0 job IDs detected</div>
                     <div style="text-align:right;margin-top:10px;">
-                        <button id="jl-paste-cancel" style="background:#9ca3af;color:#fff;border:0;border-radius:4px;padding:7px 14px;cursor:pointer;margin-right:6px;">Cancel</button>
-                        <button id="jl-paste-ok" style="background:#2563eb;color:#fff;border:0;border-radius:4px;padding:7px 14px;cursor:pointer;">Load</button>
+                        <button id="jl-paste-quoted-cancel" style="background:#9ca3af;color:#fff;border:0;border-radius:4px;padding:7px 14px;cursor:pointer;margin-right:6px;">Cancel</button>
+                        <button id="jl-paste-quoted-ok" style="background:#2563eb;color:#fff;border:0;border-radius:4px;padding:7px 14px;cursor:pointer;">Load</button>
                     </div>
                 </div>
             </div>`;
         document.body.appendChild(overlay);
-        const ta = overlay.querySelector('#jl-paste-ta');
-        const count = overlay.querySelector('#jl-paste-count');
+        const ta = overlay.querySelector('#jl-paste-quoted-ta');
+        const count = overlay.querySelector('#jl-paste-quoted-count');
         ta.addEventListener('input', () => {
             const n = parseJobRefs(ta.value).length;
             count.textContent = `${n} job ID${n === 1 ? '' : 's'} detected`;
         });
-        overlay.querySelector('#jl-paste-cancel').onclick = () => overlay.remove();
-        overlay.querySelector('#jl-paste-ok').onclick = () => {
+        overlay.querySelector('#jl-paste-quoted-cancel').onclick = () => overlay.remove();
+        overlay.querySelector('#jl-paste-quoted-ok').onclick = () => {
             jobRefs = parseJobRefs(ta.value);
             overlay.remove();
             if (jobRefs.length) {
@@ -271,7 +271,7 @@
         return JSON.parse(html.slice(start, end));
     }
 
-    // Tag a job with "Solved on SF" via /api/Job/EditDetail
+    // Tag a job with "Quoted and Closed" via /api/Job/EditDetail
     async function addTag(internalId, jobNumber, dryRun, _retry = 0) {
         const html = await fetchText('/Job/Detail/' + internalId);
         const job = extractJobState(html, internalId);
@@ -281,8 +281,8 @@
         const existingTagIds = Array.isArray(job.TagIds)
             ? job.TagIds.map(String)
             : (Array.isArray(job.Tags) ? job.Tags.map(t => String(t.Id || t.TagId || t)) : []);
-        if (existingTagIds.includes(SOLVED_ON_SF_ID)) return { alreadyTagged: true };
-        const newTagIds = [...existingTagIds, SOLVED_ON_SF_ID];
+        if (existingTagIds.includes(QUOTED_AND_CLOSED_ID)) return { alreadyTagged: true };
+        const newTagIds = [...existingTagIds, QUOTED_AND_CLOSED_ID];
 
         // Build urlencoded body matching the captured Save payload exactly
         const entries = [];
