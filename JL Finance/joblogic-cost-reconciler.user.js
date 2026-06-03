@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything.
+// @version      1.1
+// @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -23,6 +23,11 @@
     // STATE
     // ===================================================================
     let panel, pasteArea, logArea, scanBtn, runBtn, stopBtn, copyBtn, progressText, resultsBox;
+
+    // This script's identity in the shared dock (keep unique per script).
+    const SCRIPT_ID = 'cost-reconciler';
+    const SCRIPT_LABEL = '💷 Cost Reconciler';
+    const SCRIPT_COLOR = '#0a8';
     let running = false;
     let rows = [];          // parsed sheet rows
     let results = [];       // per-row outcome (for Copy)
@@ -647,8 +652,60 @@
     }
     const setProgress = (m) => { progressText.textContent = m; };
 
+    // ===== Shared JL userscript launcher dock (identical in every script) =====
+    const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order';
+    function jlReadOrder() { try { return JSON.parse(localStorage.getItem(JL_ORDER_KEY)) || []; } catch (e) { return []; } }
+    function jlSaveOrder() { const d = document.getElementById(JL_DOCK_ID); if (!d) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...d.children].map(b => b.dataset.scriptId).filter(Boolean))); }
+    function jlApplyOrder() { const d = document.getElementById(JL_DOCK_ID); if (!d) return; [...d.children].sort((a, b) => { const o = jlReadOrder(); let ia = o.indexOf(a.dataset.scriptId), ib = o.indexOf(b.dataset.scriptId); if (ia < 0) ia = 1e9; if (ib < 0) ib = 1e9; return ia - ib; }).forEach(b => d.appendChild(b)); }
+    function jlAfter(d, y) { let c = { o: -Infinity, el: null }; for (const el of d.querySelectorAll('button:not(.jl-dragging)')) { const r = el.getBoundingClientRect(); const off = y - (r.top + r.height / 2); if (off < 0 && off > c.o) c = { o: off, el }; } return c.el; }
+    function jlGetDock() {
+        let d = document.getElementById(JL_DOCK_ID);
+        if (!d) {
+            d = document.createElement('div');
+            d.id = JL_DOCK_ID;
+            d.style.cssText = 'position:fixed;top:80px;left:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-start;';
+            document.body.appendChild(d);
+        }
+        if (!d.dataset.dnd) {
+            d.dataset.dnd = '1';
+            d.addEventListener('dragover', e => { e.preventDefault(); const dr = d.querySelector('.jl-dragging'); if (!dr) return; const a = jlAfter(d, e.clientY); if (a == null) d.appendChild(dr); else d.insertBefore(dr, a); });
+            d.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
+        }
+        return d;
+    }
+    function jlDockButton(id, label, color, onClick) {
+        const d = jlGetDock();
+        let b = document.getElementById('jl-launch-' + id);
+        if (b) return b;
+        b = document.createElement('button');
+        b.id = 'jl-launch-' + id;
+        b.dataset.scriptId = id;
+        b.textContent = label;
+        b.title = 'Show / hide ' + label + '  (drag to reorder)';
+        b.draggable = true;
+        b.style.cssText = `background:${color};color:#fff;border:none;padding:8px 13px;border-radius:18px;cursor:grab;font-family:monospace;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);white-space:nowrap;`;
+        b.addEventListener('click', () => { if (b.dataset.justDragged) { delete b.dataset.justDragged; return; } onClick(); });
+        b.addEventListener('dragstart', () => { b.classList.add('jl-dragging'); b.style.opacity = '0.4'; });
+        b.addEventListener('dragend', () => { b.classList.remove('jl-dragging'); b.style.opacity = '1'; b.dataset.justDragged = '1'; setTimeout(() => { delete b.dataset.justDragged; }, 60); jlSaveOrder(); });
+        d.appendChild(b);
+        jlApplyOrder();
+        return b;
+    }
+    function jlRegisterPanel(panelEl, id, label, color) {
+        const shown = (panelEl.style.display && panelEl.style.display !== 'none') ? panelEl.style.display : 'block';
+        panelEl.style.display = 'none';
+        const btn = jlDockButton(id, label, color, () => {
+            const opening = panelEl.style.display === 'none';
+            panelEl.style.display = opening ? shown : 'none';
+            btn.style.boxShadow = opening ? '0 0 0 2px #fff, 0 2px 8px rgba(0,0,0,.4)' : '0 2px 8px rgba(0,0,0,.4)';
+        });
+        return btn;
+    }
+    // ===== end shared dock =====
+
     function createUI() {
         if (document.getElementById('jl-costrec-panel')) return;
+
         panel = document.createElement('div');
         panel.id = 'jl-costrec-panel';
         const c = document.createElement('div');
@@ -657,9 +714,9 @@
         const header = document.createElement('div');
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
         const title = document.createElement('strong'); title.style.fontSize = '14px'; title.textContent = 'Cost Reconciler  (read-only)';
-        const x = document.createElement('button'); x.textContent = 'X';
-        x.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
-        x.addEventListener('click', () => panel.remove());
+        const x = document.createElement('button'); x.textContent = '–'; x.title = 'Collapse';
+        x.style.cssText = 'background:none;border:none;color:#eee;font-size:20px;cursor:pointer;line-height:1;';
+        x.addEventListener('click', () => { panel.style.display = 'none'; });
         header.appendChild(title); header.appendChild(x);
 
         const hint = document.createElement('div');
@@ -689,6 +746,7 @@
         c.appendChild(header); c.appendChild(hint); c.appendChild(pasteArea);
         c.appendChild(controls); c.appendChild(resultsBox); c.appendChild(logLabel); c.appendChild(logArea);
         panel.appendChild(c); document.body.appendChild(panel);
+        jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR);
     }
     function mkBtn(text, bg, fn) {
         const b = document.createElement('button');
