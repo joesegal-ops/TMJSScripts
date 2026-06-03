@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Add Note Everywhere (JL desc + JL note + SF chatter)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  Floating panel: type one note, prepend "dd/mm - <note>" to the job's Description, add it as a public Job note, and (if an SF Case ID is on the job) post it to the Salesforce Case Chatter feed.
+// @version      1.3
+// @description  Floating panel: type one note, prepend "dd/mm - <note>" to the job's Description, add it as a public Job note, and (if an SF Case ID is on the job) post it to the Salesforce Case Chatter feed. v1.3: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*
 // @connect      wecompany.my.salesforce.com
@@ -14,6 +14,63 @@
 
 (function () {
     'use strict';
+
+    // ===== Shared JL userscript launcher dock (identical in every script) =====
+    const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order';
+    function jlReadOrder() { try { return JSON.parse(localStorage.getItem(JL_ORDER_KEY)) || []; } catch (e) { return []; } }
+    function jlSaveOrder() { const d = document.getElementById(JL_DOCK_ID); if (!d) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...d.children].map(b => b.dataset.scriptId).filter(Boolean))); }
+    function jlApplyOrder() { const d = document.getElementById(JL_DOCK_ID); if (!d) return; [...d.children].sort((a, b) => { const o = jlReadOrder(); let ia = o.indexOf(a.dataset.scriptId), ib = o.indexOf(b.dataset.scriptId); if (ia < 0) ia = 1e9; if (ib < 0) ib = 1e9; return ia - ib; }).forEach(b => d.appendChild(b)); }
+    function jlAfter(d, y) { let c = { o: -Infinity, el: null }; for (const el of d.querySelectorAll('button:not(.jl-dragging)')) { const r = el.getBoundingClientRect(); const off = y - (r.top + r.height / 2); if (off < 0 && off > c.o) c = { o: off, el }; } return c.el; }
+    function jlGetDock() {
+        let d = document.getElementById(JL_DOCK_ID);
+        if (!d) {
+            d = document.createElement('div');
+            d.id = JL_DOCK_ID;
+            d.style.cssText = 'position:fixed;top:80px;left:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-start;';
+            document.body.appendChild(d);
+        }
+        if (!d.dataset.dnd) {
+            d.dataset.dnd = '1';
+            d.addEventListener('dragover', e => { e.preventDefault(); const dr = d.querySelector('.jl-dragging'); if (!dr) return; const a = jlAfter(d, e.clientY); if (a == null) d.appendChild(dr); else d.insertBefore(dr, a); });
+            d.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
+        }
+        return d;
+    }
+    function jlDockButton(id, label, color, onClick) {
+        const d = jlGetDock();
+        let b = document.getElementById('jl-launch-' + id);
+        if (b) return b;
+        b = document.createElement('button');
+        b.id = 'jl-launch-' + id;
+        b.dataset.scriptId = id;
+        b.textContent = label;
+        b.title = 'Show / hide ' + label + '  (drag to reorder)';
+        b.draggable = true;
+        b.style.cssText = `background:${color};color:#fff;border:none;padding:8px 13px;border-radius:18px;cursor:grab;font-family:monospace;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);white-space:nowrap;`;
+        b.addEventListener('click', () => { if (b.dataset.justDragged) { delete b.dataset.justDragged; return; } onClick(); });
+        b.addEventListener('dragstart', () => { b.classList.add('jl-dragging'); b.style.opacity = '0.4'; });
+        b.addEventListener('dragend', () => { b.classList.remove('jl-dragging'); b.style.opacity = '1'; b.dataset.justDragged = '1'; setTimeout(() => { delete b.dataset.justDragged; }, 60); jlSaveOrder(); });
+        d.appendChild(b);
+        jlApplyOrder();
+        return b;
+    }
+    // Collapse a panel to a dock button. panelEl = the OUTERMOST element of the
+    // script's floating UI. Returns the dock button.
+    function jlRegisterPanel(panelEl, id, label, color) {
+        const shown = (panelEl.style.display && panelEl.style.display !== 'none') ? panelEl.style.display : 'block';
+        panelEl.style.display = 'none';
+        const btn = jlDockButton(id, label, color, () => {
+            const opening = panelEl.style.display === 'none';
+            panelEl.style.display = opening ? shown : 'none';
+            btn.style.boxShadow = opening ? '0 0 0 2px #fff, 0 2px 8px rgba(0,0,0,.4)' : '0 2px 8px rgba(0,0,0,.4)';
+        });
+        return btn;
+    }
+    // ===== end shared dock =====
+
+    const SCRIPT_ID = 'add-note-everywhere';
+    const SCRIPT_LABEL = '📝 Add Note Everywhere';
+    const SCRIPT_COLOR = '#a60';
 
     // ========================================================================
     // CONFIG
@@ -282,18 +339,10 @@
         root.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:99999;font-family:system-ui,sans-serif;';
         document.body.append(root);
 
-        // Collapsed pill — small circular button
-        const pill = document.createElement('button');
-        pill.id = 'jl-add-note-pill';
-        pill.title = 'Add Note Everywhere';
-        pill.textContent = '+ Note';
-        pill.style.cssText = 'background:#0a8;color:#fff;border:0;border-radius:20px;padding:8px 14px;font-size:12px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,0.25);';
-        root.append(pill);
-
-        // Expanded panel — hidden by default
+        // Expanded panel — shown whenever the root is visible (dock controls root)
         const panel = document.createElement('div');
         panel.id = 'jl-add-note-panel';
-        panel.style.cssText = 'display:none;background:#1a1a2e;color:#eee;border-radius:8px;padding:14px;width:340px;box-shadow:0 4px 20px rgba(0,0,0,0.5);';
+        panel.style.cssText = 'display:block;background:#1a1a2e;color:#eee;border-radius:8px;padding:14px;width:340px;box-shadow:0 4px 20px rgba(0,0,0,0.5);';
 
         const header = document.createElement('div');
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
@@ -329,10 +378,9 @@
 
         root.append(panel);
 
-        const expand = () => { pill.style.display = 'none'; panel.style.display = 'block'; ta.focus(); };
-        const collapse = () => { panel.style.display = 'none'; pill.style.display = 'inline-block'; };
-        pill.onclick = expand;
-        closeBtn.onclick = collapse;
+        // Collapse to the shared dock button instead of a standalone FAB.
+        jlRegisterPanel(root, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR);
+        closeBtn.onclick = () => { root.style.display = 'none'; };
 
         btn.onclick = async () => {
             const noteText = ta.value.trim();
@@ -383,6 +431,8 @@
 
     function removeJoblogicPanel() {
         document.getElementById('jl-add-note-root')?.remove();
+        // Drop the dock button too so a later re-render rewires a fresh panel.
+        document.getElementById('jl-launch-' + SCRIPT_ID)?.remove();
     }
 
     // ========================================================================
