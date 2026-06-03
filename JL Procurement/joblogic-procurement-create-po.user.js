@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Procurement -> Joblogic Supplier PO
 // @namespace    http://tampermonkey.net/
-// @version      1.18
+// @version      1.19
 // @description  Floating button on the Procurement Google Group AND Gmail: per email, prompts for job number and creates a Joblogic Supplier PO with "PO Only Supplier" + delivers to the job. v1.1 adds email metadata parsing + Page 2 Additional Instructions / Items autofill. v1.2 force-rebuilds the FAB on script reload so updates take effect, plus console-logs version + click events. v1.3 fixes Trusted Types CSP error on Google Groups (replaces innerHTML with DOM building). v1.4 adds Lightbulbs Direct-style multi-line item parser ("Qty: N" markers); normalises price to unit cost across all parsers. v1.5 adds in-flight guards (prevents duplicate runs from hashchange/popstate) + step-by-step console logging in the Page 2 / Items flow + waits for modal inputs to mount before filling. v1.6 auto-clicks Save in the items modal after filling. v1.7 polls up to 15s for the Add Item button instead of a fixed 600ms sleep (handles slow Page 2 renders). v1.8 handles Heat-and-Plumb-style "Quantity : N    Price : £X.XX" inline format and "Item in this order" header; tabular fallback no longer mistakes qty/price lines for descriptions. v1.9 adds Claude Haiku 4.5 LLM extraction (auto-fallback when regex finds 0 items, plus a manual Re-extract button) with prompt caching, structured outputs, and a settings dialog for the API key. v1.10 adds a Reset button that re-reads the current conversation so the panel can be reused for another email without closing it. v1.11 verifies each item field after setting (retries up to 3x) and runs a final sweep to re-fill any field that got wiped by a later setter — fixes intermittent empty Description. v1.12 detects VAT-inclusive emails (Subtotal == Total with non-zero Taxes line) and divides regex-extracted item prices to net; LLM prompt also instructed to handle VAT correctly. v1.13 also runs the VAT detector on LLM output (it was returning gross prices despite the prompt) — detector compares items_sum against gross/net to decide adjust-or-skip, so it never double-discounts. v1.14 adds Gmail support — same FAB and Create PO flow when an email is open in mail.google.com (uses h2.hP / .gD[email] / .a3s selectors). Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://groups.google.com/a/up-fm.com/g/procurement*
 // @match        https://mail.google.com/*
@@ -20,7 +20,7 @@
     'use strict';
 
     // ===== Shared JL userscript launcher dock (identical in every script) =====
-    const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order', JL_MIN_KEY = 'jl-userscript-dock-min';
+    const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order', JL_MIN_KEY = 'jl-userscript-dock-min', JL_TOP_KEY = 'jl-userscript-dock-top';
     const jlDockList = () => document.getElementById('jl-userscript-dock-list');
     function jlReadOrder() { try { return JSON.parse(localStorage.getItem(JL_ORDER_KEY)) || []; } catch (e) { return []; } }
     function jlSaveOrder() { const l = jlDockList(); if (!l) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...l.children].map(b => b.dataset.scriptId).filter(Boolean))); }
@@ -31,12 +31,19 @@
         let d = document.getElementById(JL_DOCK_ID);
         if (!d) { d = document.createElement('div'); d.id = JL_DOCK_ID; document.body.appendChild(d); }
         d.style.cssText = 'position:fixed;top:80px;right:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-end;';
+        const savedTop = localStorage.getItem(JL_TOP_KEY); if (savedTop !== null) d.style.top = savedTop + 'px';
         let t = document.getElementById('jl-userscript-dock-toggle');
         if (!t) {
             t = document.createElement('button');
             t.id = 'jl-userscript-dock-toggle';
-            t.style.cssText = 'background:#11111a;color:#fff;border:1px solid #555;padding:6px 12px;border-radius:18px;cursor:pointer;font-family:monospace;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);white-space:nowrap;';
-            t.addEventListener('click', () => jlSetDockMin(jlDockList().style.display !== 'none'));
+            t.title = 'Drag to move up/down • click to expand/collapse';
+            t.style.cssText = 'background:#11111a;color:#fff;border:1px solid #555;padding:6px 12px;border-radius:18px;cursor:grab;font-family:monospace;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);white-space:nowrap;touch-action:none;';
+            let drag = null;
+            t.addEventListener('pointerdown', e => { drag = { y: e.clientY, top: d.getBoundingClientRect().top, moved: false }; try { t.setPointerCapture(e.pointerId); } catch (x) {} t.style.cursor = 'grabbing'; e.preventDefault(); });
+            t.addEventListener('pointermove', e => { if (!drag) return; const dy = e.clientY - drag.y; if (Math.abs(dy) > 4) drag.moved = true; if (drag.moved) { const top = Math.max(4, Math.min(window.innerHeight - 40, drag.top + dy)); d.style.top = top + 'px'; } });
+            const endDrag = e => { if (!drag) return; const moved = drag.moved; drag = null; t.style.cursor = 'grab'; try { t.releasePointerCapture(e.pointerId); } catch (x) {} if (moved) { try { localStorage.setItem(JL_TOP_KEY, parseInt(d.style.top, 10)); } catch (x) {} } else { jlSetDockMin(jlDockList().style.display !== 'none'); } };
+            t.addEventListener('pointerup', endDrag);
+            t.addEventListener('pointercancel', endDrag);
             d.appendChild(t);
         }
         let l = document.getElementById('jl-userscript-dock-list');
