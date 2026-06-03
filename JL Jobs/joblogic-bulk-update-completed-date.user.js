@@ -101,7 +101,7 @@
         const closeBtn = document.createElement('button');
         closeBtn.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
         closeBtn.textContent = 'X';
-        closeBtn.addEventListener('click', () => panel.remove());
+        closeBtn.addEventListener('click', () => { panel.style.display = 'none'; });
         header.appendChild(title);
         header.appendChild(closeBtn);
 
@@ -153,6 +153,7 @@
         container.appendChild(logArea);
         panel.appendChild(container);
         document.body.appendChild(panel);
+        jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR);
     }
 
     function log(msg, color) {

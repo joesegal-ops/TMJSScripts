@@ -2,7 +2,7 @@
 
 All Joblogic userscripts collapse to a small launcher button in ONE shared dock
 (a single `#jl-userscript-dock` element). Whichever script loads first creates the
-dock; the rest append their button to it. Buttons line up down the **left edge**,
+dock; the rest append their button to it. Buttons line up down the **right edge**,
 are **draggable to reorder**, and the order is **remembered in localStorage**.
 
 ## 1. Paste this block verbatim inside the IIFE (right after `'use strict';`)
