@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cancel Old Open Visits
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.4
 // @description  Loops through jobs in the list, finds open visits (New, Accepted, Travelling, On Site, Left Site) scheduled more than a week ago, and cancels them Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -14,28 +14,40 @@
     'use strict';
 
     // ===== Shared JL userscript launcher dock (identical in every script) =====
-    const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order';
+    const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order', JL_MIN_KEY = 'jl-userscript-dock-min';
+    const jlDockList = () => document.getElementById('jl-userscript-dock-list');
     function jlReadOrder() { try { return JSON.parse(localStorage.getItem(JL_ORDER_KEY)) || []; } catch (e) { return []; } }
-    function jlSaveOrder() { const d = document.getElementById(JL_DOCK_ID); if (!d) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...d.children].map(b => b.dataset.scriptId).filter(Boolean))); }
-    function jlApplyOrder() { const d = document.getElementById(JL_DOCK_ID); if (!d) return; [...d.children].sort((a, b) => { const o = jlReadOrder(); let ia = o.indexOf(a.dataset.scriptId), ib = o.indexOf(b.dataset.scriptId); if (ia < 0) ia = 1e9; if (ib < 0) ib = 1e9; return ia - ib; }).forEach(b => d.appendChild(b)); }
-    function jlAfter(d, y) { let c = { o: -Infinity, el: null }; for (const el of d.querySelectorAll('button:not(.jl-dragging)')) { const r = el.getBoundingClientRect(); const off = y - (r.top + r.height / 2); if (off < 0 && off > c.o) c = { o: off, el }; } return c.el; }
+    function jlSaveOrder() { const l = jlDockList(); if (!l) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...l.children].map(b => b.dataset.scriptId).filter(Boolean))); }
+    function jlApplyOrder() { const l = jlDockList(); if (!l) return; [...l.children].sort((a, b) => { const o = jlReadOrder(); let ia = o.indexOf(a.dataset.scriptId), ib = o.indexOf(b.dataset.scriptId); if (ia < 0) ia = 1e9; if (ib < 0) ib = 1e9; return ia - ib; }).forEach(b => l.appendChild(b)); }
+    function jlAfter(l, y) { let c = { o: -Infinity, el: null }; for (const el of l.querySelectorAll('button:not(.jl-dragging)')) { const r = el.getBoundingClientRect(); const off = y - (r.top + r.height / 2); if (off < 0 && off > c.o) c = { o: off, el }; } return c.el; }
+    function jlSetDockMin(min) { const l = jlDockList(), t = document.getElementById('jl-userscript-dock-toggle'); if (l) l.style.display = min ? 'none' : 'flex'; if (t) t.textContent = (min ? '▸' : '▾') + ' Advanced Controls'; try { localStorage.setItem(JL_MIN_KEY, min ? '1' : '0'); } catch (e) {} }
     function jlGetDock() {
         let d = document.getElementById(JL_DOCK_ID);
-        if (!d) {
-            d = document.createElement('div');
-            d.id = JL_DOCK_ID;
-            d.style.cssText = 'position:fixed;top:80px;right:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-end;';
-            document.body.appendChild(d);
+        if (!d) { d = document.createElement('div'); d.id = JL_DOCK_ID; document.body.appendChild(d); }
+        d.style.cssText = 'position:fixed;top:80px;right:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-end;';
+        let t = document.getElementById('jl-userscript-dock-toggle');
+        if (!t) {
+            t = document.createElement('button');
+            t.id = 'jl-userscript-dock-toggle';
+            t.style.cssText = 'background:#11111a;color:#fff;border:1px solid #555;padding:6px 12px;border-radius:18px;cursor:pointer;font-family:monospace;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);white-space:nowrap;';
+            t.addEventListener('click', () => jlSetDockMin(jlDockList().style.display !== 'none'));
+            d.appendChild(t);
         }
-        if (!d.dataset.dnd) {
-            d.dataset.dnd = '1';
-            d.addEventListener('dragover', e => { e.preventDefault(); const dr = d.querySelector('.jl-dragging'); if (!dr) return; const a = jlAfter(d, e.clientY); if (a == null) d.appendChild(dr); else d.insertBefore(dr, a); });
-            d.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
+        let l = document.getElementById('jl-userscript-dock-list');
+        if (!l) {
+            l = document.createElement('div');
+            l.id = 'jl-userscript-dock-list';
+            l.style.cssText = 'display:flex;flex-direction:column;gap:8px;align-items:flex-end;';
+            l.addEventListener('dragover', e => { e.preventDefault(); const dr = l.querySelector('.jl-dragging'); if (!dr) return; const a = jlAfter(l, e.clientY); if (a == null) l.appendChild(dr); else l.insertBefore(dr, a); });
+            l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
+            d.appendChild(l);
         }
+        jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }
     function jlDockButton(id, label, color, onClick) {
-        const d = jlGetDock();
+        jlGetDock();
+        const l = jlDockList();
         let b = document.getElementById('jl-launch-' + id);
         if (b) return b;
         b = document.createElement('button');
@@ -48,10 +60,12 @@
         b.addEventListener('click', () => { if (b.dataset.justDragged) { delete b.dataset.justDragged; return; } onClick(); });
         b.addEventListener('dragstart', () => { b.classList.add('jl-dragging'); b.style.opacity = '0.4'; });
         b.addEventListener('dragend', () => { b.classList.remove('jl-dragging'); b.style.opacity = '1'; b.dataset.justDragged = '1'; setTimeout(() => { delete b.dataset.justDragged; }, 60); jlSaveOrder(); });
-        d.appendChild(b);
+        l.appendChild(b);
         jlApplyOrder();
         return b;
     }
+    // Collapse a panel to a dock button. panelEl = the OUTERMOST element of the
+    // script's floating UI. Returns the dock button.
     function jlRegisterPanel(panelEl, id, label, color) {
         const shown = (panelEl.style.display && panelEl.style.display !== 'none') ? panelEl.style.display : 'block';
         panelEl.style.display = 'none';
