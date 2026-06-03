@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic -> Salesforce - Post Visit Update
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Collect latest public visit note + same-day images from Joblogic jobs, post them to matching Salesforce Support Request Chatter feed. v2.5: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Set Site Reference Number
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Paste CSV of AutoID,SF ID; script walks each Site config tab, sets Reference Number, and saves. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none

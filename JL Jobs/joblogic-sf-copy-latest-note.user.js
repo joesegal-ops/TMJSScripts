@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic -> Salesforce - Copy Latest Note (single job)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  One-click copy of the latest public note (and same-day images) from the open Joblogic job to the related Salesforce Case Chatter publisher. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*

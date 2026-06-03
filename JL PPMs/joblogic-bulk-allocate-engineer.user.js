@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Allocate Engineer
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Paste CSV of Job Number, Appointment Date, Engineer. Script navigates each job's Visits tab, fills in the Allocate Engineer panel, clicks Allocate, and reports on existing + new visits. v2.5: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none

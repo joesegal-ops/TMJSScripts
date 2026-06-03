@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Redeploy Visits (from filtered list)
 // @namespace    https://go.joblogic.com/
-// @version      1.17
+// @version      1.18
 // @description  Scan the filtered Jobs list, navigate to each job, and redeploy eligible visits back to the same engineer so the jobs re-appear in their app. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
