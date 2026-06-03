@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cancel Old Open Visits
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Loops through jobs in the list, finds open visits (New, Accepted, Travelling, On Site, Left Site) scheduled more than a week ago, and cancels them Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none

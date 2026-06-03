@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL Bulk Add Job Categories
 // @namespace    https://up-fm.com
-// @version      1.1
+// @version      1.2
 // @description  Bulk-add Job Categories on the Joblogic Library/Misc page. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Library/Misc*
 // @grant        none

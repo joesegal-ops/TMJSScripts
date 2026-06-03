@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Close Jobs & mark Quoted and Closed (API)
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.2
 // @description  Paste a list of job numbers; script tags them "Quoted and Closed" and completes them via API. v3.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none

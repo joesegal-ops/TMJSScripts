@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL Bulk Add Staff
 // @namespace    https://up-fm.com
-// @version      1.4
+// @version      1.5
 // @description  Bulk-add staff to Joblogic by pasting Name/Email/Role from Google Sheets. v1.4: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Staff*
 // @grant        none

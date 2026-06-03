@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Update Invoice Customer Order Number
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  On any Invoice/PPMInvoice list page, enter a value and script updates CustomerOrderNumber on all visible invoices via API. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
