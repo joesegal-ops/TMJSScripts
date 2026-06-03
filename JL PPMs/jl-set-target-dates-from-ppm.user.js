@@ -7,6 +7,8 @@
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/jl-set-target-dates-from-ppm.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/jl-set-target-dates-from-ppm.user.js
 // ==/UserScript==
 
 (function () {

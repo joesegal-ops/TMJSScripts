@@ -12,6 +12,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      api.anthropic.com
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Procurement/joblogic-procurement-create-po.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Procurement/joblogic-procurement-create-po.user.js
 // ==/UserScript==
 
 (function () {

@@ -8,6 +8,8 @@
 // @grant        GM.xmlHttpRequest
 // @connect      cdn.jsdelivr.net
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-bulk-print-reports.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-bulk-print-reports.user.js
 // ==/UserScript==
 
 (function () {

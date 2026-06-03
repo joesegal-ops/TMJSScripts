@@ -10,6 +10,8 @@
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-add-note-everywhere.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-add-note-everywhere.user.js
 // ==/UserScript==
 
 (function () {

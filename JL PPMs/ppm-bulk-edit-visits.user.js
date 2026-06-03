@@ -6,6 +6,8 @@
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-bulk-edit-visits.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-bulk-edit-visits.user.js
 // ==/UserScript==
 
 (function () {

@@ -6,6 +6,8 @@
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-start
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Sites/joblogic-bulk-set-site-reference.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Sites/joblogic-bulk-set-site-reference.user.js
 // ==/UserScript==
 
 (function () {
