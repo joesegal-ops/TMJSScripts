@@ -25,7 +25,7 @@
         if (!d) {
             d = document.createElement('div');
             d.id = JL_DOCK_ID;
-            d.style.cssText = 'position:fixed;top:80px;left:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-start;';
+            d.style.cssText = 'position:fixed;top:80px;right:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-end;';
             document.body.appendChild(d);
         }
         if (!d.dataset.dnd) {
