@@ -5,6 +5,8 @@
 // @description  Bulk-add staff to Joblogic by pasting Name/Email/Role from Google Sheets. v1.4: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Staff*
 // @grant        none
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Misc/joblogic-bulk-add-staff.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Misc/joblogic-bulk-add-staff.user.js
 // ==/UserScript==
 
 (function () {

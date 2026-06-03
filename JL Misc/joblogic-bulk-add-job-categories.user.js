@@ -5,6 +5,8 @@
 // @description  Bulk-add Job Categories on the Joblogic Library/Misc page. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Library/Misc*
 // @grant        none
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Misc/joblogic-bulk-add-job-categories.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Misc/joblogic-bulk-add-job-categories.user.js
 // ==/UserScript==
 
 (function () {

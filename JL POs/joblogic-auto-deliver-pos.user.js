@@ -6,6 +6,8 @@
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20POs/joblogic-auto-deliver-pos.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20POs/joblogic-auto-deliver-pos.user.js
 // ==/UserScript==
 
 (function () {
