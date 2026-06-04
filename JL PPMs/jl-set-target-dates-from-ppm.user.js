@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: Set Target Completion Dates from PPM Visits
 // @namespace    http://tampermonkey.net/
-// @version      2.9
+// @version      2.10
 // @description  For each job in the filtered Jobs list (all pages), reads PPM Visit Due Date + Duration, then sets Target Completion Date = Due Date + Duration (minutes). Supports dry run and stop. v2.3: collapses to a launcher button in the shared dock (drag to reorder).
 // @author       UP-FM / Claude
 // @match        https://go.joblogic.com/*
@@ -16,7 +16,7 @@
 
     // ===== Shared JL userscript launcher dock (identical in every script) =====
     const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order', JL_MIN_KEY = 'jl-userscript-dock-min', JL_TOP_KEY = 'jl-userscript-dock-top';
-    const JL_BTN_CSS = 'color:#fff;padding:7px 13px;border-radius:4px;border:1px solid transparent;cursor:grab;font-family:"Open Sans",sans-serif;font-size:12px;box-shadow:0 1px 3px rgba(0,0,0,.25);white-space:nowrap;';
+    const JL_BTN_CSS = 'color:#fff;padding:7px 13px;border-radius:4px;border:1px solid transparent;cursor:grab;font-family:"Open Sans",sans-serif;font-size:14px;box-shadow:0 1px 3px rgba(0,0,0,.25);white-space:nowrap;';
     const jlDockList = () => document.getElementById('jl-userscript-dock-list');
     function jlReadOrder() { try { return JSON.parse(localStorage.getItem(JL_ORDER_KEY)) || []; } catch (e) { return []; } }
     function jlSaveOrder() { const l = jlDockList(); if (!l) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...l.children].map(b => b.dataset.scriptId).filter(Boolean))); }
@@ -91,7 +91,7 @@
 
     const SCRIPT_ID = 'target-dates-ppm';
     const SCRIPT_LABEL = '🎯 Target Dates (PPM)';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#4c9f01';
 
     if (window.__jlTargetDatesLoaded) return;
     window.__jlTargetDatesLoaded = true;
