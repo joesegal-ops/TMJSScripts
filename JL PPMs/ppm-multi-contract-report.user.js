@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.34
+// @version      3.35
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -51,6 +51,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }

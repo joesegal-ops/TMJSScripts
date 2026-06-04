@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic PPM — Bulk Edit Visits
 // @namespace    https://go.joblogic.com/
-// @version      0.9
+// @version      0.10
 // @description  Bulk-edit Description / Assignee type / Engineer / Duration / Job Category / Trade for all filtered visits on a PPM contract. v0.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
@@ -51,6 +51,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }

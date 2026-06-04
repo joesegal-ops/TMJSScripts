@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Fix Show On for Required Forms (PM0 PPM Maintenance)
 // @namespace    http://tampermonkey.net/
-// @version      3.8
+// @version      3.9
 // @description  Loops through PM0 PPM Maintenance jobs, finds forms with Required on Visit/Asset toggled on, and sets Show On to only "Complete" Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -51,6 +51,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }

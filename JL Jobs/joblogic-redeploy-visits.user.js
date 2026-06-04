@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Redeploy Visits (from filtered list)
 // @namespace    https://go.joblogic.com/
-// @version      1.24
+// @version      1.25
 // @description  Scan the filtered Jobs list, navigate to each job, and redeploy eligible visits back to the same engineer so the jobs re-appear in their app. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -51,6 +51,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }
