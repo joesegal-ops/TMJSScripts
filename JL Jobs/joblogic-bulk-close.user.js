@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Close Jobs & mark Solved on SF (API)
 // @namespace    http://tampermonkey.net/
-// @version      3.9
+// @version      3.10
 // @description  Paste a list of job numbers; script tags them "Solved on SF" and completes them via API. v3.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -56,7 +56,7 @@
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }
-    function jlDockButton(id, label, color, onClick) {
+    function jlDockButton(id, label, color, onClick, desc) {
         jlGetDock();
         const l = jlDockList();
         let b = document.getElementById('jl-launch-' + id);
@@ -66,7 +66,7 @@
         b.id = 'jl-launch-' + id;
         b.dataset.scriptId = id;
         b.textContent = label;
-        b.title = 'Show / hide ' + label + '  (drag to reorder)';
+        b.title = (desc ? desc + '\n\n' : '') + '(click to open • drag to reorder)';
         b.draggable = true;
         b.style.cssText = JL_BTN_CSS + 'background:' + bg + ';border-color:' + bg + ';';
         b.addEventListener('click', () => { if (b.dataset.justDragged) { delete b.dataset.justDragged; return; } onClick(); });
@@ -76,16 +76,28 @@
         jlApplyOrder();
         return b;
     }
+    // A small help banner prepended inside a panel the first time it opens.
+    function jlHelpBanner(text) {
+        const b = document.createElement('div');
+        b.className = 'jl-help-banner';
+        b.style.cssText = 'background:#0e3a4f;color:#e3edf2;font-family:"Open Sans",sans-serif;font-size:11px;line-height:1.45;padding:8px 10px;border-radius:4px;margin:0 0 8px 0;border-left:3px solid #ff7919;';
+        b.textContent = text;
+        return b;
+    }
     // Collapse a panel to a dock button. panelEl = the OUTERMOST element of the
-    // script's floating UI. Returns the dock button.
-    function jlRegisterPanel(panelEl, id, label, color) {
+    // script's floating UI. desc = on-hover + in-panel summary text.
+    function jlRegisterPanel(panelEl, id, label, color, desc) {
         const shown = (panelEl.style.display && panelEl.style.display !== 'none') ? panelEl.style.display : 'block';
         panelEl.style.display = 'none';
         const btn = jlDockButton(id, label, color, () => {
             const opening = panelEl.style.display === 'none';
             panelEl.style.display = opening ? shown : 'none';
+            if (opening && desc) {
+                const box = getComputedStyle(panelEl).position === 'fixed' ? panelEl : (panelEl.firstElementChild || panelEl);
+                if (box && !box.querySelector(':scope > .jl-help-banner')) box.insertBefore(jlHelpBanner(desc), box.firstChild);
+            }
             btn.style.boxShadow = opening ? '0 0 0 2px #fff, 0 1px 3px rgba(0,0,0,.25)' : '0 1px 3px rgba(0,0,0,.25)';
-        });
+        }, desc);
         return btn;
     }
     // ===== end shared dock =====
@@ -93,6 +105,7 @@
     const SCRIPT_ID = 'bulk-close';
     const SCRIPT_LABEL = '✅ Bulk Close and Mark as Solved on SF';
     const SCRIPT_COLOR = '#6b4226';
+    const SCRIPT_DESC = 'Paste a list of job numbers; tags each as Solved on SF and completes it via the API. Paste the numbers, then Start.';
 
     // --- CONFIG ---
     const TAG_NAME = 'Solved on SF';
@@ -183,7 +196,7 @@
         document.body.appendChild(panel);
 
         // Start hidden; the shared dock button toggles visibility.
-        jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR);
+        jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
     }
 
     function log(msg, color) {

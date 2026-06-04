@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.10
+// @version      1.12
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -29,7 +29,8 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#4c9f01';
+    const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
     let rows = [];          // parsed sheet rows
     let results = [];       // per-row outcome (for Copy)
@@ -697,7 +698,7 @@
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }
-    function jlDockButton(id, label, color, onClick) {
+    function jlDockButton(id, label, color, onClick, desc) {
         jlGetDock();
         const l = jlDockList();
         let b = document.getElementById('jl-launch-' + id);
@@ -707,7 +708,7 @@
         b.id = 'jl-launch-' + id;
         b.dataset.scriptId = id;
         b.textContent = label;
-        b.title = 'Show / hide ' + label + '  (drag to reorder)';
+        b.title = (desc ? desc + '\n\n' : '') + '(click to open • drag to reorder)';
         b.draggable = true;
         b.style.cssText = JL_BTN_CSS + 'background:' + bg + ';border-color:' + bg + ';';
         b.addEventListener('click', () => { if (b.dataset.justDragged) { delete b.dataset.justDragged; return; } onClick(); });
@@ -717,16 +718,28 @@
         jlApplyOrder();
         return b;
     }
+    // A small help banner prepended inside a panel the first time it opens.
+    function jlHelpBanner(text) {
+        const b = document.createElement('div');
+        b.className = 'jl-help-banner';
+        b.style.cssText = 'background:#0e3a4f;color:#e3edf2;font-family:"Open Sans",sans-serif;font-size:11px;line-height:1.45;padding:8px 10px;border-radius:4px;margin:0 0 8px 0;border-left:3px solid #ff7919;';
+        b.textContent = text;
+        return b;
+    }
     // Collapse a panel to a dock button. panelEl = the OUTERMOST element of the
-    // script's floating UI. Returns the dock button.
-    function jlRegisterPanel(panelEl, id, label, color) {
+    // script's floating UI. desc = on-hover + in-panel summary text.
+    function jlRegisterPanel(panelEl, id, label, color, desc) {
         const shown = (panelEl.style.display && panelEl.style.display !== 'none') ? panelEl.style.display : 'block';
         panelEl.style.display = 'none';
         const btn = jlDockButton(id, label, color, () => {
             const opening = panelEl.style.display === 'none';
             panelEl.style.display = opening ? shown : 'none';
+            if (opening && desc) {
+                const box = getComputedStyle(panelEl).position === 'fixed' ? panelEl : (panelEl.firstElementChild || panelEl);
+                if (box && !box.querySelector(':scope > .jl-help-banner')) box.insertBefore(jlHelpBanner(desc), box.firstChild);
+            }
             btn.style.boxShadow = opening ? '0 0 0 2px #fff, 0 1px 3px rgba(0,0,0,.25)' : '0 1px 3px rgba(0,0,0,.25)';
-        });
+        }, desc);
         return btn;
     }
     // ===== end shared dock =====
@@ -774,7 +787,7 @@
         c.appendChild(header); c.appendChild(hint); c.appendChild(pasteArea);
         c.appendChild(controls); c.appendChild(resultsBox); c.appendChild(logLabel); c.appendChild(logArea);
         panel.appendChild(c); document.body.appendChild(panel);
-        jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR);
+        jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
     }
     function mkBtn(text, bg, fn) {
         const b = document.createElement('button');
