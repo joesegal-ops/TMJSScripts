@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic PPM — Bulk Edit Visits
 // @namespace    https://go.joblogic.com/
-// @version      0.8
+// @version      0.9
 // @description  Bulk-edit Description / Assignee type / Engineer / Duration / Job Category / Trade for all filtered visits on a PPM contract. v0.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
@@ -15,7 +15,7 @@
 
     // ===== Shared JL userscript launcher dock (identical in every script) =====
     const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order', JL_MIN_KEY = 'jl-userscript-dock-min', JL_TOP_KEY = 'jl-userscript-dock-top';
-    const JL_BTN_CSS = 'color:#fff;padding:7px 13px;border-radius:4px;border:1px solid transparent;cursor:grab;font-family:"Open Sans",sans-serif;font-size:12px;box-shadow:0 1px 3px rgba(0,0,0,.25);white-space:nowrap;';
+    const JL_BTN_CSS = 'color:#fff;padding:7px 13px;border-radius:4px;border:1px solid transparent;cursor:grab;font-family:"Open Sans",sans-serif;font-size:14px;box-shadow:0 1px 3px rgba(0,0,0,.25);white-space:nowrap;';
     const jlDockList = () => document.getElementById('jl-userscript-dock-list');
     function jlReadOrder() { try { return JSON.parse(localStorage.getItem(JL_ORDER_KEY)) || []; } catch (e) { return []; } }
     function jlSaveOrder() { const l = jlDockList(); if (!l) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...l.children].map(b => b.dataset.scriptId).filter(Boolean))); }
@@ -90,7 +90,7 @@
 
     const SCRIPT_ID = 'ppm-bulk-edit-visits';
     const SCRIPT_LABEL = '🗓 PPM Edit Visits';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#4c9f01';
 
     // ---------------------------------------------------------------------
     // CONFIG — tweak selectors here once you've inspected the real DOM.
