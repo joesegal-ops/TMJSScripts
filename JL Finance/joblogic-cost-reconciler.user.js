@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.12
+// @version      1.13
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -99,16 +99,30 @@
     }
     function extractRefs(text) {
         const t = String(text || '');
-        const out = { job: [], sf: [], quote: [] };
-        (t.match(RE_QUOTE) || []).forEach(m => out.quote.push(m.replace(/\s+/g, '').toUpperCase()));
-        // remove quote hits before scanning job refs so "UP02443" isn't read as job "P02443"
+        const out = { job: [], sf: [], quote: [], internal: [] };
+        (t.match(RE_QUOTE) || []).forEach(m => {
+            const code = m.replace(/\s+/g, '').toUpperCase();
+            // Real quotes look like UP0xxxx (leading zero). Codes like UP1000 are
+            // internal materials codes, NOT quotes (per Finance) — don't job-search them.
+            if (/^UP0\d+$/.test(code)) out.quote.push(code);
+            else out.internal.push(code);
+        });
         let t2 = t.replace(RE_QUOTE, ' ');
         (t2.match(RE_JOBREF) || []).forEach(m => out.job.push(normJobRef(m)));
         (t.match(RE_SF) || []).forEach(m => out.sf.push(m));
         out.job = [...new Set(out.job)];
         out.sf = [...new Set(out.sf)];
         out.quote = [...new Set(out.quote)];
+        out.internal = [...new Set(out.internal)];
         return out;
+    }
+    // JL job numbers are PREFIX + 7 zero-padded digits (e.g. PROJ0001393); staff
+    // often drop the zeros ("PROJ 1393" / "PROJ1393"). Return forms to try.
+    function jobRefCandidates(ref) {
+        const m = String(ref).toUpperCase().match(/^(RE|PROJ|MOB|M|R)0*(\d+)$/);
+        if (!m) return [ref];
+        const prefix = m[1], num = m[2];
+        return [...new Set([prefix + num.padStart(7, '0'), ref, prefix + ' ' + num, prefix + num])];
     }
 
     // ===================================================================
@@ -133,7 +147,7 @@
         if (jobs.length) {
             const exact = jobs.find(j => norm(j.JobNumber) === norm(term) || norm(j.ReferenceNumber) === norm(term));
             const m = exact || jobs[0];
-            res = { id: m.Id || m.JobId, jobNumber: m.JobNumber || m.ReferenceNumber || term, multiple: jobs.length };
+            res = { id: m.Id || m.JobId, jobNumber: m.JobNumber || m.ReferenceNumber || term, multiple: jobs.length, exact: !!exact };
         }
         searchCache.set(term, res);
         return res;
@@ -355,6 +369,26 @@
     const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
     // Find the best line match across job + secondary sources.
+    // For NOT-IN-JOB rows, rank the job/quote cost lines by how close their value is
+    // to the receipt (nearest of net/gross vs nearest of unit/subtotal), and flag any
+    // whose description shares a word with the merchant. Lets a human spot near-misses
+    // (delivery charges, rounding, slightly different descriptions).
+    function candidateLines(net, gross, lines, merchant) {
+        const tokens = (String(merchant || '').toLowerCase().match(/[a-z]{4,}/g) || []);
+        const scored = [];
+        for (const l of lines) {
+            // only purchasable lines — a receipt is never labour/travel/mileage
+            if (/labour|travel|mileage|overtime|call-?out/i.test(l.category || '')) continue;
+            const vals = [l.unit, l.subtotal].filter(v => v != null && v > 0);
+            if (!vals.length) continue;
+            let dist = Infinity;
+            vals.forEach(v => [net, gross].forEach(b => { if (b > 0) dist = Math.min(dist, Math.abs(v - b) / b); }));
+            const desc = String(l.desc || '').toLowerCase();
+            scored.push({ line: l, dist, descMatch: tokens.some(tok => desc.includes(tok)) });
+        }
+        scored.sort((a, b) => a.dist - b.dist);
+        return scored;
+    }
     function matchAgainstLines(net, gross, sheetVat, lines, ownerName, dateStr) {
         let best = null;
         for (const line of lines) {
@@ -457,7 +491,13 @@
     async function resolveJob(refs) {
         // returns {id, jobNumber, via, quoteNote} or null
         for (const ref of refs.job) {
-            const j = await searchJob(ref); if (j) return { ...j, via: 'job ref ' + ref };
+            let fallback = null;
+            for (const cand of jobRefCandidates(ref)) {
+                const j = await searchJob(cand);
+                if (j && j.exact) return { ...j, via: 'job ref ' + j.jobNumber };
+                if (j && !fallback) fallback = { ...j, via: 'job ref ' + ref + ' \u2192 ' + j.jobNumber };
+            }
+            if (fallback) return fallback;
         }
         for (const ref of refs.sf) {
             const j = await searchJob(ref); if (j) return { ...j, via: 'Salesforce ' + ref };
@@ -483,7 +523,8 @@
         }
         const anyRef = m.refs.job.length || m.refs.sf.length || m.refs.quote.length;
         if (!anyRef) {
-            return { ...base, status: 'NO REFERENCE', detail: `No job ref / SF number / quote in Note or Source. Note: "${(m.note || '').slice(0, 60)}"` };
+            const internalNote = m.refs.internal.length ? ` (${m.refs.internal.join(', ')} looks like an internal code, e.g. materials — not a job or quote)` : '';
+            return { ...base, status: 'NO REFERENCE', detail: `No job ref / SF number / quote in Note or Source${internalNote}. Note: "${(m.note || '').slice(0, 60)}"` };
         }
 
         const job = await resolveJob(m.refs);
@@ -502,25 +543,50 @@
 
         // 2) If nothing on the job, look at parent/related quote (+ its embedded costs)
         let secondaryNote = '';
+        let quoteLabel = null, rwLines = [];
         if (!best) {
             try {
                 const rw = await getRelatedWorks(job.id);
-                if (rw.lines.length) {
-                    best = matchAgainstLines(m.net, m.gross, m.vat, rw.lines, m.owner, m.date);
+                quoteLabel = rw.quoteLabel; rwLines = rw.lines || [];
+                if (rwLines.length) {
+                    best = matchAgainstLines(m.net, m.gross, m.vat, rwLines, m.owner, m.date);
                     if (best) secondaryNote = ' (found in ' + best.line.source + ')';
-                } else if (rw.quoteLabel) {
-                    secondaryNote = ` (related quote ${rw.quoteLabel} has no matching cost line)`;
                 }
             } catch (e) { /* related works optional */ }
         }
 
         const jobUrl = `${location.origin}/Job/Detail/${job.id}`;
+        const isProject = /^PROJ/i.test(job.jobNumber || '');
+
         if (!best) {
+            // No clean match: surface the closest cost line(s) so a human can judge
+            // (delivery charges, rounding, slightly different descriptions).
+            const cands = candidateLines(m.net, m.gross, allLines.concat(rwLines), m.merchant);
+            const top = cands.slice(0, 2);
+            const plausible = top.find(c => c.dist <= 0.30 || c.descMatch);
+            const fmtVal = l => { const v = (l.unit && l.unit > 0) ? l.unit : l.subtotal; return v != null ? '£' + v.toFixed(2) : ''; };
+            const fmtLine = c => `"${(c.line.desc || c.line.category || 'line').slice(0, 48)}" ${fmtVal(c.line)}${(c.line.source || '').indexOf('quote') === 0 ? ' [' + c.line.source + ']' : ''}`;
+            const candText = top.length ? '  Closest: ' + top.map(fmtLine).join(' ; ') : '';
+
+            if (plausible) {
+                return {
+                    ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
+                    status: 'POSSIBLE MATCH',
+                    detail: `Job ${job.jobNumber}: no exact match for £${m.net.toFixed(2)} net, but a similar cost line exists — value differs (delivery / rounding / description?).${candText}`,
+                    suggest: `Review — may already be on the job as ${fmtLine(plausible)}. Confirm before adding.`
+                };
+            }
+            let action;
+            if (isProject || quoteLabel) {
+                action = `Project/quoted job${quoteLabel ? ' (quote ' + quoteLabel + ')' : ''} — the cost is likely already covered/forecasted in the quote. If it does need adding, put it on as a NON-CHARGEABLE materials line.`;
+            } else {
+                action = `Not on the job — add it as a materials line (£${m.net.toFixed(2)} net).`;
+            }
             return {
                 ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
                 status: 'NOT IN JOB',
-                detail: `Job ${job.jobNumber} found (${job.via}) but no cost line near £${m.net.toFixed(2)} net${secondaryNote}.` +
-                        (parseOk ? '' : ' [could not read cost model]')
+                detail: `Job ${job.jobNumber} found (${job.via}) but no cost line near £${m.net.toFixed(2)} net${quoteLabel ? ' (related quote ' + quoteLabel + ')' : ''}.${candText}` + (parseOk ? '' : ' [could not read cost model]'),
+                suggest: action
             };
         }
 
@@ -539,7 +605,7 @@
             ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
             status: 'INCORRECT', factor: best.factor,
             detail: best.why + secondaryNote + (soft.length ? '  [' + soft.join('; ') + ']' : ''),
-            suggest: `Change ${best.line.source} "${(best.line.desc || '').slice(0, 40)}" unit cost to £${m.net.toFixed(2)} (net).`
+            suggest: `Change ${best.line.source} "${(best.line.desc || '').slice(0, 40)}" unit cost to £${m.net.toFixed(2)} (net). If the line has already been invoiced, the invoice/credit must be corrected too.`
         };
     }
 
@@ -556,7 +622,7 @@
         logArea.innerHTML = ''; resultsBox.innerHTML = '';
         log(`Parsed ${parsed.headers.length} columns, ${rows.length} rows.`, '#0af');
 
-        const stats = { ok: 0, incorrect: 0, notin: 0, notfound: 0, noref: 0, noval: 0, err: 0 };
+        const stats = { ok: 0, incorrect: 0, possible: 0, notin: 0, notfound: 0, noref: 0, noval: 0, err: 0 };
         for (let i = 0; i < rows.length; i++) {
             if (!running) { log('Stopped by user.', '#f55'); break; }
             setProgress(`Row ${i + 1}/${rows.length}`);
@@ -572,6 +638,7 @@
         log('===== SUMMARY =====', '#0af');
         log(`Already in job: ${stats.ok}`, '#0fa');
         log(`Incorrect:      ${stats.incorrect}`, '#fb0');
+        log(`Possible match: ${stats.possible}`, '#3cc');
         log(`Not in job:     ${stats.notin}`, '#f90');
         log(`Job not found:  ${stats.notfound}`, '#f55');
         log(`No reference:   ${stats.noref}`, '#999');
@@ -584,7 +651,7 @@
     }
 
     function tallyAndRender(res, stats) {
-        const map = { 'ALREADY IN JOB': 'ok', 'INCORRECT': 'incorrect', 'NOT IN JOB': 'notin',
+        const map = { 'ALREADY IN JOB': 'ok', 'INCORRECT': 'incorrect', 'POSSIBLE MATCH': 'possible', 'NOT IN JOB': 'notin',
             'JOB NOT FOUND': 'notfound', 'NO JOB': 'notfound', 'NO REFERENCE': 'noref', 'NO VALUE': 'noval' };
         if (map[res.status]) stats[map[res.status]]++;
         renderResult(res);
@@ -594,7 +661,7 @@
     // UI
     // ===================================================================
     const STATUS_COLOR = {
-        'ALREADY IN JOB': '#0fa', 'INCORRECT': '#fb0', 'NOT IN JOB': '#f90',
+        'ALREADY IN JOB': '#0fa', 'INCORRECT': '#fb0', 'POSSIBLE MATCH': '#3cc', 'NOT IN JOB': '#f90',
         'JOB NOT FOUND': '#f55', 'NO JOB': '#f77', 'NO REFERENCE': '#999',
         'NO VALUE': '#999', 'ERROR': '#f55'
     };
