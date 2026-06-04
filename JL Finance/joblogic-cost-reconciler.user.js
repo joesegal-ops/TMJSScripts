@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.13
+// @version      1.14
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -559,7 +559,20 @@
         const isProject = /^PROJ/i.test(job.jobNumber || '');
 
         if (!best) {
-            // No clean match: surface the closest cost line(s) so a human can judge
+            // Describe the cost landscape: does the job/quote have ANY costs at all,
+            // or does it have costs that simply did not match? (changes the action).
+            const valued = l => (l.unit && l.unit > 0) || (l.subtotal && l.subtotal > 0);
+            const isMat = l => !/labour|travel|mileage|overtime|call-?out/i.test(l.category || '');
+            const jobValued = allLines.filter(valued);
+            const jobMats = jobValued.filter(isMat);
+            const quoteValued = rwLines.filter(valued);
+            let landscape = jobValued.length
+                ? `Job has ${jobValued.length} cost line${jobValued.length === 1 ? '' : 's'} (${jobMats.length} material/expense)`
+                : 'Job has NO costs entered yet';
+            if (quoteLabel) landscape += `; related quote ${quoteLabel} has ${quoteValued.length} line${quoteValued.length === 1 ? '' : 's'}`;
+            else landscape += '; no related quote';
+
+            // Surface the closest cost line(s) so a human can judge near-misses
             // (delivery charges, rounding, slightly different descriptions).
             const cands = candidateLines(m.net, m.gross, allLines.concat(rwLines), m.merchant);
             const top = cands.slice(0, 2);
@@ -572,7 +585,7 @@
                 return {
                     ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
                     status: 'POSSIBLE MATCH',
-                    detail: `Job ${job.jobNumber}: no exact match for £${m.net.toFixed(2)} net, but a similar cost line exists — value differs (delivery / rounding / description?).${candText}`,
+                    detail: `${landscape}. No exact match for £${m.net.toFixed(2)} net, but a similar line exists — value differs (delivery / rounding / description?).${candText}`,
                     suggest: `Review — may already be on the job as ${fmtLine(plausible)}. Confirm before adding.`
                 };
             }
@@ -585,7 +598,7 @@
             return {
                 ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
                 status: 'NOT IN JOB',
-                detail: `Job ${job.jobNumber} found (${job.via}) but no cost line near £${m.net.toFixed(2)} net${quoteLabel ? ' (related quote ' + quoteLabel + ')' : ''}.${candText}` + (parseOk ? '' : ' [could not read cost model]'),
+                detail: `Job ${job.jobNumber} found (${job.via}). ${landscape}. No cost line near £${m.net.toFixed(2)} net.${candText}` + (parseOk ? '' : ' [could not read cost model]'),
                 suggest: action
             };
         }
