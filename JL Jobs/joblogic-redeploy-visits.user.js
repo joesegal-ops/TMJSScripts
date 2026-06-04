@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Redeploy Visits (from filtered list)
 // @namespace    https://go.joblogic.com/
-// @version      1.21
+// @version      1.23
 // @description  Scan the filtered Jobs list, navigate to each job, and redeploy eligible visits back to the same engineer so the jobs re-appear in their app. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -15,6 +15,7 @@
 
     // ===== Shared JL userscript launcher dock (identical in every script) =====
     const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order', JL_MIN_KEY = 'jl-userscript-dock-min', JL_TOP_KEY = 'jl-userscript-dock-top';
+    const JL_BTN_CSS = 'color:#fff;padding:7px 13px;border-radius:4px;border:1px solid transparent;cursor:grab;font-family:"Open Sans",sans-serif;font-size:12px;box-shadow:0 1px 3px rgba(0,0,0,.25);white-space:nowrap;';
     const jlDockList = () => document.getElementById('jl-userscript-dock-list');
     function jlReadOrder() { try { return JSON.parse(localStorage.getItem(JL_ORDER_KEY)) || []; } catch (e) { return []; } }
     function jlSaveOrder() { const l = jlDockList(); if (!l) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...l.children].map(b => b.dataset.scriptId).filter(Boolean))); }
@@ -22,6 +23,7 @@
     function jlAfter(l, y) { let c = { o: -Infinity, el: null }; for (const el of l.querySelectorAll('button:not(.jl-dragging)')) { const r = el.getBoundingClientRect(); const off = y - (r.top + r.height / 2); if (off < 0 && off > c.o) c = { o: off, el }; } return c.el; }
     function jlSetDockMin(min) { const l = jlDockList(), t = document.getElementById('jl-userscript-dock-toggle'); if (l) l.style.display = min ? 'none' : 'flex'; if (t) t.textContent = (min ? '▸' : '▾') + ' Advanced Controls'; try { localStorage.setItem(JL_MIN_KEY, min ? '1' : '0'); } catch (e) {} }
     function jlGetDock() {
+        if (!document.getElementById('jl-dock-style')) { const st = document.createElement('style'); st.id = 'jl-dock-style'; st.textContent = '#jl-userscript-dock button:hover{filter:brightness(1.18);}'; (document.head || document.documentElement).appendChild(st); }
         let d = document.getElementById(JL_DOCK_ID);
         if (!d) { d = document.createElement('div'); d.id = JL_DOCK_ID; document.body.appendChild(d); }
         d.style.cssText = 'position:fixed;top:80px;right:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-end;';
@@ -31,7 +33,7 @@
             t = document.createElement('button');
             t.id = 'jl-userscript-dock-toggle';
             t.title = 'Drag to move up/down • click to expand/collapse';
-            t.style.cssText = 'background:#11111a;color:#fff;border:1px solid #555;padding:6px 12px;border-radius:18px;cursor:grab;font-family:monospace;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);white-space:nowrap;touch-action:none;';
+            t.style.cssText = JL_BTN_CSS + 'background:#072d3d;border-color:#072d3d;touch-action:none;';
             let drag = null;
             t.addEventListener('pointerdown', e => { drag = { y: e.clientY, top: d.getBoundingClientRect().top, moved: false }; try { t.setPointerCapture(e.pointerId); } catch (x) {} t.style.cursor = 'grabbing'; e.preventDefault(); });
             t.addEventListener('pointermove', e => { if (!drag) return; const dy = e.clientY - drag.y; if (Math.abs(dy) > 4) drag.moved = true; if (drag.moved) { const top = Math.max(4, Math.min(window.innerHeight - 40, drag.top + dy)); d.style.top = top + 'px'; } });
@@ -57,13 +59,14 @@
         const l = jlDockList();
         let b = document.getElementById('jl-launch-' + id);
         if (b) return b;
+        const bg = color || '#072d3d';
         b = document.createElement('button');
         b.id = 'jl-launch-' + id;
         b.dataset.scriptId = id;
         b.textContent = label;
         b.title = 'Show / hide ' + label + '  (drag to reorder)';
         b.draggable = true;
-        b.style.cssText = `background:${color};color:#fff;border:none;padding:8px 13px;border-radius:18px;cursor:grab;font-family:monospace;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.4);white-space:nowrap;`;
+        b.style.cssText = JL_BTN_CSS + 'background:' + bg + ';border-color:' + bg + ';';
         b.addEventListener('click', () => { if (b.dataset.justDragged) { delete b.dataset.justDragged; return; } onClick(); });
         b.addEventListener('dragstart', () => { b.classList.add('jl-dragging'); b.style.opacity = '0.4'; });
         b.addEventListener('dragend', () => { b.classList.remove('jl-dragging'); b.style.opacity = '1'; b.dataset.justDragged = '1'; setTimeout(() => { delete b.dataset.justDragged; }, 60); jlSaveOrder(); });
@@ -79,7 +82,7 @@
         const btn = jlDockButton(id, label, color, () => {
             const opening = panelEl.style.display === 'none';
             panelEl.style.display = opening ? shown : 'none';
-            btn.style.boxShadow = opening ? '0 0 0 2px #fff, 0 2px 8px rgba(0,0,0,.4)' : '0 2px 8px rgba(0,0,0,.4)';
+            btn.style.boxShadow = opening ? '0 0 0 2px #fff, 0 1px 3px rgba(0,0,0,.25)' : '0 1px 3px rgba(0,0,0,.25)';
         });
         return btn;
     }
@@ -87,7 +90,7 @@
 
     const SCRIPT_ID = 'redeploy-visits';
     const SCRIPT_LABEL = '🔁 Redeploy Visits';
-    const SCRIPT_COLOR = '#a60';
+    const SCRIPT_COLOR = '#072d3d';
 
     if (window.__jlRedeployLoaded) return;
     window.__jlRedeployLoaded = true;
