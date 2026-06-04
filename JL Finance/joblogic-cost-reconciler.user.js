@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.14
+// @version      1.15
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -595,9 +595,10 @@
             } else {
                 action = `Not on the job — add it as a materials line (£${m.net.toFixed(2)} net).`;
             }
+            const noMatchStatus = (jobValued.length || quoteValued.length) ? 'NOT IN JOB' : 'NO COSTS';
             return {
                 ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
-                status: 'NOT IN JOB',
+                status: noMatchStatus,
                 detail: `Job ${job.jobNumber} found (${job.via}). ${landscape}. No cost line near £${m.net.toFixed(2)} net.${candText}` + (parseOk ? '' : ' [could not read cost model]'),
                 suggest: action
             };
@@ -635,7 +636,7 @@
         logArea.innerHTML = ''; resultsBox.innerHTML = '';
         log(`Parsed ${parsed.headers.length} columns, ${rows.length} rows.`, '#0af');
 
-        const stats = { ok: 0, incorrect: 0, possible: 0, notin: 0, notfound: 0, noref: 0, noval: 0, err: 0 };
+        const stats = { ok: 0, incorrect: 0, possible: 0, notin: 0, nocosts: 0, notfound: 0, noref: 0, noval: 0, err: 0 };
         for (let i = 0; i < rows.length; i++) {
             if (!running) { log('Stopped by user.', '#f55'); break; }
             setProgress(`Row ${i + 1}/${rows.length}`);
@@ -653,6 +654,7 @@
         log(`Incorrect:      ${stats.incorrect}`, '#fb0');
         log(`Possible match: ${stats.possible}`, '#3cc');
         log(`Not in job:     ${stats.notin}`, '#f90');
+        log(`No costs:       ${stats.nocosts}`, '#b388ff');
         log(`Job not found:  ${stats.notfound}`, '#f55');
         log(`No reference:   ${stats.noref}`, '#999');
         log(`No value:       ${stats.noval}`, '#999');
@@ -664,7 +666,7 @@
     }
 
     function tallyAndRender(res, stats) {
-        const map = { 'ALREADY IN JOB': 'ok', 'INCORRECT': 'incorrect', 'POSSIBLE MATCH': 'possible', 'NOT IN JOB': 'notin',
+        const map = { 'ALREADY IN JOB': 'ok', 'INCORRECT': 'incorrect', 'POSSIBLE MATCH': 'possible', 'NOT IN JOB': 'notin', 'NO COSTS': 'nocosts',
             'JOB NOT FOUND': 'notfound', 'NO JOB': 'notfound', 'NO REFERENCE': 'noref', 'NO VALUE': 'noval' };
         if (map[res.status]) stats[map[res.status]]++;
         renderResult(res);
@@ -674,7 +676,7 @@
     // UI
     // ===================================================================
     const STATUS_COLOR = {
-        'ALREADY IN JOB': '#0fa', 'INCORRECT': '#fb0', 'POSSIBLE MATCH': '#3cc', 'NOT IN JOB': '#f90',
+        'ALREADY IN JOB': '#0fa', 'INCORRECT': '#fb0', 'POSSIBLE MATCH': '#3cc', 'NOT IN JOB': '#f90', 'NO COSTS': '#b388ff',
         'JOB NOT FOUND': '#f55', 'NO JOB': '#f77', 'NO REFERENCE': '#999',
         'NO VALUE': '#999', 'ERROR': '#f55'
     };
