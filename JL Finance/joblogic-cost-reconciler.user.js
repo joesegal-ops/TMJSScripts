@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -28,7 +28,7 @@
 
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
-    const SCRIPT_LABEL = '💷 Cost Reconciler';
+    const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
     const SCRIPT_COLOR = '#072d3d';
     let running = false;
     let rows = [];          // parsed sheet rows
@@ -739,7 +739,7 @@
 
         const header = document.createElement('div');
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
-        const title = document.createElement('strong'); title.style.fontSize = '14px'; title.textContent = 'Cost Reconciler  (read-only)';
+        const title = document.createElement('strong'); title.style.fontSize = '14px'; title.textContent = 'Check costs are in Jobs correctly  (read-only)';
         const x = document.createElement('button'); x.textContent = '–'; x.title = 'Collapse';
         x.style.cssText = 'background:none;border:none;color:#eee;font-size:20px;cursor:pointer;line-height:1;';
         x.addEventListener('click', () => { panel.style.display = 'none'; });
