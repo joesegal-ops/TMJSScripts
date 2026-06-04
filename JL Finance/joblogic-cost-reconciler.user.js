@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      1.10
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -692,6 +692,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }

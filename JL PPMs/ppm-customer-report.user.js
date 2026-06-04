@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Contract Customer Report
 // @namespace    https://go.joblogic.com/
-// @version      4.8
+// @version      4.9
 // @downloadURL https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-customer-report.user.js
 // @updateURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-customer-report.user.js
 // @description  Generate a branded Untitled Projects PPM matrix report — services as rows, months as columns, colour-coded completion status. Share with the customer monthly. v4.1: collapses to a launcher button in the shared dock (drag to reorder).
@@ -51,6 +51,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }

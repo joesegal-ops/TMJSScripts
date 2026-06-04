@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Close Jobs & mark Solved on SF (API)
 // @namespace    http://tampermonkey.net/
-// @version      3.8
+// @version      3.9
 // @description  Paste a list of job numbers; script tags them "Solved on SF" and completes them via API. v3.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -51,6 +51,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }

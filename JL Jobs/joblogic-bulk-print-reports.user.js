@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Print Job Reports (Merged PDF)
 // @namespace    http://tampermonkey.net/
-// @version      1.10
+// @version      1.11
 // @description  On /Job with a filter applied, iterates all jobs across all pages, downloads each Job Report (Share > Download), and saves a single merged PDF. v1.3: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Job*
 // @grant        GM_xmlhttpRequest
@@ -53,6 +53,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }

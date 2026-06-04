@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -51,6 +51,8 @@
             l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
             d.appendChild(l);
         }
+        [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+        jlApplyOrder();
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }
