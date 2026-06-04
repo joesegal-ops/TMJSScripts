@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic -> Salesforce - Post Visit Update
 // @namespace    http://tampermonkey.net/
-// @version      2.13
+// @version      2.14
 // @description  Collect latest public visit note + same-day images from Joblogic jobs, post them to matching Salesforce Support Request Chatter feed. v2.5: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*
@@ -60,7 +60,7 @@
         jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
         return d;
     }
-    function jlDockButton(id, label, color, onClick) {
+    function jlDockButton(id, label, color, onClick, desc) {
         jlGetDock();
         const l = jlDockList();
         let b = document.getElementById('jl-launch-' + id);
@@ -70,7 +70,7 @@
         b.id = 'jl-launch-' + id;
         b.dataset.scriptId = id;
         b.textContent = label;
-        b.title = 'Show / hide ' + label + '  (drag to reorder)';
+        b.title = (desc ? desc + '\n\n' : '') + '(click to open • drag to reorder)';
         b.draggable = true;
         b.style.cssText = JL_BTN_CSS + 'background:' + bg + ';border-color:' + bg + ';';
         b.addEventListener('click', () => { if (b.dataset.justDragged) { delete b.dataset.justDragged; return; } onClick(); });
@@ -80,16 +80,28 @@
         jlApplyOrder();
         return b;
     }
+    // A small help banner prepended inside a panel the first time it opens.
+    function jlHelpBanner(text) {
+        const b = document.createElement('div');
+        b.className = 'jl-help-banner';
+        b.style.cssText = 'background:#0e3a4f;color:#e3edf2;font-family:"Open Sans",sans-serif;font-size:11px;line-height:1.45;padding:8px 10px;border-radius:4px;margin:0 0 8px 0;border-left:3px solid #ff7919;';
+        b.textContent = text;
+        return b;
+    }
     // Collapse a panel to a dock button. panelEl = the OUTERMOST element of the
-    // script's floating UI. Returns the dock button.
-    function jlRegisterPanel(panelEl, id, label, color) {
+    // script's floating UI. desc = on-hover + in-panel summary text.
+    function jlRegisterPanel(panelEl, id, label, color, desc) {
         const shown = (panelEl.style.display && panelEl.style.display !== 'none') ? panelEl.style.display : 'block';
         panelEl.style.display = 'none';
         const btn = jlDockButton(id, label, color, () => {
             const opening = panelEl.style.display === 'none';
             panelEl.style.display = opening ? shown : 'none';
+            if (opening && desc) {
+                const box = getComputedStyle(panelEl).position === 'fixed' ? panelEl : (panelEl.firstElementChild || panelEl);
+                if (box && !box.querySelector(':scope > .jl-help-banner')) box.insertBefore(jlHelpBanner(desc), box.firstChild);
+            }
             btn.style.boxShadow = opening ? '0 0 0 2px #fff, 0 1px 3px rgba(0,0,0,.25)' : '0 1px 3px rgba(0,0,0,.25)';
-        });
+        }, desc);
         return btn;
     }
     // ===== end shared dock =====
@@ -97,6 +109,7 @@
     const SCRIPT_ID = 'sf-post-update';
     const SCRIPT_LABEL = '🔗 SF Post Update';
     const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_DESC = 'Collects the latest public visit note and same-day photos from jobs and posts them to the matching Salesforce Support Request Chatter. Scan the jobs, then run.';
 
     // ========================================================================
     // CONFIG
@@ -136,7 +149,7 @@
         body.append(header);
         panel.append(body);
         document.body.append(panel);
-        jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR);
+        jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
         return { panel, body };
     }
 
