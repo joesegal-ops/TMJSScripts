@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic -> Salesforce - Copy Latest Note (single job)
 // @namespace    http://tampermonkey.net/
-// @version      1.10
+// @version      1.11
 // @description  One-click copy of the latest public note (and same-day images) from the open Joblogic job to the related Salesforce Case Chatter publisher. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*
@@ -27,6 +27,7 @@
     function jlAfter(l, y) { let c = { o: -Infinity, el: null }; for (const el of l.querySelectorAll('button:not(.jl-dragging)')) { const r = el.getBoundingClientRect(); const off = y - (r.top + r.height / 2); if (off < 0 && off > c.o) c = { o: off, el }; } return c.el; }
     function jlSetDockMin(min) { const l = jlDockList(), t = document.getElementById('jl-userscript-dock-toggle'); if (l) l.style.display = min ? 'none' : 'flex'; if (t) t.textContent = (min ? '▸' : '▾') + ' Advanced Controls'; try { localStorage.setItem(JL_MIN_KEY, min ? '1' : '0'); } catch (e) {} }
     function jlGetDock() {
+        if (window.top !== window.self) return null;  // only the top frame hosts the dock (avoids duplicate docks in Salesforce iframes)
         if (!document.getElementById('jl-dock-style')) { const st = document.createElement('style'); st.id = 'jl-dock-style'; st.textContent = '#jl-userscript-dock button:hover{filter:brightness(1.18);}'; (document.head || document.documentElement).appendChild(st); }
         let d = document.getElementById(JL_DOCK_ID);
         if (!d) { d = document.createElement('div'); d.id = JL_DOCK_ID; document.body.appendChild(d); }
@@ -63,6 +64,7 @@
     function jlDockButton(id, label, color, onClick, desc) {
         jlGetDock();
         const l = jlDockList();
+        if (!l) return null;
         let b = document.getElementById('jl-launch-' + id);
         if (b) return b;
         const bg = color || '#072d3d';
