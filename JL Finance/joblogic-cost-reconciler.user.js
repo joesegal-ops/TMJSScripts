@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.16
+// @version      1.18
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -29,7 +29,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.16');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.18');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -90,7 +90,7 @@
     // Pull every candidate reference out of free text (Note, Source desc).
     // Priority: Job ref (RE/PROJ/R/M) > Salesforce (8 digits, leading 1) > Quote (UP).
     // ===================================================================
-    const RE_JOBREF = /\b(?:RE|PROJ|MOB|M|R)\s?0*\d{2,}\b/gi; // reactive/project/maintenance/job
+    const RE_JOBREF = /\b(?:RE|PROJ|PM|M|R)\s?0*\d{2,}\b/gi; // reactive/project/PPM(PM)/maintenance jobs
     const RE_SF      = /\b1\d{7}\b/g;                          // Salesforce: 8 digits starting with 1
     const RE_QUOTE   = /\bUP\s?0*\d{2,}\b/gi;                  // Quote number UP....
 
@@ -120,7 +120,7 @@
     // JL job numbers are PREFIX + 7 zero-padded digits (e.g. PROJ0001393); staff
     // often drop the zeros ("PROJ 1393" / "PROJ1393"). Return forms to try.
     function jobRefCandidates(ref) {
-        const m = String(ref).toUpperCase().match(/^(RE|PROJ|MOB|M|R)0*(\d+)$/);
+        const m = String(ref).toUpperCase().match(/^(RE|PROJ|PM|M|R)0*(\d+)$/);
         if (!m) return [ref];
         const prefix = m[1], num = m[2];
         return [...new Set([prefix + num.padStart(7, '0'), ref, prefix + ' ' + num, prefix + num])];
