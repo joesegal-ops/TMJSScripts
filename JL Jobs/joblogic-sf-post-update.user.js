@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic -> Salesforce - Post Visit Update
 // @namespace    http://tampermonkey.net/
-// @version      2.14
+// @version      2.15
 // @description  Collect latest public visit note + same-day images from Joblogic jobs, post them to matching Salesforce Support Request Chatter feed. v2.5: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*
@@ -114,7 +114,7 @@
     // ========================================================================
     // CONFIG
     // ========================================================================
-    const SCRIPT_VERSION = '2.4';
+    const SCRIPT_VERSION = '2.15';
     const SF_HOST        = 'https://wecompany.lightning.force.com';
     const sfCaseUrl      = caseId => `${SF_HOST}/lightning/r/Case/${caseId}/view`;
     const QUEUE_KEY      = 'jl_sf_queue_v1';
@@ -510,7 +510,15 @@
             log(`Resolving SF Case Id for ${item.sfId}...`, '#0af');
             try {
                 const caseId = await sfResolveCaseId(item.sfId);
-                if (caseId) { window.open(sfCaseUrl(caseId), '_blank'); return; }
+                if (caseId) {
+                    // Persist the resolved Case Id on the queue item so the SF
+                    // tab can match by URL even when the title is generic.
+                    const cur = readQueue();
+                    const idx = cur.findIndex(it => it.queuedAt === item.queuedAt && it.sfId === item.sfId);
+                    if (idx >= 0) { cur[idx].caseId = caseId; writeQueue(cur); }
+                    window.open(sfCaseUrl(caseId), '_blank');
+                    return;
+                }
                 log(`No Case found for ${item.sfId} — opening SF home.`, '#fa0');
             } catch (e) {
                 log(`Resolve failed: ${e.message} — opening SF home.`, '#fa0');
@@ -565,6 +573,14 @@
         return m ? m[1] : null;
     }
     const onCasePage = () => /\/lightning\/r\/Case\//.test(location.pathname);
+    // The URL on a Case page contains the 15- or 18-char Case Id (e.g.
+    // /lightning/r/Case/500Uz000010B9h3IAC/view). The first 15 chars are the
+    // canonical short Id; SF guarantees uniqueness on those 15.
+    function caseIdFromUrl() {
+        const m = location.pathname.match(/\/Case\/(500[a-zA-Z0-9]{12,15})/);
+        return m ? m[1].slice(0, 15) : null;
+    }
+    const sameCaseId = (a, b) => a && b && a.slice(0, 15) === b.slice(0, 15);
 
     function findPublisherEditor() {
         const hasSharePlaceholder = e => {
@@ -773,8 +789,16 @@
 
         const currentMatchedItem = () => {
             if (!onCasePage()) return null;
+            const q = readQueue();
+            // Prefer URL-based match (works regardless of tab title / DOM state).
+            const cid = caseIdFromUrl();
+            if (cid) {
+                const byCid = q.find(it => sameCaseId(it.caseId, cid));
+                if (byCid) return byCid;
+            }
+            // Fallback: extract Case Number from title / DOM and match by sfId.
             const cn = currentCaseNumber();
-            return cn ? readQueue().find(it => it.sfId === cn) || null : null;
+            return cn ? q.find(it => it.sfId === cn) || null : null;
         };
 
         const refresh = () => {
@@ -818,15 +842,23 @@
             const q = readQueue();
             if (!q.length) { log('Queue empty — done.', '#0fa'); refresh(); return; }
             const item = q[0];
-            log(`Resolving SF Case Id for ${item.sfId}...`, '#0af');
-            try {
-                const caseId = await sfResolveCaseId(item.sfId);
+            let caseId = item.caseId;
+            if (!caseId) {
+                log(`Resolving SF Case Id for ${item.sfId}...`, '#0af');
+                try {
+                    caseId = await sfResolveCaseId(item.sfId);
+                } catch (e) {
+                    log(`Resolve failed: ${e.message}`, '#f55');
+                    return;
+                }
                 if (!caseId) { log(`No Case found for ${item.sfId}.`, '#f55'); return; }
-                log(`Navigating to ${item.jobNumber} -> ${item.sfId}`, '#0fa');
-                location.href = `/lightning/r/Case/${caseId}/view`;
-            } catch (e) {
-                log(`Resolve failed: ${e.message}`, '#f55');
+                // Persist so currentMatchedItem() can match by URL after nav.
+                const cur = readQueue();
+                const idx = cur.findIndex(it => it.queuedAt === item.queuedAt && it.sfId === item.sfId);
+                if (idx >= 0) { cur[idx].caseId = caseId; writeQueue(cur); }
             }
+            log(`Navigating to ${item.jobNumber} -> ${item.sfId}`, '#0fa');
+            location.href = `/lightning/r/Case/${caseId}/view`;
         }
 
         function removeFromQueue(item) {
@@ -860,9 +892,9 @@
             const item = currentMatchedItem();
             if (!item) {
                 if (onCasePage()) {
-                    const cn = currentCaseNumber();
-                    if (!cn) log(`Auto-prep (${reason}) skipped: could not read Case Number from page (title="${document.title.slice(0,80)}").`, '#fa0');
-                    else    log(`Auto-prep (${reason}) skipped: Case ${cn} not in queue.`, '#fa0');
+                    const cid = caseIdFromUrl();
+                    const cn  = currentCaseNumber();
+                    log(`Auto-prep (${reason}) skipped: URL caseId=${cid||'?'} caseNumber=${cn||'?'} — not in queue (or queue items don't yet have cached caseId; click "Open Next Case" once to seed).`, '#fa0');
                 }
                 return;
             }
