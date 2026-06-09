@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic -> Salesforce - Post Visit Update
 // @namespace    http://tampermonkey.net/
-// @version      2.15
+// @version      2.16
 // @description  Collect latest public visit note + same-day images from Joblogic jobs, post them to matching Salesforce Support Request Chatter feed. v2.5: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*
@@ -114,7 +114,7 @@
     // ========================================================================
     // CONFIG
     // ========================================================================
-    const SCRIPT_VERSION = '2.15';
+    const SCRIPT_VERSION = '2.16';
     const SF_HOST        = 'https://wecompany.lightning.force.com';
     const sfCaseUrl      = caseId => `${SF_HOST}/lightning/r/Case/${caseId}/view`;
     const QUEUE_KEY      = 'jl_sf_queue_v1';
@@ -731,15 +731,36 @@
             }
             log?.(`  Injected ${files.length} file${files.length===1?'':'s'} via intercepted file input`, '#888');
 
-            await sleep(3000);
-            const closeBtn = [...document.querySelectorAll('button')].find(b =>
-                visible(b) && !b.disabled && /^(Add|Done|Attach)$/i.test(b.textContent.trim())
-            );
-            if (closeBtn) {
-                closeBtn.click();
-                log?.(`  Clicked "${closeBtn.textContent.trim()}"`, '#888');
-            } else {
-                log?.('  Dialog likely auto-closed after upload.', '#888');
+            // Wait for upload to complete, then dismiss the Select Files dialog.
+            // Try in order: Add/Done/Attach (enabled), then a Cancel/Close-X, then Escape.
+            // Upload via Lightning's "Upload Files" path normally auto-attaches
+            // to the publisher — the dialog just lingers as a UI artifact.
+            await sleep(3500);
+            const dialogButtons = () => [...document.querySelectorAll('button')].filter(visible);
+            const findBtn = re => dialogButtons().find(b => !b.disabled && re.test(b.textContent.trim()));
+            let dismissed = false;
+            const addBtn = findBtn(/^(Add|Done|Attach)$/i);
+            if (addBtn) {
+                addBtn.click();
+                log?.(`  Clicked "${addBtn.textContent.trim()}"`, '#888');
+                dismissed = true;
+            }
+            if (!dismissed) {
+                await sleep(800);
+                const cancelBtn = findBtn(/^cancel$/i);
+                if (cancelBtn) {
+                    cancelBtn.click();
+                    log?.('  Clicked Cancel to dismiss (files already attached).', '#888');
+                    dismissed = true;
+                }
+            }
+            if (!dismissed) {
+                const xBtn = dialogButtons().find(b => /close|dismiss/i.test(b.getAttribute('title')||b.getAttribute('aria-label')||''));
+                if (xBtn) { xBtn.click(); log?.('  Clicked dialog close-X.', '#888'); dismissed = true; }
+            }
+            if (!dismissed) {
+                document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+                log?.('  Sent Escape to dismiss dialog.', '#888');
             }
         } finally {
             HTMLInputElement.prototype.click = origClick;
@@ -887,8 +908,12 @@
 
         // Auto-prep once per Case landing. The key combines path + queuedAt so
         // revisiting a Case after a skip/mark doesn't double-fire.
+        // prepInProgress prevents initial + spa-nav from racing each other when
+        // the page lands on a Case via SPA nav while initial is still working.
         let lastAutoPreppedKey = null;
+        let prepInProgress = false;
         async function maybeAutoPrep(reason) {
+            if (prepInProgress) { log(`Auto-prep (${reason}) skipped: another prep is in progress.`, '#888'); return; }
             const item = currentMatchedItem();
             if (!item) {
                 if (onCasePage()) {
@@ -901,19 +926,24 @@
             const key = `${location.pathname}|${item.queuedAt}`;
             if (lastAutoPreppedKey === key) return;
             lastAutoPreppedKey = key;
-            log(`Auto-prep (${reason}): ${item.jobNumber} -> ${item.sfId}`, '#0af');
-            await sleep(1500);
-            let editor = findPublisherEditor();
-            if (!editor) {
-                log('  Publisher not in DOM yet — clicking Conversation + scrolling.', '#888');
-                await ensurePublisherVisible(log);
-                editor = await waitFor(findPublisherEditor, 15000, 500);
+            prepInProgress = true;
+            try {
+                log(`Auto-prep (${reason}): ${item.jobNumber} -> ${item.sfId}`, '#0af');
+                await sleep(1500);
+                let editor = findPublisherEditor();
+                if (!editor) {
+                    log('  Publisher not in DOM yet — clicking Conversation + scrolling.', '#888');
+                    await ensurePublisherVisible(log);
+                    editor = await waitFor(findPublisherEditor, 15000, 500);
+                }
+                if (!editor) {
+                    log('Publisher still not found. Click "Prep Here" once the "Share an update..." box is on screen.', '#fa0');
+                    return;
+                }
+                await doPrep(item);
+            } finally {
+                prepInProgress = false;
             }
-            if (!editor) {
-                log('Publisher still not found. Click "Prep Here" once the "Share an update..." box is on screen.', '#fa0');
-                return;
-            }
-            await doPrep(item);
         }
 
         maybeAutoPrep('initial');
