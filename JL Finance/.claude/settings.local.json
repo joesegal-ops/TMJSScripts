@@ -9,7 +9,8 @@
       "Bash(python3 -)",
       "Bash(git fetch *)",
       "mcp__Claude_in_Chrome__tabs_context_mcp",
-      "mcp__Claude_in_Chrome__computer"
+      "mcp__Claude_in_Chrome__computer",
+      "Bash(osascript -l JavaScript -e ' *)"
     ]
   }
 }
