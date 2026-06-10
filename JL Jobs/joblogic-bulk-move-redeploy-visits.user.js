@@ -125,7 +125,15 @@
         'Keiran Connolly',
         'Lee Rafferty',
         'Luke Kelly',
-        'Raj Solanki'
+        'Raj Solanki',
+        'Gerard Egan',
+        'Charlie Flaherty',
+        'Niall Mcdaid',
+        'Damon Rafferty',
+        'Nathaniel Brown',
+        'Yassine Guarguab',
+        'Alen Stephen',
+        'Daniel Wills'
     ];
 
     // StatusDescription values that are eligible to be moved + redeployed.
