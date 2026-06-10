@@ -165,8 +165,15 @@
         return m ? m[1] : '';
     }
 
-    function yesterday() { const d = new Date(); d.setDate(d.getDate() - 1); d.setHours(0, 0, 0, 0); return d; }
-    function today()     { const d = new Date(); d.setHours(0, 0, 0, 0); return d; }
+    function today()       { const d = new Date(); d.setHours(0, 0, 0, 0); return d; }
+    function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+    // The source day(s) to sweep. On Monday (getDay()===1) sweep Fri + Sat + Sun so
+    // weekend visits are caught; every other day sweeps just the previous day.
+    function sourceDays() {
+        const t = today();
+        if (t.getDay() === 1) return [addDays(t, -3), addDays(t, -2), addDays(t, -1)]; // Fri, Sat, Sun
+        return [addDays(t, -1)];
+    }
 
     // =========================================================================
     // SCHEDULER-SEARCH TEMPLATE CAPTURE
@@ -299,12 +306,12 @@
     // =========================================================================
     // ELIGIBILITY
     // =========================================================================
-    function isEligible(v, yIso) {
+    function isEligible(v, allowedDays) {
         if (!v || v.id == null) return false;
         if (v.SubcontractorId) return false;                       // engineers only
         if (v.IsTeamVisit) return false;                           // team visits use a different endpoint
         if (v.IsMoveable === false) return false;
-        if (dayOf(v.start) !== yIso) return false;                 // must actually be dated yesterday
+        if (!allowedDays.has(dayOf(v.start))) return false;        // must start on a source day
         const status = (v.StatusDescription || '').trim().toLowerCase();
         return ELIGIBLE_STATUSES.indexOf(status) !== -1;
     }
@@ -327,27 +334,31 @@
                 log('Could not capture a search template. Click the planner refresh once, then Scan again.', '#f55');
                 return;
             }
-            const yDay = yesterday(), tDay = today();
-            const yIso = isoDay(yDay);
-            log(`Yesterday = ${ddmmyyyy(yDay)}  →  Today = ${ddmmyyyy(tDay)}`, '#0af');
+            const srcDays = sourceDays(), tDay = today();
+            const allowed = new Set(srcDays.map(isoDay));
+            const rangeLabel = srcDays.map(ddmmyyyy).join(', ');
+            log(`Source day(s) = ${rangeLabel}  →  moving to Today = ${ddmmyyyy(tDay)}`, '#0af');
 
             log('Fetching engineer list…', '#0af');
             const engIds = await fetchEngineerIds();
             log(`${engIds.length} engineer(s).`, '#888');
 
-            setProgress('Searching yesterday across all engineers…');
-            const items = await searchVisits(`${ddmmyyyy(yDay)} 00:00`, `${ddmmyyyy(yDay)} 23:59`, engIds);
-            log(`${items.length} visit(s) dated yesterday in total.`, '#888');
+            setProgress('Searching source day(s) for the configured engineers…');
+            const items = await searchVisits(
+                `${ddmmyyyy(srcDays[0])} 00:00`,
+                `${ddmmyyyy(srcDays[srcDays.length - 1])} 23:59`,
+                engIds);
+            log(`${items.length} visit(s) in range in total.`, '#888');
 
-            foundVisits = items.filter(v => isEligible(v, yIso));
+            foundVisits = items.filter(v => isEligible(v, allowed));
 
             // Tally for transparency
             const tally = {};
             items.forEach(v => { const s = (v.StatusDescription || 'null'); tally[s] = (tally[s] || 0) + 1; });
-            log('Status breakdown (all yesterday): ' + Object.entries(tally).map(([k, n]) => `${k}:${n}`).join(', '), '#666');
+            log('Status breakdown (all in range): ' + Object.entries(tally).map(([k, n]) => `${k}:${n}`).join(', '), '#666');
 
             if (!foundVisits.length) {
-                setProgress('Nothing to do — no New / Not Sent / Read visits dated yesterday.');
+                setProgress('Nothing to do — no New / Not Sent / Read visits on the source day(s).');
                 log('No eligible visits found.', '#fa0');
                 return;
             }
@@ -474,8 +485,8 @@
     <button class="btn-stop">Stop</button>
   </div>
   <div class="hint">
-    Finds every <b>New / Not Sent / Read</b> visit dated <b>yesterday</b> for the
-    <b>configured engineers</b> (edit <code>ENGINEER_ALLOWLIST</code> in the script),
+    Finds every <b>New / Not Sent / Read</b> visit from the <b>previous day</b> (on Mondays:
+    <b>Fri + Sat + Sun</b>) for the <b>configured engineers</b> (edit <code>ENGINEER_ALLOWLIST</code> in the script),
     moves each to <b>today</b> at the same time of day, then redeploys it. Skips team &amp; subcontractor
     visits. Respects the planner's current job-type filter. Scan previews first — nothing is changed until you Run.
   </div>
