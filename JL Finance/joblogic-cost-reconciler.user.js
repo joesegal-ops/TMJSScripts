@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      1.19
+// @version      1.22
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in the job / Incorrect (with a why) / Not found. READ-ONLY — it never changes anything. v1.1: collapses to a launcher button in a shared dock so multiple JL scripts line up.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -24,12 +24,13 @@
     // ===================================================================
     // STATE
     // ===================================================================
-    let panel, pasteArea, logArea, scanBtn, runBtn, stopBtn, copyBtn, progressText, resultsBox;
+    let panel, pasteArea, logArea, scanBtn, runBtn, stopBtn, copyBtn, stage2Btn, confirmBtn, progressText, resultsBox;
+    let stage2Items = [], stage2Running = false;
 
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.19');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.22');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -265,7 +266,7 @@
             (j.AdditionalData?.Items || []).forEach(it => {
                 const unit = money(it.ListPrice), q = qtyNum(it.Quantity);
                 out.push({
-                    source: 'undelivered PO ' + (it.PurchaseOrderNo || ''), poNo: it.PurchaseOrderNo || '',
+                    source: 'undelivered PO ' + (it.PurchaseOrderNo || ''), poNo: it.PurchaseOrderNo || '', poId: it.PurchaseOrderId || '',
                     category: 'Material', desc: it.Description || '', date: it.Date || '', engineer: '',
                     qtyRaw: it.Quantity, qty: q, unit: unit, vat: null,
                     subtotal: (unit != null && q != null) ? unit * q : unit
@@ -413,6 +414,32 @@
         scored.sort((a, b) => a.dist - b.dist);
         return scored;
     }
+    // Some receipts are split across MULTIPLE cost lines that together sum to the
+    // total. Find a combination of 2-3 material lines whose unit costs sum to the
+    // net (correct) or the gross (VAT-inclusive — should be net). Returns a best-shaped obj.
+    function matchCombination(net, gross, vat, lines, sourceLabel) {
+        const r = (vat != null ? vat : VAT_FALLBACK);
+        const mats = lines.filter(l => l.unit && l.unit > 0 && !/labour|travel|mileage|overtime|call-?out/i.test(l.category || ''));
+        if (mats.length < 2) return null;
+        const mk = (idxs, verdict, factor) => {
+            const ls = idxs.map(i => mats[i]);
+            const sum = ls.reduce((a, l) => a + l.unit, 0);
+            const list = ls.map(l => `"${(l.desc || '').slice(0, 24)}" £${l.unit.toFixed(2)}`).join(' + ');
+            const why = verdict === 'OK'
+                ? `${ls.length} cost lines sum to the net £${net.toFixed(2)} — ${list}`
+                : `${ls.length} cost lines sum to £${sum.toFixed(2)} = the VAT-inclusive total; they should be net (£${net.toFixed(2)}) — ${list}`;
+            return { verdict, factor: factor || '', why, line: { source: ls[0].source || sourceLabel, desc: ls.map(l => l.desc).join(' + ') }, combo: ls, ownerMatch: false, dateMatch: false };
+        };
+        const test = (sum, idxs) => {
+            if (eqMoney(sum, net)) return mk(idxs, 'OK');
+            if (eqMoney(sum, gross) || eqMoney(sum, net * (1 + r))) return mk(idxs, 'INCORRECT', '×(1+VAT)');
+            return null;
+        };
+        const n = mats.length;
+        for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { const res = test(mats[i].unit + mats[j].unit, [i, j]); if (res) return res; }
+        for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) for (let k = j + 1; k < n; k++) { const res = test(mats[i].unit + mats[j].unit + mats[k].unit, [i, j, k]); if (res) return res; }
+        return null;
+    }
     function matchAgainstLines(net, gross, sheetVat, lines, ownerName, dateStr) {
         let best = null;
         for (const line of lines) {
@@ -498,6 +525,7 @@
             owner: col(row, ['Owner']),
             date: normalizeDate(col(row, ['Date'])),
             merchant: srcDesc,
+            xeroDesc: col(row, ['Xero description', 'Xero Description', 'Xero desc']),
             receipt: col(row, ['Receipt', 'Expense ID', 'Document Number'])
         };
     }
@@ -540,7 +568,7 @@
     async function processRow(row, idx) {
         const m = mapRow(row);
         const label = m.receipt ? `#${m.receipt}` : `row ${idx + 1}`;
-        const base = { idx, receipt: m.receipt, merchant: m.merchant, owner: m.owner, date: m.date, net: m.net, gross: m.gross };
+        const base = { idx, receipt: m.receipt, merchant: m.merchant, owner: m.owner, date: m.date, net: m.net, gross: m.gross, xeroDesc: m.xeroDesc };
 
         if (m.net == null) {
             return { ...base, status: 'NO VALUE', detail: 'No Net/Amount could be read from this row.' };
@@ -569,54 +597,59 @@
             return { ...base, status: 'NO JOB', jobNumber: job.jobNumber, detail: `${job.via} — quote not yet upgraded to a job.` };
         }
 
-        // 1) Costs on the job (includes delivered Supplier PO costs)
+        // ---- gather everything once (used for matching AND the report columns) ----
         const { lines, parseOk } = await getJobCosts(job.id);
-        let allLines = lines.slice();
-        let best = matchAgainstLines(m.net, m.gross, m.vat, allLines, m.owner, m.date);
-
-        // 2) If nothing on the job, look at parent/related quote (+ its embedded costs)
-        let secondaryNote = '';
-        let quoteLabel = null, rwLines = [];
-        if (!best) {
-            try {
-                const rw = await getRelatedWorks(job.id);
-                quoteLabel = rw.quoteLabel; rwLines = rw.lines || [];
-                if (rwLines.length) {
-                    best = matchAgainstLines(m.net, m.gross, m.vat, rwLines, m.owner, m.date);
-                    if (best) secondaryNote = ' (found in ' + best.line.source + ')';
-                }
-            } catch (e) { /* related works optional */ }
-        }
-
-        // 3) Still nothing on the job/quote? Check undelivered Supplier POs (ordered,
-        // not yet delivered — so not on the cost page). A match means "deliver the PO".
-        let poLines = [];
-        if (!best) {
-            poLines = await getUndeliveredPOLines(job.id);
-            if (poLines.length) {
-                const poBest = matchAgainstLines(m.net, m.gross, m.vat, poLines, m.owner, m.date);
-                if (poBest) {
-                    const sf = /cancel|suspend/i.test(job.jobStatus || '') ? `  \u26a0 Job status: ${job.jobStatus} — check before delivering.` : (job.jobStatus ? `  Job status: ${job.jobStatus}.` : '');
-                    return {
-                        ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl: `${location.origin}/Job/Detail/${job.id}`, via: job.via,
-                        status: 'ON UNDELIVERED PO', factor: poBest.verdict !== 'OK' ? poBest.factor : '',
-                        detail: `On ${poBest.line.source}: ${poBest.why}.${sf}`,
-                        suggest: `Deliver PO ${poBest.line.poNo} (Job → Costs → deliver the PO) and the cost posts to the job — no manual line needed.` + (/cancel/i.test(job.jobStatus || '') ? ' NOTE: job is Cancelled — confirm status first.' : '')
-                    };
-                }
-            }
-        }
+        const jobLines = lines.slice();
+        let quoteLabel = null, quoteUrl = '', rwLines = [];
+        try {
+            const rw = await getRelatedWorks(job.id);
+            quoteLabel = rw.quoteLabel; rwLines = rw.lines || [];
+            const ql = (rw.quoteLinks || []).find(q => q.href);
+            if (ql) quoteUrl = ql.href.indexOf('http') === 0 ? ql.href : location.origin + ql.href;
+        } catch (e) { /* optional */ }
+        const poLines = await getUndeliveredPOLines(job.id);
 
         const jobUrl = `${location.origin}/Job/Detail/${job.id}`;
         const isProject = /^PROJ/i.test(job.jobNumber || '');
-        const statusNote = /cancel|suspend/i.test(job.jobStatus || '') ? `  \u26a0 Job status: ${job.jobStatus}.` : '';
+        const cancelled = /cancel|suspend/i.test(job.jobStatus || '');
+        const statusNote = cancelled ? `  \u26a0 Job status: ${job.jobStatus}.` : '';
+        const poNos = [...new Set(poLines.map(l => l.poNo).filter(Boolean))];
+        const cols = {
+            jobId: job.id,
+            jobFound: job.jobNumber || '', jobLink: jobUrl,
+            spoText: poNos.length ? poNos.join(', ') : 'No',
+            spoUrl: (poLines[0] && poLines[0].poId) ? `${location.origin}/PurchaseOrder/Detail/${poLines[0].poId}` : '',
+            quoteText: quoteLabel || 'No', quoteUrl,
+            jobStatusText: job.jobStatus || ''
+        };
+        const valOf = l => (l.unit && l.unit > 0) ? l.unit : l.subtotal;
+        const fmtLineObj = l => `"${(l.desc || l.category || 'line').slice(0, 48)}" ${valOf(l) != null ? '£' + valOf(l).toFixed(2) : ''}${(l.source || '').indexOf('quote') === 0 ? ' [' + l.source + ']' : ''}`;
+
+        // ---- match: job lines -> job combo -> quote lines -> quote combo ----
+        let best = matchAgainstLines(m.net, m.gross, m.vat, jobLines, m.owner, m.date);
+        if (!best) best = matchCombination(m.net, m.gross, m.vat, jobLines, 'job');
+        let secondaryNote = '';
+        if (!best && rwLines.length) {
+            best = matchAgainstLines(m.net, m.gross, m.vat, rwLines, m.owner, m.date) || matchCombination(m.net, m.gross, m.vat, rwLines, 'quote');
+            if (best) secondaryNote = ' (found in ' + best.line.source + ')';
+        }
+
+        // ---- ON UNDELIVERED PO (ordered but not yet delivered) ----
+        if (!best && poLines.length) {
+            const poBest = matchAgainstLines(m.net, m.gross, m.vat, poLines, m.owner, m.date) || matchCombination(m.net, m.gross, m.vat, poLines, 'PO');
+            if (poBest) {
+                return { ...base, ...cols, status: 'ON UNDELIVERED PO', factor: poBest.verdict !== 'OK' ? poBest.factor : '',
+                    costNear: 'On undelivered PO', costLine: fmtLineObj(poBest.combo ? poBest.combo[0] : poBest.line),
+                    other: cancelled ? `\u26a0 ${job.jobStatus}` : '',
+                    detail: `On ${poBest.line.source}: ${poBest.why}.${statusNote}`,
+                    suggest: `Deliver PO ${poBest.line.poNo || poNos.join(', ')} and the cost posts to the job — no manual line needed.` + (cancelled ? ' NOTE: job is Cancelled — confirm status first.' : '') };
+            }
+        }
 
         if (!best) {
-            // Describe the cost landscape: does the job/quote have ANY costs at all,
-            // or does it have costs that simply did not match? (changes the action).
             const valued = l => (l.unit && l.unit > 0) || (l.subtotal && l.subtotal > 0);
             const isMat = l => !/labour|travel|mileage|overtime|call-?out/i.test(l.category || '');
-            const jobValued = allLines.filter(valued);
+            const jobValued = jobLines.filter(valued);
             const jobMats = jobValued.filter(isMat);
             const quoteValued = rwLines.filter(valued);
             let landscape = jobValued.length
@@ -626,67 +659,66 @@
             else landscape += '; no related quote';
             if (poLines.length) landscape += `; ${poLines.length} undelivered PO line${poLines.length === 1 ? '' : 's'}`;
 
-            // Surface the closest cost line(s) so a human can judge near-misses
-            // (delivery charges, rounding, slightly different descriptions).
-            const cands = candidateLines(m.net, m.gross, allLines.concat(rwLines).concat(poLines), m.merchant);
+            const cands = candidateLines(m.net, m.gross, jobLines.concat(rwLines).concat(poLines), m.merchant);
             const top = cands.slice(0, 2);
             const plausible = top.find(c => c.dist <= 0.30 || c.descMatch);
-            const fmtVal = l => { const v = (l.unit && l.unit > 0) ? l.unit : l.subtotal; return v != null ? '£' + v.toFixed(2) : ''; };
-            const fmtLine = c => `"${(c.line.desc || c.line.category || 'line').slice(0, 48)}" ${fmtVal(c.line)}${(c.line.source || '').indexOf('quote') === 0 ? ' [' + c.line.source + ']' : ''}`;
-            const candText = top.length ? '  Closest: ' + top.map(fmtLine).join(' ; ') : '';
+            const candText = top.length ? '  Closest: ' + top.map(c => fmtLineObj(c.line)).join(' ; ') : '';
 
             if (plausible) {
-                return {
-                    ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
-                    status: 'POSSIBLE MATCH',
+                return { ...base, ...cols, status: 'POSSIBLE MATCH', costNear: 'Possible', costLine: fmtLineObj(plausible.line),
+                    other: cancelled ? `\u26a0 ${job.jobStatus}` : '',
                     detail: `${landscape}. No exact match for £${m.net.toFixed(2)} net, but a similar line exists — value differs (delivery / rounding / description?).${candText}${statusNote}`,
-                    suggest: `Review — may already be on the job as ${fmtLine(plausible)}. Confirm before adding.`
-                };
+                    suggest: `Review — may already be on the job as ${fmtLineObj(plausible.line)}. Confirm before adding.` };
             }
             let action;
-            if (isProject || quoteLabel) {
-                action = `Project/quoted job${quoteLabel ? ' (quote ' + quoteLabel + ')' : ''} — the cost is likely already covered/forecasted in the quote. If it does need adding, put it on as a NON-CHARGEABLE materials line.`;
-            } else {
-                action = `Not on the job — add it as a materials line (£${m.net.toFixed(2)} net).`;
-            }
+            if (isProject || quoteLabel) action = `Project/quoted job${quoteLabel ? ' (quote ' + quoteLabel + ')' : ''} — likely covered/forecasted in the quote. If it must be added, use a NON-CHARGEABLE materials line.`;
+            else action = `Not on the job — add it as a materials line (£${m.net.toFixed(2)} net).`;
             const noMatchStatus = (jobValued.length || quoteValued.length || poLines.length) ? 'NOT IN JOB' : 'NO COSTS';
-            return {
-                ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
-                status: noMatchStatus,
+            return { ...base, ...cols, status: noMatchStatus, costNear: 'No', costLine: top.length ? fmtLineObj(top[0].line) + ' (not a match)' : '',
+                other: landscape + (cancelled ? `  \u26a0 ${job.jobStatus}` : ''),
                 detail: `Job ${job.jobNumber} found (${job.via}). ${landscape}. No cost line near £${m.net.toFixed(2)} net.${candText}${statusNote}` + (parseOk ? '' : ' [could not read cost model]'),
-                suggest: action
-            };
+                suggest: action };
         }
 
+        // ---- matched (single line or combination) ----
         const soft = [];
         if (best.ownerMatch) soft.push('owner ✓'); else if (m.owner && best.line.engineer) soft.push(`owner: sheet "${m.owner}" vs JL "${best.line.engineer}"`);
         if (best.dateMatch) soft.push('date ✓'); else if (m.date && best.line.date) soft.push(`date: sheet ${m.date} vs JL ${best.line.date}`);
+        const matchedLineText = best.combo ? best.combo.map(fmtLineObj).join(' + ') : fmtLineObj(best.line);
+        const otherBits = [];
+        if (best.factor) otherBits.push(best.factor);
+        soft.forEach(s => otherBits.push(s));
+        if (cancelled) otherBits.push(`\u26a0 ${job.jobStatus}`);
+        const otherText = otherBits.join('; ');
 
         if (best.verdict === 'OK') {
-            return {
-                ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
-                status: 'ALREADY IN JOB',
-                detail: best.why + secondaryNote + statusNote + (soft.length ? '  [' + soft.join('; ') + ']' : '')
-            };
+            return { ...base, ...cols, status: 'ALREADY IN JOB', costNear: 'Yes', costLine: matchedLineText, other: otherText,
+                detail: best.why + secondaryNote + statusNote + (soft.length ? '  [' + soft.join('; ') + ']' : '') };
         }
         const inQuote = (best.line.source || '').indexOf('quote') === 0;
+        if (best.verdict === 'INCORRECT' && /×\d/.test(best.factor || '') && inQuote && !best.combo) {
+            return { ...base, ...cols, status: 'UNCLEAR', factor: best.factor, costNear: 'Possible', costLine: matchedLineText, other: otherText,
+                detail: `Unclear — ${best.why}. The spend does not cleanly match; it may be part of a quoted line (e.g. sundries / fittings) rather than a direct match.${statusNote}`,
+                suggest: `Flag for manual review — unclear which line/quote covers this £${m.net.toFixed(2)} receipt. Do not change quote lines.` };
+        }
         const invoicedAmt = String(job.totalInvoiced || '').replace(/[£,\s]/g, '');
         const jobInvoiced = invoicedAmt && !/^0(\.00)?$/.test(invoicedAmt);
+        const r2 = (m.vat != null ? m.vat : VAT_FALLBACK);
         let fix;
-        if (inQuote) {
+        if (best.combo) {
+            fix = `${best.combo.length} cost lines are VAT-inclusive and should be net — divide each by 1+VAT: ` +
+                best.combo.map(l => `"${(l.desc || '').slice(0, 24)}" £${l.unit.toFixed(2)} → £${(l.unit / (1 + r2)).toFixed(2)}`).join(' ; ') +
+                (inQuote ? ' (Quote lines — flag, do not change.)' : (jobInvoiced ? ' \u26a0 Job has invoiced amounts — flag, do not change totals if invoiced.' : ''));
+        } else if (inQuote) {
             fix = `Found in ${best.line.source}. Do NOT change quote lines — quoted values are fixed forecasts (spend under and the margin is kept). Flag for manual review: confirm this £${m.net.toFixed(2)} receipt against the quoted material line(s).`;
         } else {
-            fix = `Change job "${(best.line.desc || '').slice(0, 40)}" unit cost to £${m.net.toFixed(2)} (net).`
-                + (jobInvoiced
-                    ? ' \u26a0 This job already has invoiced amounts — if this line is invoiced do NOT change the total; flag it and raise a credit/adjustment instead.'
-                    : ' If the line has already been invoiced, do NOT change the total — flag it and raise a credit/adjustment instead.');
+            fix = `Change job "${(best.line.desc || '').slice(0, 40)}" unit cost to £${m.net.toFixed(2)} (net).` +
+                (jobInvoiced ? ' \u26a0 This job already has invoiced amounts — if this line is invoiced do NOT change the total; flag it and raise a credit/adjustment instead.'
+                             : ' If the line has already been invoiced, do NOT change the total — flag it and raise a credit/adjustment instead.');
         }
-        return {
-            ...base, jobNumber: job.jobNumber, jobId: job.id, jobUrl, via: job.via,
-            status: 'INCORRECT', factor: best.factor,
+        return { ...base, ...cols, status: 'INCORRECT', factor: best.factor, costNear: 'Yes', costLine: matchedLineText, other: otherText,
             detail: best.why + secondaryNote + statusNote + (soft.length ? '  [' + soft.join('; ') + ']' : ''),
-            suggest: fix
-        };
+            suggest: fix };
     }
 
     // ===================================================================
@@ -702,7 +734,7 @@
         logArea.innerHTML = ''; resultsBox.innerHTML = '';
         log(`Parsed ${parsed.headers.length} columns, ${rows.length} rows.`, '#0af');
 
-        const stats = { ok: 0, incorrect: 0, possible: 0, po: 0, notin: 0, nocosts: 0, notfound: 0, noref: 0, ignore: 0, noval: 0, err: 0 };
+        const stats = { ok: 0, incorrect: 0, unclear: 0, possible: 0, po: 0, notin: 0, nocosts: 0, notfound: 0, noref: 0, ignore: 0, noval: 0, err: 0 };
         for (let i = 0; i < rows.length; i++) {
             if (!running) { log('Stopped by user.', '#f55'); break; }
             setProgress(`Row ${i + 1}/${rows.length}`);
@@ -718,6 +750,7 @@
         log('===== SUMMARY =====', '#0af');
         log(`Already in job: ${stats.ok}`, '#0fa');
         log(`Incorrect:      ${stats.incorrect}`, '#fb0');
+        log(`Unclear:        ${stats.unclear}`, '#f6c');
         log(`Possible match: ${stats.possible}`, '#3cc');
         log(`Not in job:     ${stats.notin}`, '#f90');
         log(`No costs:       ${stats.nocosts}`, '#b388ff');
@@ -731,10 +764,11 @@
         running = false;
         runBtn.style.display = 'inline-block'; stopBtn.style.display = 'none';
         copyBtn.style.display = 'inline-block';
+        if (results.some(r => r.status === 'NO COSTS' && r.jobId)) stage2Btn.style.display = 'inline-block';
     }
 
     function tallyAndRender(res, stats) {
-        const map = { 'ALREADY IN JOB': 'ok', 'INCORRECT': 'incorrect', 'POSSIBLE MATCH': 'possible', 'ON UNDELIVERED PO': 'po', 'NOT IN JOB': 'notin', 'NO COSTS': 'nocosts',
+        const map = { 'ALREADY IN JOB': 'ok', 'INCORRECT': 'incorrect', 'UNCLEAR': 'unclear', 'POSSIBLE MATCH': 'possible', 'ON UNDELIVERED PO': 'po', 'NOT IN JOB': 'notin', 'NO COSTS': 'nocosts',
             'JOB NOT FOUND': 'notfound', 'NO JOB': 'notfound', 'NO REFERENCE': 'noref', 'IGNORE': 'ignore', 'NO VALUE': 'noval' };
         if (map[res.status]) stats[map[res.status]]++;
         renderResult(res);
@@ -744,7 +778,7 @@
     // UI
     // ===================================================================
     const STATUS_COLOR = {
-        'ALREADY IN JOB': '#0fa', 'INCORRECT': '#fb0', 'POSSIBLE MATCH': '#3cc', 'ON UNDELIVERED PO': '#4af', 'NOT IN JOB': '#f90', 'NO COSTS': '#b388ff',
+        'ALREADY IN JOB': '#0fa', 'INCORRECT': '#fb0', 'UNCLEAR': '#f6c', 'POSSIBLE MATCH': '#3cc', 'ON UNDELIVERED PO': '#4af', 'NOT IN JOB': '#f90', 'NO COSTS': '#b388ff',
         'JOB NOT FOUND': '#f55', 'NO JOB': '#f77', 'NO REFERENCE': '#999', 'IGNORE': '#888',
         'NO VALUE': '#999', 'ERROR': '#f55'
     };
@@ -788,14 +822,106 @@
         resultsBox.scrollTop = resultsBox.scrollHeight;
     }
 
+    // ===================================================================
+    // STAGE 2 — add the NO-COSTS rows to their jobs as material lines
+    // (verified: POST /api/JobLine/AddMaterialCosts; net unit, qty 1, chargeable,
+    // 20% VAT, Xero description, sheet date. No engineer — JobLogic exposes no API
+    // to resolve the roster, so per spec we add WITHOUT the engineer.)
+    // ===================================================================
+    const STAGE2_CFG = {
+        taxCodeId: 'c1d73a68-7887-4f91-9124-26100ef712b0', taxCodeValue: '20.00',
+        taxCodeDesc: '20% (VAT on Income) (20.00%)',
+        payBandId: 'f76846b0-674b-4410-8473-c2f22508f51c', payBandDesc: 'Basic',
+        libraryId: 54838, libraryName: 'Standard Parts Library'
+    };
+    function buildMaterialBody(jobId, description, dateStr, net) {
+        const c = STAGE2_CFG, v = Number(net).toFixed(2);
+        const dt = /\d{1,2}:\d{2}/.test(dateStr || '') ? dateStr : ((dateStr || '') + ' 09:00');
+        return {
+            JobId: jobId, TimeId: null, VirtualTimeId: null,
+            CostLines: [{
+                Id: null, PartNumber: null, Quantity: '1', ReturnQuantity: 0, IsReturnItemToStock: false,
+                CostPerUnit: v, CostPerHour: '0.00', Uplift: '0.00', SellPerUnit: v, SellPerHour: '0.00',
+                CreateLibraryAllowed: true, CategoryId: null, CategoryDescription: null, ForEquipmentUse: false,
+                Make: null, Model: null, HasFixedSell: false, SetupSell: 0,
+                TaxCodeId: c.taxCodeId, TaxCodeValue: c.taxCodeValue, TaxCodeDescription: c.taxCodeDesc,
+                IsChargeable: true, PriceCalculationType: 1,
+                PayBandId: c.payBandId, PayBandDescription: c.payBandDesc, SellPayBandId: c.payBandId,
+                Description: description, CreatePayBandAllowed: true, LibraryId: c.libraryId, LibraryName: c.libraryName,
+                DateIncurred: dt, HasQuote: false, ItemId: 0, JobLineOption: 5,
+                QuotedValueTaxCodeId: c.taxCodeId, QuotedValueTaxCodeDescription: c.taxCodeDesc,
+                forEquipmentUse: false, IsIssueFromStock: false, CurrencySymbol: '£', AssignType: 0,
+                RackShelfId: null, LocationId: null, Discount: '0.00', TagIds: null, Status: 'Required',
+                LimitedSORAccess: false, PartSerial: null, SellingRateId: null
+            }]
+        };
+    }
+    async function addMaterialLine(jobId, description, dateStr, net) {
+        const r = await fetch('/api/JobLine/AddMaterialCosts', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', '__RequestVerificationToken': csrf() },
+            body: JSON.stringify(buildMaterialBody(jobId, description, dateStr, net))
+        });
+        const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + txt.slice(0, 120));
+        if (j && j.success === false) throw new Error(j.Message || j.message || 'AddMaterialCosts returned success=false');
+        return true;
+    }
+    function noCostItems() {
+        return results.filter(r => r.status === 'NO COSTS' && r.jobId && r.net != null).map(r => ({
+            jobId: r.jobId, jobNumber: r.jobFound || r.jobNumber || ('job ' + r.jobId), owner: r.owner || '',
+            description: String(r.xeroDesc || r.merchant || 'Materials').trim().slice(0, 250),
+            date: r.date || '', net: r.net
+        }));
+    }
+    function stage2DryRun() {
+        if (stage2Running) return;
+        const items = noCostItems();
+        if (!items.length) { alert('No "NO COSTS" rows to add. Run a check first.'); return; }
+        stage2Items = items;
+        resultsBox.innerHTML = ''; logArea.innerHTML = '';
+        log(`STAGE 2 — DRY RUN: ${items.length} NO-COSTS line(s) would be added (nothing written yet):`, '#0af');
+        const missingDesc = items.filter(i => !i.description || i.description === 'Materials').length;
+        items.forEach(it => log(`  ${it.jobNumber}: "${it.description.slice(0, 44)}"  £${it.net.toFixed(2)} net · ${it.date || '(no date)'} · chargeable · no engineer (owner: ${it.owner || '?'})`, '#9cf'));
+        if (missingDesc) log(`  ⚠ ${missingDesc} row(s) have no Xero description — they will use the merchant/"Materials".`, '#fb0');
+        log('Each is added as a chargeable Material line at NET with 20% VAT. Engineer is NOT set (assign in JobLogic — owner shown above).', '#fb0');
+        log('Click "Confirm & write" to add them to JobLogic.', '#fb0');
+        confirmBtn.style.display = 'inline-block';
+        setProgress(`Stage 2 dry run: ${items.length} line(s) ready. Review, then Confirm & write.`);
+    }
+    async function stage2Write() {
+        if (stage2Running || !stage2Items.length) return;
+        if (!confirm(`Add ${stage2Items.length} material line(s) to JobLogic now? This writes to live jobs.`)) return;
+        stage2Running = true; confirmBtn.style.display = 'none'; stage2Btn.style.display = 'none'; stopBtn.style.display = 'inline-block';
+        log('', '#fff'); log('WRITING...', '#f55');
+        let ok = 0, fail = 0;
+        for (let i = 0; i < stage2Items.length; i++) {
+            if (!stage2Running) { log('Stopped by user.', '#f55'); break; }
+            const it = stage2Items[i];
+            setProgress(`Adding ${i + 1}/${stage2Items.length}: ${it.jobNumber}`);
+            try { await addMaterialLine(it.jobId, it.description, it.date, it.net); log(`  ✓ ${it.jobNumber}: added £${it.net.toFixed(2)} "${it.description.slice(0, 34)}"`, '#0fa'); ok++; }
+            catch (e) { log(`  ✗ ${it.jobNumber}: ${e.message}`, '#f55'); fail++; }
+            await sleep(400);
+        }
+        log('', '#fff'); log(`STAGE 2 DONE — ${ok} added, ${fail} failed.`, '#0af');
+        setProgress(`Stage 2 done: ${ok} added, ${fail} failed.`);
+        stage2Running = false; stopBtn.style.display = 'none';
+    }
+
     function copyResults() {
-        const headers = ['Receipt', 'Merchant', 'Owner', 'Date', 'Net', 'Gross', 'Status', 'Factor', 'Job', 'Explanation', 'Suggested fix'];
+        const hl = (url, label) => url ? `=HYPERLINK("${url}","${String(label || '').replace(/"/g, '""')}")` : (label || '');
+        const cell = v => String(v == null ? '' : v).replace(/[\t\n]/g, ' ');
+        const headers = ['Receipt', 'Merchant', 'Owner', 'Date', 'Net', 'Gross', 'Status',
+            'Job Found', 'Undelivered SPO', 'Related Quote', 'Cost near value', 'Matched / closest line', 'Other info', 'Suggested fix'];
         const lines = [headers.join('\t')];
         results.forEach(r => lines.push([
-            r.receipt || '', r.merchant || '', r.owner || '', r.date || '',
+            cell(r.receipt), cell(r.merchant), cell(r.owner), cell(r.date),
             r.net != null ? r.net.toFixed(2) : '', r.gross != null ? r.gross.toFixed(2) : '',
-            r.status, r.factor || '', r.jobNumber || '', (r.detail || '').replace(/\t/g, ' '),
-            (r.suggest || '').replace(/\t/g, ' ')
+            cell(r.status),
+            r.jobFound ? hl(r.jobLink, r.jobFound) : 'No',
+            (r.spoText && r.spoText !== 'No') ? hl(r.spoUrl, r.spoText) : 'No',
+            (r.quoteText && r.quoteText !== 'No') ? hl(r.quoteUrl, r.quoteText) : 'No',
+            cell(r.costNear), cell(r.costLine), cell(r.other), cell(r.suggest)
         ].join('\t')));
         navigator.clipboard.writeText(lines.join('\n')).then(
             () => setProgress('Results copied — paste into your sheet.'),
@@ -928,11 +1054,13 @@
         const controls = document.createElement('div');
         controls.style.cssText = 'margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;';
         runBtn = mkBtn('Check costs', '#0a8', run);
-        stopBtn = mkBtn('Stop', '#a22', () => { running = false; }); stopBtn.style.display = 'none';
+        stopBtn = mkBtn('Stop', '#a22', () => { running = false; stage2Running = false; }); stopBtn.style.display = 'none';
         copyBtn = mkBtn('Copy results', '#08a', copyResults); copyBtn.style.display = 'none';
+        stage2Btn = mkBtn('➕ Add NO-COSTS to jobs', '#6b4226', stage2DryRun); stage2Btn.style.display = 'none';
+        confirmBtn = mkBtn('Confirm & write', '#a22', stage2Write); confirmBtn.style.display = 'none';
         progressText = document.createElement('span'); progressText.style.color = '#0fa';
         progressText.textContent = 'Ready.';
-        controls.appendChild(runBtn); controls.appendChild(stopBtn); controls.appendChild(copyBtn); controls.appendChild(progressText);
+        controls.appendChild(runBtn); controls.appendChild(stopBtn); controls.appendChild(copyBtn); controls.appendChild(stage2Btn); controls.appendChild(confirmBtn); controls.appendChild(progressText);
 
         resultsBox = document.createElement('div');
         resultsBox.style.cssText = 'overflow-y:auto;max-height:46vh;margin-bottom:6px;';
