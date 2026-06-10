@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Move & Redeploy Yesterday's Visits
 // @namespace    https://go.joblogic.com/
-// @version      1.00
+// @version      1.03
 // @description  On the Planner, finds every New / Not Sent / Read visit dated yesterday across ALL engineers, moves it to today (same time of day) and redeploys it to the same engineer. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
