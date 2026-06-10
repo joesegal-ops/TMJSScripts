@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.0');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.1');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -834,18 +834,34 @@
         payBandId: 'f76846b0-674b-4410-8473-c2f22508f51c', payBandDesc: 'Basic',
         libraryId: 54838, libraryName: 'Standard Parts Library'
     };
-    function buildMaterialBody(jobId, description, dateStr, net) {
-        const c = STAGE2_CFG, v = Number(net).toFixed(2);
+    const upliftCache = new Map();
+    // Each job has a default Uplift % (markup) from its selling rate. Read it from the
+    // Add-Material metadata so the Sell price carries the right margin (Sell = Cost x (1 + uplift/100)).
+    async function jobMaterialDefaults(jobId) {
+        if (upliftCache.has(jobId)) return upliftCache.get(jobId);
+        let d = { uplift: 0, pct: 1 };
+        try {
+            const r = await fetch('/api/JobCost/GetAddMaterialCostMetadata?jobId=' + jobId, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+            const j = await r.json(); const ad = j.AdditionalData || j;
+            d = { uplift: Number(ad.Uplift) || 0, pct: ad.PriceCalculationType != null ? ad.PriceCalculationType : 1 };
+        } catch (e) { /* default 0 */ }
+        upliftCache.set(jobId, d);
+        return d;
+    }
+    function buildMaterialBody(jobId, description, dateStr, net, uplift, pct) {
+        const c = STAGE2_CFG, cost = Number(net), up = Number(uplift) || 0;
+        const v = cost.toFixed(2);
+        const sell = (cost * (1 + up / 100)).toFixed(2);
         const dt = /\d{1,2}:\d{2}/.test(dateStr || '') ? dateStr : ((dateStr || '') + ' 09:00');
         return {
             JobId: jobId, TimeId: null, VirtualTimeId: null,
             CostLines: [{
                 Id: null, PartNumber: null, Quantity: '1', ReturnQuantity: 0, IsReturnItemToStock: false,
-                CostPerUnit: v, CostPerHour: '0.00', Uplift: '0.00', SellPerUnit: v, SellPerHour: '0.00',
+                CostPerUnit: v, CostPerHour: '0.00', Uplift: up.toFixed(2), SellPerUnit: sell, SellPerHour: '0.00',
                 CreateLibraryAllowed: true, CategoryId: null, CategoryDescription: null, ForEquipmentUse: false,
                 Make: null, Model: null, HasFixedSell: false, SetupSell: 0,
                 TaxCodeId: c.taxCodeId, TaxCodeValue: c.taxCodeValue, TaxCodeDescription: c.taxCodeDesc,
-                IsChargeable: true, PriceCalculationType: 1,
+                IsChargeable: true, PriceCalculationType: pct != null ? pct : 1,
                 PayBandId: c.payBandId, PayBandDescription: c.payBandDesc, SellPayBandId: c.payBandId,
                 Description: description, CreatePayBandAllowed: true, LibraryId: c.libraryId, LibraryName: c.libraryName,
                 DateIncurred: dt, HasQuote: false, ItemId: 0, JobLineOption: 5,
@@ -857,10 +873,11 @@
         };
     }
     async function addMaterialLine(jobId, description, dateStr, net) {
+        const d = await jobMaterialDefaults(jobId);
         const r = await fetch('/api/JobLine/AddMaterialCosts', {
             method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', '__RequestVerificationToken': csrf() },
-            body: JSON.stringify(buildMaterialBody(jobId, description, dateStr, net))
+            body: JSON.stringify(buildMaterialBody(jobId, description, dateStr, net, d.uplift, d.pct))
         });
         const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
         if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + txt.slice(0, 120));
@@ -874,17 +891,22 @@
             date: r.date || '', net: r.net
         }));
     }
-    function stage2DryRun() {
+    async function stage2DryRun() {
         if (stage2Running) return;
         const items = noCostItems();
         if (!items.length) { alert('No "NO COSTS" rows to add. Run a check first.'); return; }
         stage2Items = items;
         resultsBox.innerHTML = ''; logArea.innerHTML = '';
         log(`STAGE 2 — DRY RUN: ${items.length} NO-COSTS line(s) would be added (nothing written yet):`, '#0af');
+        setProgress('Stage 2 dry run — reading job uplifts...');
         const missingDesc = items.filter(i => !i.description || i.description === 'Materials').length;
-        items.forEach(it => log(`  ${it.jobNumber}: "${it.description.slice(0, 44)}"  £${it.net.toFixed(2)} net · ${it.date || '(no date)'} · chargeable · no engineer (owner: ${it.owner || '?'})`, '#9cf'));
+        for (const it of items) {
+            const d = await jobMaterialDefaults(it.jobId);
+            const sell = (it.net * (1 + (d.uplift || 0) / 100)).toFixed(2);
+            log(`  ${it.jobNumber}: "${it.description.slice(0, 44)}"  cost £${it.net.toFixed(2)} -> sell £${sell} (uplift ${(d.uplift || 0)}%) · ${it.date || '(no date)'} · chargeable · no engineer (owner: ${it.owner || '?'})`, '#9cf');
+        }
         if (missingDesc) log(`  ⚠ ${missingDesc} row(s) have no Xero description — they will use the merchant/"Materials".`, '#fb0');
-        log('Each is added as a chargeable Material line at NET with 20% VAT. Engineer is NOT set (assign in JobLogic — owner shown above).', '#fb0');
+        log('Each is a chargeable Material line: cost = NET, sell = cost + the job default uplift, 20% VAT. Engineer NOT set (assign in JobLogic — owner shown).', '#fb0');
         log('Click "Confirm & write" to add them to JobLogic.', '#fb0');
         confirmBtn.style.display = 'inline-block';
         setProgress(`Stage 2 dry run: ${items.length} line(s) ready. Review, then Confirm & write.`);
