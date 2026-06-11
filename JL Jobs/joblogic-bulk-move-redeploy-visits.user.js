@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Move & Redeploy Yesterday's Visits
 // @namespace    https://go.joblogic.com/
-// @version      1.04
+// @version      1.05
 // @description  On the Planner, finds every New / Not Sent / Read visit dated yesterday across ALL engineers, moves it to today (same time of day) and redeploys it to the same engineer. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Scheduler*
 // @grant        none
@@ -113,28 +113,17 @@
     // =========================================================================
     // CONFIG
     // =========================================================================
-    // Only these engineers are processed. Names are matched case-insensitively
-    // against /Staff/GetEngineers. Leave the array empty to process ALL engineers.
-    const ENGINEER_ALLOWLIST = [
-        'Daniel Nobes',
-        'Francis Jones',
-        'George Kirumira',
-        'Indy Singh',
-        'Jake Rafferty',
-        'Jevarri Williams',
-        'Keiran Connolly',
-        'Lee Rafferty',
-        'Luke Kelly',
-        'Raj Solanki',
-        'Gerard Egan',
-        'Charlie Flaherty',
-        'Niall Mcdaid',
-        'Damon Rafferty',
-        'Nathaniel Brown',
-        'Yassine Guarguab',
-        'Alen Stephen',
-        'Daniel Wills'
+    // The engineer selection is chosen by the user in the panel and persisted in
+    // localStorage (survives across days/sessions). On the very first run — when no
+    // selection has been saved yet — we seed it from these default names so the
+    // panel isn't empty. After that the user's ticks are the single source of truth.
+    const DEFAULT_ENGINEER_NAMES = [
+        'Daniel Nobes', 'Francis Jones', 'George Kirumira', 'Indy Singh', 'Jake Rafferty',
+        'Jevarri Williams', 'Keiran Connolly', 'Lee Rafferty', 'Luke Kelly', 'Raj Solanki',
+        'Gerard Egan', 'Charlie Flaherty', 'Niall Mcdaid', 'Damon Rafferty', 'Nathaniel Brown',
+        'Yassine Guarguab', 'Alen Stephen', 'Daniel Wills'
     ];
+    const SELECTED_KEY = 'jl-moveredeploy-engineers-v1';   // localStorage: JSON array of engineer Ids
 
     // StatusDescription values that are eligible to be moved + redeployed.
     const ELIGIBLE_STATUSES = ['new', 'not sent', 'read'];
@@ -227,24 +216,41 @@
     // =========================================================================
     // API CALLS
     // =========================================================================
-    async function fetchEngineerIds() {
+    let engineersCache = null;   // [{Id, Name}], sorted by Name
+
+    // Fetch the full engineer roster once and cache it.
+    async function loadEngineers() {
+        if (engineersCache) return engineersCache;
         const r = await fetch(ENGINEERS_URL, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
         if (!r.ok) throw new Error('GetEngineers HTTP ' + r.status);
         const data = await r.json();
-        const engineers = Array.isArray(data) ? data : [];
-        if (!ENGINEER_ALLOWLIST.length) {
-            return engineers.map(e => e.Id).filter(id => id != null);
-        }
+        engineersCache = (Array.isArray(data) ? data : [])
+            .filter(e => e && e.Id != null && e.Name)
+            .sort((a, b) => a.Name.localeCompare(b.Name));
+        return engineersCache;
+    }
+
+    // --- persisted selection (array of engineer Ids, stored as strings) ---
+    function getSelectedIds() {
+        try { const v = JSON.parse(localStorage.getItem(SELECTED_KEY)); return Array.isArray(v) ? v.map(String) : null; }
+        catch (e) { return null; }
+    }
+    function saveSelectedIds(ids) {
+        try { localStorage.setItem(SELECTED_KEY, JSON.stringify([...new Set(ids.map(String))])); } catch (e) {}
+        updateSelectedCount();
+    }
+
+    // First-run seed: if nothing has ever been saved, pre-tick the default names.
+    function seedSelectionIfNeeded(engineers) {
+        if (getSelectedIds() !== null) return;   // a saved selection (even empty) wins
         const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
         const ids = [];
-        for (const name of ENGINEER_ALLOWLIST) {
+        for (const name of DEFAULT_ENGINEER_NAMES) {
             const want = norm(name);
-            const match = engineers.find(e => norm(e.Name) === want) || engineers.find(e => norm(e.Name).includes(want));
-            if (match) { ids.push(match.Id); }
-            else { log(`  ⚠ engineer not found: "${name}"`, '#fa0'); }
+            const m = engineers.find(e => norm(e.Name) === want) || engineers.find(e => norm(e.Name).includes(want));
+            if (m) ids.push(String(m.Id));
         }
-        log(`Restricted to ${ids.length}/${ENGINEER_ALLOWLIST.length} configured engineer(s).`, '#888');
-        return ids;
+        saveSelectedIds(ids);
     }
 
     // Search all engineers between two DD/MM/YYYY HH:mm strings. Returns Items[].
@@ -347,9 +353,13 @@
             const rangeLabel = srcDays.map(ddmmyyyy).join(', ');
             log(`Source day(s) = ${rangeLabel}  →  moving to Today = ${ddmmyyyy(tDay)}`, '#0af');
 
-            log('Fetching engineer list…', '#0af');
-            const engIds = await fetchEngineerIds();
-            log(`${engIds.length} engineer(s).`, '#888');
+            const engIds = getSelectedIds() || [];
+            if (!engIds.length) {
+                setProgress('Select at least one engineer in the list above.');
+                log('No engineers selected — tick some in the Engineers list, then Scan.', '#f55');
+                return;
+            }
+            log(`${engIds.length} engineer(s) selected.`, '#888');
 
             setProgress('Searching source day(s) for the configured engineers…');
             const items = await searchVisits(
@@ -444,8 +454,62 @@
     // =========================================================================
     // UI
     // =========================================================================
-    let panelEl, logArea, progressEl;
+    let panelEl, logArea, progressEl, engListEl, engFilterEl, engCountEl;
     function setProgress(msg) { if (progressEl) progressEl.textContent = msg; }
+
+    function updateSelectedCount() {
+        if (!engCountEl) return;
+        engCountEl.textContent = (getSelectedIds() || []).length + ' selected';
+    }
+
+    // Render the (filtered) engineer checkbox list from engineersCache + saved selection.
+    function renderEngineers() {
+        if (!engListEl) return;
+        const sel = new Set(getSelectedIds() || []);
+        const q = (engFilterEl ? engFilterEl.value : '').toLowerCase().trim();
+        engListEl.innerHTML = '';
+        for (const e of (engineersCache || [])) {
+            if (q && !e.Name.toLowerCase().includes(q)) continue;
+            const id = String(e.Id);
+            const row = document.createElement('label');
+            row.className = 'eng-row';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox'; cb.value = id; cb.checked = sel.has(id);
+            cb.addEventListener('change', () => {
+                const cur = new Set(getSelectedIds() || []);
+                if (cb.checked) cur.add(id); else cur.delete(id);
+                saveSelectedIds([...cur]);
+            });
+            const span = document.createElement('span');
+            span.textContent = e.Name;
+            row.appendChild(cb); row.appendChild(span);
+            engListEl.appendChild(row);
+        }
+    }
+
+    // Tick / untick every currently-visible (filtered) row.
+    function setShownChecked(checked) {
+        const cur = new Set(getSelectedIds() || []);
+        engListEl.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.checked = checked;
+            if (checked) cur.add(cb.value); else cur.delete(cb.value);
+        });
+        saveSelectedIds([...cur]);
+    }
+
+    async function loadAndRenderEngineers() {
+        try {
+            const list = await loadEngineers();
+            seedSelectionIfNeeded(list);
+            renderEngineers();
+            updateSelectedCount();
+            setProgress('Pick engineers (saved automatically), then click Scan.');
+        } catch (e) {
+            setProgress('Could not load engineer list — refresh the page.');
+            log('Engineer load failed: ' + e.message, '#f55');
+        }
+    }
+
     function log(msg, color = '#ccc') {
         if (!logArea) return;
         const line = document.createElement('div');
@@ -481,12 +545,33 @@
 #jl-moveredeploy-panel .btn-close { background:transparent; border:none; color:#eee; font-size:16px; cursor:pointer; }
 #jl-moveredeploy-panel button[disabled] { opacity:.4; cursor:not-allowed; }
 #jl-moveredeploy-panel .hint { color:#6b7280; font-size:11px; line-height:1.45; }
-#jl-moveredeploy-panel .log { background:#0a0a1a; padding:8px; border-radius:4px; overflow-y:auto; max-height:52vh; white-space:pre-wrap; word-break:break-word; }
+#jl-moveredeploy-panel .log { background:#0a0a1a; padding:8px; border-radius:4px; overflow-y:auto; max-height:40vh; white-space:pre-wrap; word-break:break-word; }
 #jl-moveredeploy-panel .log div { padding:1px 0; line-height:1.35; }
+#jl-moveredeploy-panel .eng-section { border:1px solid #2a2a40; border-radius:6px; padding:8px; display:flex; flex-direction:column; gap:6px; }
+#jl-moveredeploy-panel .eng-toolbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+#jl-moveredeploy-panel .eng-toolbar .lbl { font-weight:600; color:#cbd5e1; }
+#jl-moveredeploy-panel .eng-count { color:#0fa; }
+#jl-moveredeploy-panel .mini { background:#374151; padding:3px 8px; font-size:11px; }
+#jl-moveredeploy-panel .eng-filter { flex:1; min-width:120px; background:#0a0a1a; border:1px solid #374151; border-radius:3px; color:#eee; padding:4px 7px; font:12px monospace; }
+#jl-moveredeploy-panel .eng-list { max-height:200px; overflow-y:auto; background:#0a0a1a; border-radius:4px; padding:4px 6px; display:flex; flex-direction:column; gap:1px; }
+#jl-moveredeploy-panel .eng-row { display:flex; align-items:center; gap:7px; padding:2px 3px; cursor:pointer; border-radius:3px; }
+#jl-moveredeploy-panel .eng-row:hover { background:#16213e; }
+#jl-moveredeploy-panel .eng-row input { cursor:pointer; }
 </style>
 <header><b>Move + Redeploy Yesterday's Visits</b><button class="btn-close">×</button></header>
 <div class="body">
-  <div class="progress">Open on the Planner, then click Scan.</div>
+  <div class="progress">Loading engineers…</div>
+  <div class="eng-section">
+    <div class="eng-toolbar">
+      <span class="lbl">Engineers</span>
+      <span class="eng-count">0 selected</span>
+      <span style="flex:1"></span>
+      <button class="mini btn-all">All shown</button>
+      <button class="mini btn-none">None shown</button>
+    </div>
+    <input class="eng-filter" type="text" placeholder="Filter engineers…">
+    <div class="eng-list"></div>
+  </div>
   <div class="controls">
     <button class="btn-scan">Scan</button>
     <button class="btn-run" disabled>Move + Redeploy All</button>
@@ -494,8 +579,8 @@
   </div>
   <div class="hint">
     Finds every <b>New / Not Sent / Read</b> visit from the <b>previous day</b> (on Mondays:
-    <b>Fri + Sat + Sun</b>) for the <b>configured engineers</b> (edit <code>ENGINEER_ALLOWLIST</code> in the script),
-    moves each to <b>today</b> at the same time of day, then redeploys it. Skips team &amp; subcontractor
+    <b>Fri + Sat + Sun</b>) for the <b>ticked engineers</b>, moves each to <b>today</b> at the same time of day,
+    then redeploys it. Your selection is saved and persists across days. Skips team &amp; subcontractor
     visits. Respects the planner's current job-type filter. Scan previews first — nothing is changed until you Run.
   </div>
   <div class="log"></div>
@@ -505,6 +590,9 @@
 
         logArea = panelEl.querySelector('.log');
         progressEl = panelEl.querySelector('.progress');
+        engListEl = panelEl.querySelector('.eng-list');
+        engFilterEl = panelEl.querySelector('.eng-filter');
+        engCountEl = panelEl.querySelector('.eng-count');
 
         const hdr = panelEl.querySelector('header');
         let drag = null;
@@ -516,6 +604,9 @@
         panelEl.querySelector('.btn-scan').onclick = onScan;
         panelEl.querySelector('.btn-run').onclick = onRun;
         panelEl.querySelector('.btn-stop').onclick = onStop;
+        panelEl.querySelector('.btn-all').onclick = () => setShownChecked(true);
+        panelEl.querySelector('.btn-none').onclick = () => setShownChecked(false);
+        engFilterEl.addEventListener('input', renderEngineers);
     }
 
     // =========================================================================
@@ -524,6 +615,7 @@
     function boot() {
         if (!document.body) { setTimeout(boot, 400); return; }
         buildPanel();
+        loadAndRenderEngineers();
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
     else boot();
