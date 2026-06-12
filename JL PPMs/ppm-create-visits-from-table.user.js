@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Joblogic PPM — Create Visits From Table v0.3
+// @name         Joblogic PPM — Create Visits From Table
 // @namespace    https://go.joblogic.com/
-// @version      0.3
+// @version      0.4
 // @description  Paste a PPM activity table (from Excel) and auto-create one visit per required visit on the open PPM contract, evenly distributed over the 12-month contract. Weekly (52/yr) visits start on Mondays with a 5-day duration; everything else lands on the first working day of its month with a 1-month duration. Activities are grouped by category (Water/Fire/Electrical/HVAC/…): same category shares months, different categories get different months, and annuals land mid-contract. "Out of Scope" rows are skipped. Nothing is saved automatically — review and press Joblogic's Save.
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
@@ -287,7 +287,7 @@
         p.id = SCRIPT_ID + '-panel';
         p.style.cssText = 'position:fixed;top:70px;right:8px;z-index:99999;width:430px;max-height:84vh;overflow:auto;background:#fff;border:1px solid #c9d4da;border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,.25);font-family:"Open Sans",sans-serif;font-size:12px;color:#243b46;padding:12px;';
         p.innerHTML = `
-            <div style="font-weight:700;font-size:14px;margin-bottom:8px;">📋 Create Visits From Table <span style="font-weight:400;color:#888;">v0.3</span></div>
+            <div style="font-weight:700;font-size:14px;margin-bottom:8px;">📋 Create Visits From Table <span style="font-weight:400;color:#888;">v0.4</span></div>
             <div style="display:flex;gap:8px;margin-bottom:8px;">
                 <label style="flex:1;">PPM number<br><input id="cvft-ppm" class="form-control" style="width:100%;font-size:12px;" placeholder="PM0001234"></label>
                 <label style="flex:1;">Contract start (DD/MM/YYYY)<br><input id="cvft-start" class="form-control" style="width:100%;font-size:12px;" placeholder="01/05/2026"></label>
