@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic PPM — Create Visits From Table
 // @namespace    https://go.joblogic.com/
-// @version      0.4
+// @version      0.5
 // @description  Paste a PPM activity table (from Excel) and auto-create one visit per required visit on the open PPM contract, evenly distributed over the 12-month contract. Weekly (52/yr) visits start on Mondays with a 5-day duration; everything else lands on the first working day of its month with a 1-month duration. Activities are grouped by category (Water/Fire/Electrical/HVAC/…): same category shares months, different categories get different months, and annuals land mid-contract. "Out of Scope" rows are skipped. Nothing is saved automatically — review and press Joblogic's Save.
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
@@ -205,9 +205,10 @@
     //    start, 5-day duration.
     //  - annuals (1 visit): mid-contract — month 5–9 of the contract,
     //    staggered by category so different categories get different months.
-    //  - everything else: month offsets floor(i*12/N), phase-shifted by the
-    //    category's base month (categories spread evenly over the 12 slots),
-    //    first working day of each month, 1-month duration.
+    //  - everything else: month offsets floor(i*12/N) shifted by a category
+    //    stagger WITHIN the series' gap (gap = 12/N months), so a series
+    //    never wraps past the contract end — visits stay in order and
+    //    different categories start in different months.
     // The anchor month is the start month itself if its first working day
     // falls on/after the start date, else the following month.
     // ------------------------------------------------------------------
@@ -219,12 +220,10 @@
             it.cat = categorize(it.desc);
             if (!cats.includes(it.cat)) cats.push(it.cat);
         }
-        const K = cats.length;
         const out = [];
         for (const it of items) {
             const N = it.visits;
             const k = cats.indexOf(it.cat);
-            const base = Math.floor(k * 12 / K); // category phase for repeating visits
             for (let i = 0; i < N; i++) {
                 const label = N > 1 ? `${it.desc} - Visit ${i + 1} of ${N}` : it.desc;
                 if (N >= WEEKLY_THRESHOLD) {
@@ -232,8 +231,14 @@
                     d.setDate(d.getDate() + i * 7);
                     out.push({ desc: label, cat: it.cat, date: d, duration: WEEKLY_DURATION, kind: 'weekly' });
                 } else {
-                    const off = N === 1 ? 4 + (k % 5)                       // annual: months 5–9 of the contract
-                                        : (base + Math.floor(i * 12 / N)) % 12; // repeating: category-phased spread
+                    let off;
+                    if (N === 1) {
+                        off = 4 + (k % 5); // annual: months 5–9 of the contract
+                    } else {
+                        const gap = Math.floor(12 / N);          // months between visits in this series
+                        const shift = gap > 0 ? k % gap : 0;     // category stagger inside the first gap
+                        off = shift + Math.floor(i * 12 / N);    // never exceeds month 11 — no wrap
+                    }
                     const d = firstWorkingDay(anchorY, anchorM + off);
                     out.push({ desc: label, cat: it.cat, date: d, duration: MONTHLY_DURATION, kind: 'monthly' });
                 }
@@ -287,7 +292,7 @@
         p.id = SCRIPT_ID + '-panel';
         p.style.cssText = 'position:fixed;top:70px;right:8px;z-index:99999;width:430px;max-height:84vh;overflow:auto;background:#fff;border:1px solid #c9d4da;border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,.25);font-family:"Open Sans",sans-serif;font-size:12px;color:#243b46;padding:12px;';
         p.innerHTML = `
-            <div style="font-weight:700;font-size:14px;margin-bottom:8px;">📋 Create Visits From Table <span style="font-weight:400;color:#888;">v0.4</span></div>
+            <div style="font-weight:700;font-size:14px;margin-bottom:8px;">📋 Create Visits From Table <span style="font-weight:400;color:#888;">v0.5</span></div>
             <div style="display:flex;gap:8px;margin-bottom:8px;">
                 <label style="flex:1;">PPM number<br><input id="cvft-ppm" class="form-control" style="width:100%;font-size:12px;" placeholder="PM0001234"></label>
                 <label style="flex:1;">Contract start (DD/MM/YYYY)<br><input id="cvft-start" class="form-control" style="width:100%;font-size:12px;" placeholder="01/05/2026"></label>
