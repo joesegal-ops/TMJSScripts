@@ -20,7 +20,8 @@
       "Bash(find ~/Downloads ~/Desktop ~/Documents -iname \"*untitled*\" -o -iname \"*UP*logo*\" -o -iname \"*up-fm*\" 2>/dev/null | grep -i \"png\\\\|jpg\\\\|svg\\\\|webp\" | head -20)",
       "Bash(xargs ls -la)",
       "Bash(find /Users/joesegal -name \"ppm_planner*\" 2>/dev/null)",
-      "Bash(python3)"
+      "Bash(python3)",
+      "Bash(ls -la \"/Users/joesegal/Documents/Claude Code/JL PPMs/\" && ls \"/Users/joesegal/Documents/Claude Code/\")"
     ]
   }
 }
