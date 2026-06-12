@@ -21,7 +21,8 @@
       "Bash(xargs ls -la)",
       "Bash(find /Users/joesegal -name \"ppm_planner*\" 2>/dev/null)",
       "Bash(python3)",
-      "Bash(ls -la \"/Users/joesegal/Documents/Claude Code/JL PPMs/\" && ls \"/Users/joesegal/Documents/Claude Code/\")"
+      "Bash(ls -la \"/Users/joesegal/Documents/Claude Code/JL PPMs/\" && ls \"/Users/joesegal/Documents/Claude Code/\")",
+      "Bash(node --check \"/Users/joesegal/Documents/Claude Code/JL PPMs/ppm-create-visits-from-table.user.js\")"
     ]
   }
 }

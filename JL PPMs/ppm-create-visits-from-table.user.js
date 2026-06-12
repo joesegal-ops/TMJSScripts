@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic PPM — Create Visits From Table
 // @namespace    https://go.joblogic.com/
-// @version      0.1
-// @description  Paste a PPM activity table (from Excel) and auto-create one visit per required visit on the open PPM contract, evenly distributed over the 12-month contract. Weekly (52/yr) visits start on Mondays with a 5-day duration; everything else lands on the first working day of its month with a 1-month duration. "Out of Scope" rows are skipped. Nothing is saved automatically — review and press Joblogic's Save.
+// @version      0.2
+// @description  Paste a PPM activity table (from Excel) and auto-create one visit per required visit on the open PPM contract, evenly distributed over the 12-month contract. Weekly (52/yr) visits start on Mondays with a 5-day duration; everything else lands on the first working day of its month with a 1-month duration. Activities are grouped by category (Water/Fire/Electrical/HVAC/…): same category shares months, different categories get different months, and annuals land mid-contract. "Out of Scope" rows are skipped. Nothing is saved automatically — review and press Joblogic's Save.
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
 // @run-at       document-idle
@@ -178,29 +178,64 @@
     }
 
     // ------------------------------------------------------------------
+    // Category grouping. Same category → same months; different categories
+    // → different months. First matching rule wins (order matters: e.g.
+    // "Emergency Lighting Drain Test" must hit Electrical before Drainage).
+    // Fallback = first word of the description.
+    // ------------------------------------------------------------------
+    const CATEGORY_RULES = [
+        ['Water', /water|tmv|sentinel|outlet flush|shower|legionella|calorifier|hygiene|\btank\b/i],
+        ['Fire', /fire|extinguisher|sprinkler|smoke|\baov\b|damper|refuge|evcs|alarm/i],
+        ['Electrical', /electric|eicr|\bpat\b|emergency light|lightning|\blv\b|\bhv\b|\bbms\b|lighting|solar|catering equip/i],
+        ['HVAC', /vrf|ahu|hvac|boiler|chiller|heat|ventilat|air con|\bfcu\b|cooling|refrigerat/i],
+        ['Lifts', /\blifts?\b|loler|hoist/i],
+        ['Height Safety', /mansafe|fall protection|\banchor\b|eyebolt/i],
+        ['Drainage/Plumbing', /drain|gutter|booster|\bpumps?\b|leak/i],
+        ['Doors/Access', /\bdoors?\b|\bgates?\b|barrier|access control|roller shutter/i],
+    ];
+    function categorize(desc) {
+        for (const [name, re] of CATEGORY_RULES) if (re.test(desc)) return name;
+        const w = desc.trim().split(/\s+/)[0];
+        return w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : 'Other';
+    }
+
+    // ------------------------------------------------------------------
     // Scheduling across a 12-month contract starting at `start`.
-    //  - visits >= WEEKLY_THRESHOLD: weekly from the first Monday on/after start, 5-day duration.
-    //  - otherwise: month offsets floor(i*12/N) from the anchor month, first
-    //    working day of each month, 1-month duration. The anchor month is the
-    //    start month itself if its first working day falls on/after the start
-    //    date, else the following month.
+    //  - visits >= WEEKLY_THRESHOLD: weekly from the first Monday on/after
+    //    start, 5-day duration.
+    //  - annuals (1 visit): mid-contract — month 5–9 of the contract,
+    //    staggered by category so different categories get different months.
+    //  - everything else: month offsets floor(i*12/N), phase-shifted by the
+    //    category's base month (categories spread evenly over the 12 slots),
+    //    first working day of each month, 1-month duration.
+    // The anchor month is the start month itself if its first working day
+    // falls on/after the start date, else the following month.
     // ------------------------------------------------------------------
     function scheduleVisits(items, start) {
         let anchorY = start.getFullYear(), anchorM = start.getMonth();
         if (firstWorkingDay(anchorY, anchorM) < start) { anchorM++; if (anchorM > 11) { anchorM = 0; anchorY++; } }
+        const cats = [];
+        for (const it of items) {
+            it.cat = categorize(it.desc);
+            if (!cats.includes(it.cat)) cats.push(it.cat);
+        }
+        const K = cats.length;
         const out = [];
         for (const it of items) {
             const N = it.visits;
+            const k = cats.indexOf(it.cat);
+            const base = Math.floor(k * 12 / K); // category phase for repeating visits
             for (let i = 0; i < N; i++) {
                 const label = N > 1 ? `${it.desc} - Visit ${i + 1} of ${N}` : it.desc;
                 if (N >= WEEKLY_THRESHOLD) {
                     const d = firstMondayOnOrAfter(start);
                     d.setDate(d.getDate() + i * 7);
-                    out.push({ desc: label, date: d, duration: WEEKLY_DURATION, kind: 'weekly' });
+                    out.push({ desc: label, cat: it.cat, date: d, duration: WEEKLY_DURATION, kind: 'weekly' });
                 } else {
-                    const off = Math.floor(i * 12 / N);
+                    const off = N === 1 ? 4 + (k % 5)                       // annual: months 5–9 of the contract
+                                        : (base + Math.floor(i * 12 / N)) % 12; // repeating: category-phased spread
                     const d = firstWorkingDay(anchorY, anchorM + off);
-                    out.push({ desc: label, date: d, duration: MONTHLY_DURATION, kind: 'monthly' });
+                    out.push({ desc: label, cat: it.cat, date: d, duration: MONTHLY_DURATION, kind: 'monthly' });
                 }
             }
         }
@@ -293,10 +328,11 @@
             if (!items.length) { status('⚠ No usable rows found — paste the table tab-separated (copy straight from Excel).'); return; }
             plan = scheduleVisits(items, start);
             const byKind = plan.filter(v => v.kind === 'weekly').length;
-            let html = `<div style="margin-bottom:6px;"><b>${items.length}</b> activities → <b>${plan.length}</b> visits (${byKind} weekly, ${plan.length - byKind} monthly-style).</div>`;
+            const cats = [...new Set(plan.map(v => v.cat))];
+            let html = `<div style="margin-bottom:6px;"><b>${items.length}</b> activities → <b>${plan.length}</b> visits (${byKind} weekly, ${plan.length - byKind} monthly-style) across <b>${cats.length}</b> categories: ${cats.join(', ')}.</div>`;
             if (skipped.length) html += `<div style="color:#9a6b00;margin-bottom:6px;">Skipped ${skipped.length} row(s): ${skipped.map(s => `${s.desc} <i>(${s.why})</i>`).join('; ')}</div>`;
             html += '<table style="width:100%;border-collapse:collapse;">' + plan.map(v =>
-                `<tr style="border-bottom:1px solid #eee;"><td style="padding:2px 4px;">${v.desc}</td><td style="padding:2px 4px;white-space:nowrap;">${fmtDate(v.date)}</td><td style="padding:2px 4px;text-align:right;">${v.duration}m</td></tr>`
+                `<tr style="border-bottom:1px solid #eee;"><td style="padding:2px 4px;">${v.desc}</td><td style="padding:2px 4px;color:#777;">${v.cat}</td><td style="padding:2px 4px;white-space:nowrap;">${fmtDate(v.date)}</td><td style="padding:2px 4px;text-align:right;">${v.duration}m</td></tr>`
             ).join('') + '</table>';
             $('out').innerHTML = html;
             $('create').style.display = '';
