@@ -103,6 +103,9 @@
     // ===== end shared dock =====
 
     const SCRIPT_ID = 'weekly-plan-allocate';
+    // Pull the real version from Tampermonkey so the panel header can't drift
+    // out of sync with the @version metadata.
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '';
     const SCRIPT_LABEL = '🗓️ Allocate from Weekly Plan';
     const SCRIPT_COLOR = '#1d4e89';
     const SCRIPT_DESC = 'Paste a free-text weekly plan (engineer names + day-of-week job lines with PM/RE refs) and a week-start date. Expands to one visit per job per day, opens each job Visits tab and allocates the fuzzy-matched engineer on the computed date. Existing visits are left untouched.';
@@ -959,7 +962,7 @@
   #jl-weeklyplan-panel .log div{padding:1px 0;line-height:1.35;}
 </style>
 <header>
-  <b>Allocate from Weekly Plan <span style="font-weight:400;color:#9ca3af;font-size:11px;">v1.00</span></b>
+  <b>Allocate from Weekly Plan <span style="font-weight:400;color:#9ca3af;font-size:11px;">${SCRIPT_VERSION ? 'v' + SCRIPT_VERSION : ''}</span></b>
   <div>
     <button class="close" title="Close panel">×</button>
   </div>
