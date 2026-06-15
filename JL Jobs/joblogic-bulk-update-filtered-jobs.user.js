@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Update Filtered Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  On the /Job list page: captures the current search filter, walks every page of results, and bulk-updates Status, Category, Job Type, or Tags (add/remove) on every matching job via the API.
+// @version      1.1
+// @description  On the /Job list page: captures the current search filter, walks every page of results, and bulk-updates Status, Category, Job Type, or Tags (add/remove) on every matching job via the API. Also works on Customer detail pages, where it targets all of that customer's jobs.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-start
@@ -18,7 +18,7 @@
     // document-start so the initial page-load search is caught too).
     // The page posts JSON to /api/Job/SearchJsonData via axios (XHR).
     // =======================================================================
-    const capture = { body: null, totalCount: null, pageSize: null, when: null, paused: false };
+    const capture = { body: null, totalCount: null, pageSize: null, when: null, paused: false, synthetic: false };
     let onCaptureUpdate = null; // set later by the UI
 
     function noteSearchRequest(body) {
@@ -162,7 +162,7 @@
     const SCRIPT_ID = 'bulk-update-filtered';
     const SCRIPT_LABEL = '📋 Bulk Update Filtered Jobs';
     const SCRIPT_COLOR = '#1f4e6b';
-    const SCRIPT_DESC = 'Updates Status, Category, Job Type or Tags on EVERY job matching the current search filter (all pages). Apply your filter, click Search on the page, pick the field + value here, then Start. Dry Run first!';
+    const SCRIPT_DESC = 'Updates Status, Category, Job Type or Tags on EVERY job matching the current view (all pages). On the Jobs list: apply your filter and click Search first. On a Customer page: targets all of that customer\'s jobs automatically. Pick the field + value, then Start. Dry Run first!';
 
     // --- CONFIG ---
     const DELAY_BETWEEN_JOBS = 400;
@@ -519,9 +519,41 @@
             if (!capture.body) return;
             const n = capture.totalCount != null ? capture.totalCount : '?';
             captureLine.style.color = '#0fa';
-            captureLine.textContent = `Filter captured ${capture.when ? capture.when.toLocaleTimeString() : ''} — ${n} job(s) match the current search.`;
+            captureLine.textContent = capture.synthetic
+                ? `Targeting all jobs for this customer — ${n} job(s).`
+                : `Filter captured ${capture.when ? capture.when.toLocaleTimeString() : ''} — ${n} job(s) match the current search.`;
         };
         onCaptureUpdate();
+
+        // On a Customer page there is no AJAX search to capture (the Jobs tab is
+        // server-rendered and pages via ?pageIndex=). Synthesize a filter that
+        // targets every job for this customer via the same SearchJsonData backend.
+        const custId = customerIdFromUrl();
+        if (custId) primeCustomerFilter(custId);
+    }
+
+    function customerIdFromUrl() {
+        const m = location.pathname.match(/\/Customer\/Detail\/(\d+)/i);
+        return m ? m[1] : null;
+    }
+
+    async function primeCustomerFilter(custId) {
+        const body = {
+            SearchTerm: '', PageSize: 50, PageIndex: 1, EngineerType: 0,
+            IncludePPMJobs: true, IncludeReactiveJobs: true, CustomerId: custId,
+            StartLoggedDate: '', EndLoggedDate: '', StartDate: '', EndDate: '',
+            StartCompleteDate: '', EndCompleteDate: '', StartNextContactDate: '', EndNextContactDate: ''
+        };
+        capture.body = JSON.stringify(body);
+        capture.synthetic = true;
+        capture.when = new Date();
+        capture.paused = true; // never let an unrelated search overwrite the customer filter
+        try {
+            const page = await searchPage(body, 1);
+            capture.totalCount = page.totalCount;
+            capture.pageSize = page.pageSize || 50;
+        } catch (e) { /* count is best-effort */ }
+        if (onCaptureUpdate) onCaptureUpdate();
     }
 
     function log(msg, color) {
@@ -688,9 +720,11 @@
         stopBtn.style.display = 'none';
     }
 
-    // --- BOOT (UI only on the Job list page; capture hook runs everywhere) ---
+    // --- BOOT (UI on the Job list page and on Customer detail pages; capture hook runs everywhere) ---
     function boot() {
-        if (!/^\/Job\/?$/i.test(location.pathname)) return;
+        const onJobList = /^\/Job\/?$/i.test(location.pathname);
+        const onCustomer = /^\/Customer\/Detail\/\d+/i.test(location.pathname);
+        if (!onJobList && !onCustomer) return;
         createUI();
     }
     if (document.readyState === 'loading') {
