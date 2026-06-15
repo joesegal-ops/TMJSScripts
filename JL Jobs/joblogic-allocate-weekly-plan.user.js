@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Allocate Engineers from Weekly Plan
 // @namespace    http://tampermonkey.net/
-// @version      1.03
+// @version      1.04
 // @description  Paste a free-text weekly plan (engineer name lines + day-of-week job lines referencing PM/RE job numbers) and a week-start date. Script expands it to one visit per job per listed day, then navigates each job's Visits tab and allocates the (fuzzy-matched) engineer on the computed date — without touching existing visits.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -859,6 +859,47 @@
         return { engineer, start, end, iconFile, statusLabel, statusClass };
     }
 
+    // Fetch authoritative visit data for a job (the same /api/Visit/GetVisitsJson
+    // feed the Visits tab uses). It carries the reject/abort/abandon reasons that
+    // the rendered table only shows as a status icon. Returns a Map keyed by
+    // "start|engineer" (and a "start|" fallback) -> { reason, reasonType, status }.
+    async function fetchVisitReasons(jobId) {
+        const map = new Map();
+        if (!jobId) return map;
+        try {
+            const r = await fetch(`/api/Visit/GetVisitsJson?&jobId=${jobId}&isAxaJob=false&isReadOnly=false&pageIndex=1&pageSize=200`,
+                { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+            if (!r.ok) return map;
+            const j = await r.json();
+            const arr = (j.AdditionalData && j.AdditionalData.Visits) || [];
+            for (const v of arr) {
+                const pick = [
+                    ['Rejected', v.RejectReason], ['Aborted', v.AbortReason],
+                    ['Abandoned', v.AbandonReason], ['Left site', v.LeftSiteReason],
+                    ['Revisit', v.RevistReason]
+                ].find(([, txt]) => txt && String(txt).trim());
+                const reason = pick ? String(pick[1]).trim() : (v.ReasonUnFormatted ? String(v.ReasonUnFormatted).trim() : '');
+                const info = { reason, reasonType: pick ? pick[0] : '', status: v.StatusDescription || '' };
+                const start = (v.StartDate || '').trim();
+                const eng = (v.EngineerName || '').trim().toLowerCase();
+                if (start && eng) map.set(start + '|' + eng, info);
+                if (start && !map.has(start + '|')) map.set(start + '|', info);
+            }
+        } catch (e) { /* report still works without reasons */ }
+        return map;
+    }
+
+    // Merge reasons from the API map onto DOM-read visit objects (matched on
+    // start time + engineer, falling back to start time alone).
+    function attachReasons(visits, reasonMap) {
+        for (const v of visits || []) {
+            const eng = (v.engineer || '').trim().toLowerCase();
+            const info = reasonMap.get(v.start + '|' + eng) || reasonMap.get(v.start + '|');
+            if (info) { v.reason = info.reason || ''; v.reasonType = info.reasonType || ''; }
+        }
+        return visits;
+    }
+
     // Wait for a new visit row to appear (success signal).
     async function waitForNewVisit(previousCount, timeoutMs = AFTER_ALLOCATE_WAIT_MS) {
         try {
@@ -1351,8 +1392,9 @@ Callum Holdstock
             await waitForAllocatePanel();
 
             const existing = await readExistingVisits();
+            attachReasons(existing, await fetchVisitReasons(row.internalId));
             log(`  existing visits (${existing.length}):`, '#0af');
-            existing.forEach(v => log(`    · ${v.engineer} | ${v.start} → ${v.end} | [${v.statusLabel}]`, '#888'));
+            existing.forEach(v => log(`    · ${v.engineer} | ${v.start} → ${v.end} | [${v.statusLabel}]${v.reason ? ` — ${v.reasonType || 'reason'}: ${v.reason}` : ''}`, '#888'));
 
             // Decide effective dates:
             //   • If row has a date → use it.
@@ -1562,7 +1604,10 @@ Callum Holdstock
             if (!visits || !visits.length) return '<em style="color:#9ca3af;">(none)</em>';
             return '<ul style="margin:0;padding-left:16px;">' + visits.map(v => {
                 const col = statusColourForClass(v.statusClass);
-                return `<li><span>${escapeHtml(v.engineer)}</span> <span style="color:#6b7280;">${escapeHtml(v.start)} → ${escapeHtml(v.end)}</span> <span style="color:${col};font-weight:600;">[${escapeHtml(v.statusLabel)}]</span></li>`;
+                const reasonHtml = v.reason
+                    ? ` <span style="color:#b45309;">— ${escapeHtml(v.reasonType || 'reason')}: ${escapeHtml(v.reason)}</span>`
+                    : '';
+                return `<li><span>${escapeHtml(v.engineer)}</span> <span style="color:#6b7280;">${escapeHtml(v.start)} → ${escapeHtml(v.end)}</span> <span style="color:${col};font-weight:600;">[${escapeHtml(v.statusLabel)}]</span>${reasonHtml}</li>`;
             }).join('') + '</ul>';
         };
 
@@ -1647,7 +1692,7 @@ Callum Holdstock
             const s = summarizeVisits(r.existingVisits);
             const breakdown = Object.entries(s.breakdown).map(([k, n]) => `${k}×${n}`).join(' ; ');
             const existingStr = (r.existingVisits || []).map(v =>
-                `${v.engineer} ${v.start}->${v.end} [${v.statusLabel}]`
+                `${v.engineer} ${v.start}->${v.end} [${v.statusLabel}]${v.reason ? ` (${v.reasonType || 'reason'}: ${v.reason})` : ''}`
             ).join(' | ');
             lines.push([
                 r.ref, r.dateStr, r.engineerRaw, r.resolvedEngineer || '',
