@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic PPM — Bulk Edit Visits
 // @namespace    https://go.joblogic.com/
-// @version      0.12
+// @version      0.13
 // @description  Bulk-edit Description / Assignee type / Engineer / Duration / Job Category / Trade for all filtered visits on a PPM contract. v0.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none

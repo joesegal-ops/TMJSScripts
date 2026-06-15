@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic PPM — Create Visits From Table
 // @namespace    https://go.joblogic.com/
-// @version      0.5
+// @version      0.6
 // @description  Paste a PPM activity table (from Excel) and auto-create one visit per required visit on the open PPM contract, evenly distributed over the 12-month contract. Weekly (52/yr) visits start on Mondays with a 5-day duration; everything else lands on the first working day of its month with a 1-month duration. Activities are grouped by category (Water/Fire/Electrical/HVAC/…): same category shares months, different categories get different months, and annuals land mid-contract. "Out of Scope" rows are skipped. Nothing is saved automatically — review and press Joblogic's Save.
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
@@ -101,7 +101,7 @@
 
     const SCRIPT_ID = 'ppm-create-visits-from-table';
     const SCRIPT_LABEL = '📋 PPM Visits From Table';
-    const SCRIPT_COLOR = '#2e7d32';
+    const SCRIPT_COLOR = '#ff7919';
     const SCRIPT_DESC = 'Paste the PPM activity table (copied from Excel, tab-separated). One visit is created per required visit, spread evenly across the 12-month contract. 52/yr = weekly, Mondays, 5-day duration (7200 min). Everything else = first working day of its month, 1-month duration (40320 min). Rows containing "Out of Scope" are ignored. NOTHING IS SAVED automatically — review the new rows then press Joblogic\'s own Save button (or Undo Changes to discard).';
 
     const MONTHLY_DURATION = 40320; // minutes ≈ 1 month
