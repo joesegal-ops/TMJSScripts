@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Allocate Engineers from Weekly Plan
 // @namespace    http://tampermonkey.net/
-// @version      1.00
+// @version      1.02
 // @description  Paste a free-text weekly plan (engineer name lines + day-of-week job lines referencing PM/RE job numbers) and a week-start date. Script expands it to one visit per job per listed day, then navigates each job's Visits tab and allocates the (fuzzy-matched) engineer on the computed date — without touching existing visits.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -306,9 +306,16 @@
     // plus a few other Joblogic doc prefixes and bare J#### reactive numbers.
     const REF_RE = /\b((?:PM|RE|QU|SI|RM|VI|EM|WO)\d{3,}(?:\s*\/\s*\d+)?|J\d{4,})\b/gi;
 
-    // Parse a DD/MM/YYYY (time optional/ignored) into a Date, or null.
+    // Parse a date (time optional/ignored) into a Date, or null. Accepts
+    // DD/MM/YYYY (UK, as typed) and YYYY-MM-DD (what <input type="date"> returns).
     function parseDMY(s) {
-        const m = String(s || '').trim().match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+        const str = String(s || '').trim();
+        let m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); // ISO from native date picker
+        if (m) {
+            const d = new Date(+m[1], +m[2] - 1, +m[3]);
+            return isNaN(d) ? null : d;
+        }
+        m = str.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
         if (!m) return null;
         const yrRaw = +m[3];
         const d = new Date(yrRaw < 100 ? 2000 + yrRaw : yrRaw, +m[2] - 1, +m[1]);
@@ -1090,8 +1097,8 @@
   <div style="padding:14px 16px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
       <label style="font-size:13px;color:#111;font-weight:600;">Week start (Mon)</label>
-      <input id="jl-paste-week" type="text" value="${savedWeek}" placeholder="DD/MM/YYYY"
-        style="font:13px monospace;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;width:140px;">
+      <input id="jl-paste-week" type="date" value="${savedWeek}"
+        style="font:13px monospace;padding:6px 8px;border:1px solid #d1d5db;border-radius:4px;">
       <span style="color:#6b7280;font-size:11.5px;">Day names map onto this week (any date in the week works).</span>
     </div>
     <textarea id="jl-paste-ta" style="width:100%;height:260px;font:13px monospace;padding:8px;
@@ -1480,9 +1487,20 @@ Callum Holdstock
         cur.phase = 'navigating';
         saveState(cur);
         await sleep(700);
-        // Trigger navigation to the next job. location.href change ends this
-        // page's script; new page's boot resumes via runDispatcher.
-        location.href = `/Job/Detail/${cur.rows[cur.currentIndex].internalId}?pageIndex=1#visitsTab`;
+        const nextId = String(cur.rows[cur.currentIndex].internalId);
+        const curId = (location.pathname.match(/\/Job\/Detail\/(\d+)/) || [])[1];
+        if (nextId === curId) {
+            // The next visit is on the SAME job (e.g. the same PM/RE ref listed
+            // for another day). Setting location.href to the current URL would
+            // NOT reload, so re-run the dispatcher in place instead of relying
+            // on a navigation to resume.
+            if (location.hash !== '#visitsTab') location.hash = 'visitsTab';
+            setTimeout(runDispatcher, 700);
+        } else {
+            // Different job — navigate. This page's script ends; the new page's
+            // boot resumes the run via runDispatcher.
+            location.href = `/Job/Detail/${nextId}?pageIndex=1#visitsTab`;
+        }
     }
 
     function finishRun(msg) {
