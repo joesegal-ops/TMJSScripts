@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Move & Redeploy Yesterday's Visits
 // @namespace    https://go.joblogic.com/
-// @version      1.05
+// @version      1.06
 // @description  On the Planner, finds every New / Not Sent / Read visit dated yesterday across ALL engineers, moves it to today (same time of day) and redeploys it to the same engineer. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Scheduler*
 // @grant        none
@@ -102,6 +102,7 @@
     }
     // ===== end shared dock =====
 
+    const SCRIPT_VERSION = '1.06';   // keep in sync with @version header
     const SCRIPT_ID = 'move-redeploy-visits';
     const SCRIPT_LABEL = '📅 Move+Redeploy Visits';
     const SCRIPT_COLOR = '#072d3d';
@@ -124,6 +125,15 @@
         'Yassine Guarguab', 'Alen Stephen', 'Daniel Wills'
     ];
     const SELECTED_KEY = 'jl-moveredeploy-engineers-v1';   // localStorage: JSON array of engineer Ids
+
+    // Job types the user can choose from (TypeOfJob on a visit: 1 = Reactive, 2 = PPM).
+    // The selection is persisted; the default on first run is Reactive only.
+    const JOB_TYPES = [
+        { id: 1, label: 'Reactive' },
+        { id: 2, label: 'PPM' }
+    ];
+    const DEFAULT_JOB_TYPE_IDS = [1];                       // Reactive only
+    const JOBTYPE_KEY = 'jl-moveredeploy-jobtypes-v1';      // localStorage: JSON array of TypeOfJob ids
 
     // StatusDescription values that are eligible to be moved + redeployed.
     const ELIGIBLE_STATUSES = ['new', 'not sent', 'read'];
@@ -253,16 +263,33 @@
         saveSelectedIds(ids);
     }
 
+    // --- persisted job-type selection (array of TypeOfJob ids as numbers) ---
+    function getSelectedJobTypes() {
+        try {
+            const v = JSON.parse(localStorage.getItem(JOBTYPE_KEY));
+            if (Array.isArray(v)) return v.map(Number).filter(n => !isNaN(n));
+        } catch (e) {}
+        return DEFAULT_JOB_TYPE_IDS.slice();   // first run → Reactive only
+    }
+    function saveSelectedJobTypes(ids) {
+        try { localStorage.setItem(JOBTYPE_KEY, JSON.stringify([...new Set(ids.map(Number))])); } catch (e) {}
+    }
+
     // Search all engineers between two DD/MM/YYYY HH:mm strings. Returns Items[].
-    async function searchVisits(startStr, endStr, engineerIds) {
+    // jobTypeIds overrides the planner's TypeOfJobs[] filter so we fetch exactly
+    // the requested job types regardless of the planner's current filter state.
+    async function searchVisits(startStr, endStr, engineerIds, jobTypeIds) {
         const tmpl = window.__jlSchedTemplate;
         if (!tmpl) throw new Error('No SchedulerSearch template captured');
         const fd = new FormData();
         for (const [k, v] of tmpl) {
-            if (k === 'StartDate') { fd.append(k, startStr); continue; }
-            if (k === 'EndDate')   { fd.append(k, endStr);   continue; }
+            if (k === 'StartDate')           { fd.append(k, startStr); continue; }
+            if (k === 'EndDate')             { fd.append(k, endStr);   continue; }
+            if (/^TypeOfJobs/i.test(k))      { continue; }   // drop — we set these from jobTypeIds
             fd.append(k, v);
         }
+        (jobTypeIds && jobTypeIds.length ? jobTypeIds : [1, 2])
+            .forEach((t, i) => fd.append('TypeOfJobs[' + i + ']', t));
         engineerIds.forEach((id, i) => fd.append('EngineerIds[' + i + ']', id));
         const r = await fetch(SEARCH_URL, {
             method: 'POST', credentials: 'same-origin',
@@ -320,11 +347,12 @@
     // =========================================================================
     // ELIGIBILITY
     // =========================================================================
-    function isEligible(v, allowedDays) {
+    function isEligible(v, allowedDays, allowedTypes) {
         if (!v || v.id == null) return false;
         if (v.SubcontractorId) return false;                       // engineers only
         if (v.IsTeamVisit) return false;                           // team visits use a different endpoint
         if (v.IsMoveable === false) return false;
+        if (!allowedTypes.has(Number(v.TypeOfJob))) return false;  // job-type filter (Reactive / PPM)
         if (!allowedDays.has(dayOf(v.start))) return false;        // must start on a source day
         const status = (v.StatusDescription || '').trim().toLowerCase();
         return ELIGIBLE_STATUSES.indexOf(status) !== -1;
@@ -361,14 +389,24 @@
             }
             log(`${engIds.length} engineer(s) selected.`, '#888');
 
-            setProgress('Searching source day(s) for the configured engineers…');
+            const jobTypeIds = getSelectedJobTypes();
+            if (!jobTypeIds.length) {
+                setProgress('Select at least one job type.');
+                log('No job types selected — tick Reactive and/or PPM, then Scan.', '#f55');
+                return;
+            }
+            const allowedTypes = new Set(jobTypeIds.map(Number));
+            const typeLabels = JOB_TYPES.filter(t => allowedTypes.has(t.id)).map(t => t.label).join(' + ');
+            log(`Job type(s): ${typeLabels}`, '#888');
+
+            setProgress('Searching source day(s) for the selected engineers…');
             const items = await searchVisits(
                 `${ddmmyyyy(srcDays[0])} 00:00`,
                 `${ddmmyyyy(srcDays[srcDays.length - 1])} 23:59`,
-                engIds);
+                engIds, jobTypeIds);
             log(`${items.length} visit(s) in range in total.`, '#888');
 
-            foundVisits = items.filter(v => isEligible(v, allowed));
+            foundVisits = items.filter(v => isEligible(v, allowed, allowedTypes));
 
             // Tally for transparency
             const tally = {};
@@ -454,8 +492,29 @@
     // =========================================================================
     // UI
     // =========================================================================
-    let panelEl, logArea, progressEl, engListEl, engFilterEl, engCountEl;
+    let panelEl, logArea, progressEl, engListEl, engFilterEl, engCountEl, jobTypeListEl;
     function setProgress(msg) { if (progressEl) progressEl.textContent = msg; }
+
+    // Render the job-type checkboxes from saved selection (default Reactive only).
+    function renderJobTypes() {
+        if (!jobTypeListEl) return;
+        const sel = new Set(getSelectedJobTypes());
+        jobTypeListEl.innerHTML = '';
+        for (const t of JOB_TYPES) {
+            const label = document.createElement('label');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox'; cb.value = String(t.id); cb.checked = sel.has(t.id);
+            cb.addEventListener('change', () => {
+                const cur = new Set(getSelectedJobTypes());
+                if (cb.checked) cur.add(t.id); else cur.delete(t.id);
+                saveSelectedJobTypes([...cur]);
+            });
+            const span = document.createElement('span');
+            span.textContent = t.label;
+            label.appendChild(cb); label.appendChild(span);
+            jobTypeListEl.appendChild(label);
+        }
+    }
 
     function updateSelectedCount() {
         if (!engCountEl) return;
@@ -557,8 +616,11 @@
 #jl-moveredeploy-panel .eng-row { display:flex; align-items:center; gap:7px; padding:2px 3px; cursor:pointer; border-radius:3px; }
 #jl-moveredeploy-panel .eng-row:hover { background:#16213e; }
 #jl-moveredeploy-panel .eng-row input { cursor:pointer; }
+#jl-moveredeploy-panel .jobtype-list { display:flex; gap:18px; flex-wrap:wrap; padding:2px 3px; }
+#jl-moveredeploy-panel .jobtype-list label { display:flex; align-items:center; gap:6px; cursor:pointer; }
+#jl-moveredeploy-panel .ver { color:#64748b; font-weight:400; font-size:11px; }
 </style>
-<header><b>Move + Redeploy Yesterday's Visits</b><button class="btn-close">×</button></header>
+<header><b>Move + Redeploy Yesterday's Visits <span class="ver">v${SCRIPT_VERSION}</span></b><button class="btn-close">×</button></header>
 <div class="body">
   <div class="progress">Loading engineers…</div>
   <div class="eng-section">
@@ -572,6 +634,10 @@
     <input class="eng-filter" type="text" placeholder="Filter engineers…">
     <div class="eng-list"></div>
   </div>
+  <div class="eng-section">
+    <div class="eng-toolbar"><span class="lbl">Job Types</span></div>
+    <div class="jobtype-list"></div>
+  </div>
   <div class="controls">
     <button class="btn-scan">Scan</button>
     <button class="btn-run" disabled>Move + Redeploy All</button>
@@ -579,9 +645,9 @@
   </div>
   <div class="hint">
     Finds every <b>New / Not Sent / Read</b> visit from the <b>previous day</b> (on Mondays:
-    <b>Fri + Sat + Sun</b>) for the <b>ticked engineers</b>, moves each to <b>today</b> at the same time of day,
-    then redeploys it. Your selection is saved and persists across days. Skips team &amp; subcontractor
-    visits. Respects the planner's current job-type filter. Scan previews first — nothing is changed until you Run.
+    <b>Fri + Sat + Sun</b>) for the <b>ticked engineers</b> and <b>ticked job types</b> (default Reactive),
+    moves each to <b>today</b> at the same time of day, then redeploys it. Your selections are saved and
+    persist across days. Skips team &amp; subcontractor visits. Scan previews first — nothing is changed until you Run.
   </div>
   <div class="log"></div>
 </div>`;
@@ -593,6 +659,8 @@
         engListEl = panelEl.querySelector('.eng-list');
         engFilterEl = panelEl.querySelector('.eng-filter');
         engCountEl = panelEl.querySelector('.eng-count');
+        jobTypeListEl = panelEl.querySelector('.jobtype-list');
+        renderJobTypes();
 
         const hdr = panelEl.querySelector('header');
         let drag = null;
