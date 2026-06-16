@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic PPM — Create Visits From Table
 // @namespace    https://go.joblogic.com/
-// @version      0.6
-// @description  Paste a PPM activity table (from Excel) and auto-create one visit per required visit on the open PPM contract, evenly distributed over the 12-month contract. Weekly (52/yr) visits start on Mondays with a 5-day duration; everything else lands on the first working day of its month with a 1-month duration. Activities are grouped by category (Water/Fire/Electrical/HVAC/…): same category shares months, different categories get different months, and annuals land mid-contract. "Out of Scope" rows are skipped. Nothing is saved automatically — review and press Joblogic's Save.
+// @version      0.7
+// @description  Paste a PPM activity table (from Excel) and auto-create one visit per required visit on the open PPM contract, evenly distributed over the 12-month contract. Weekly (52/yr) visits start on Mondays with a 5-day duration; everything else lands on the first working day of its month with a 1-month duration. Activities are grouped by category (Water/Fire/Electrical/HVAC/…): same category shares months, different categories get different months, and annuals land mid-contract. An optional Engineer column assigns each visit — names are matched against the Engineer list first, then Subcontractors, and unmatched names are flagged. "Out of Scope" rows are skipped. Nothing is saved automatically — review and press Joblogic's Save.
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
 // @run-at       document-idle
@@ -102,7 +102,7 @@
     const SCRIPT_ID = 'ppm-create-visits-from-table';
     const SCRIPT_LABEL = '📋 PPM Visits From Table';
     const SCRIPT_COLOR = '#ff7919';
-    const SCRIPT_DESC = 'Paste the PPM activity table (copied from Excel, tab-separated). One visit is created per required visit, spread evenly across the 12-month contract. 52/yr = weekly, Mondays, 5-day duration (7200 min). Everything else = first working day of its month, 1-month duration (40320 min). Rows containing "Out of Scope" are ignored. NOTHING IS SAVED automatically — review the new rows then press Joblogic\'s own Save button (or Undo Changes to discard).';
+    const SCRIPT_DESC = 'Paste the PPM activity table (copied from Excel, tab-separated). One visit is created per required visit, spread evenly across the 12-month contract. 52/yr = weekly, Mondays, 5-day duration (7200 min). Everything else = first working day of its month, 1-month duration (40320 min). Add an optional "Engineer" column to assign each activity — the name is looked up in the Engineer list first, then Subcontractors; unmatched names are flagged in the preview. Rows containing "Out of Scope" are ignored. NOTHING IS SAVED automatically — review the new rows then press Joblogic\'s own Save button (or Undo Changes to discard).';
 
     const MONTHLY_DURATION = 40320; // minutes ≈ 1 month
     const WEEKLY_DURATION = 7200;   // minutes = 5 days
@@ -159,22 +159,25 @@
     function parseTable(text) {
         const lines = text.split(/\r?\n/);
         const items = [], skipped = [];
-        let visitsCol = 3;
+        let visitsCol = 3, engCol = -1;
         for (const line of lines) {
             if (!line.trim()) continue;
             const cells = line.split('\t').map(c => c.trim());
             const desc = cells[0];
             if (/^description$/i.test(desc)) {
-                const idx = cells.findIndex(c => /no\.?\s*visits/i.test(c));
-                if (idx > 0) visitsCol = idx;
+                const vi = cells.findIndex(c => /no\.?\s*visits/i.test(c));
+                if (vi > 0) visitsCol = vi;
+                const ei = cells.findIndex(c => /engineer|assign/i.test(c));
+                if (ei > 0) engCol = ei;
                 continue;
             }
             if (/out of scope/i.test(line)) { skipped.push({ desc: desc || line.trim(), why: 'Out of Scope' }); continue; }
             const visits = parseInt((cells[visitsCol] || '').replace(/[^\d]/g, ''), 10);
             if (!desc || !visits || visits < 1) { skipped.push({ desc: desc || line.trim(), why: 'no visit count (header/section row)' }); continue; }
-            items.push({ desc, visits });
+            const engineer = engCol >= 0 ? (cells[engCol] || '').trim() : '';
+            items.push({ desc, visits, engineer });
         }
-        return { items, skipped };
+        return { items, skipped, hasEngineerCol: engCol >= 0 };
     }
 
     // ------------------------------------------------------------------
@@ -224,12 +227,13 @@
         for (const it of items) {
             const N = it.visits;
             const k = cats.indexOf(it.cat);
+            const engineer = it.engineer || '';
             for (let i = 0; i < N; i++) {
                 const label = N > 1 ? `${it.desc} - Visit ${i + 1} of ${N}` : it.desc;
                 if (N >= WEEKLY_THRESHOLD) {
                     const d = firstMondayOnOrAfter(start);
                     d.setDate(d.getDate() + i * 7);
-                    out.push({ desc: label, cat: it.cat, date: d, duration: WEEKLY_DURATION, kind: 'weekly' });
+                    out.push({ desc: label, cat: it.cat, date: d, duration: WEEKLY_DURATION, kind: 'weekly', engineer });
                 } else {
                     let off;
                     if (N === 1) {
@@ -240,12 +244,113 @@
                         off = shift + Math.floor(i * 12 / N);    // never exceeds month 11 — no wrap
                     }
                     const d = firstWorkingDay(anchorY, anchorM + off);
-                    out.push({ desc: label, cat: it.cat, date: d, duration: MONTHLY_DURATION, kind: 'monthly' });
+                    out.push({ desc: label, cat: it.cat, date: d, duration: MONTHLY_DURATION, kind: 'monthly', engineer });
                 }
             }
         }
         out.sort((a, b) => a.date - b.date);
         return out;
+    }
+
+    // ------------------------------------------------------------------
+    // Assignee resolution. The new-visit row exposes three Kendo comboboxes
+    // (Engineer / Engineer Team / Subcontractor); both the Engineer and
+    // Subcontractor remote endpoints return their FULL list regardless of
+    // filter, so we fetch each once and match names client-side. A name is
+    // looked up in Engineers first, then Subcontractors; no match → flagged.
+    // ------------------------------------------------------------------
+    const ENG_URL = '/Staff/GetEngineers';
+    const SUB_URL = '/Subcontractor/Get' + 'SubcontractorsBy';
+    const normName = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    let directories = null;        // { engineers:[{id,name}], subs:[{id,name}] }
+    const resolveCache = new Map(); // normName -> { type:'engineer'|'subcontractor'|'none', id, name }
+
+    async function fetchList(url) {
+        const r = await fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' }, credentials: 'same-origin' });
+        const j = await r.json();
+        const arr = Array.isArray(j) ? j : (j.Data || j.data || j.results || []);
+        return arr.map(o => ({ id: o.Id, name: o.Name })).filter(o => o.name);
+    }
+    async function loadDirectories(force) {
+        if (directories && !force) return directories;
+        const [engineers, subs] = await Promise.all([fetchList(ENG_URL), fetchList(SUB_URL)]);
+        directories = { engineers, subs };
+        return directories;
+    }
+    // Match a typed name against a list: exact (normalised) first, then a
+    // unique substring match either direction. Ambiguous/none → null.
+    function matchInList(name, list) {
+        const n = normName(name);
+        if (!n) return null;
+        const exact = list.filter(o => normName(o.name) === n);
+        if (exact.length === 1) return exact[0];
+        if (exact.length > 1) return null; // ambiguous duplicate names
+        const part = list.filter(o => { const on = normName(o.name); return on.includes(n) || n.includes(on); });
+        return part.length === 1 ? part[0] : null;
+    }
+    function resolveAssignee(name) {
+        const n = normName(name);
+        if (!n) return { type: 'none', reason: 'blank' };
+        if (resolveCache.has(n)) return resolveCache.get(n);
+        let res;
+        const e = matchInList(name, directories.engineers);
+        if (e) res = { type: 'engineer', id: e.id, name: e.name };
+        else {
+            const s = matchInList(name, directories.subs);
+            if (s) res = { type: 'subcontractor', id: s.id, name: s.name };
+            else res = { type: 'none', reason: 'not found' };
+        }
+        resolveCache.set(n, res);
+        return res;
+    }
+
+    // The whole visits tab is one Vue instance whose $data.Model.Visits array
+    // is exactly what Save serialises. Setting the assignee fields directly on
+    // the new visit object is far more reliable than driving the Kendo
+    // comboboxes (which lose their display text when a row re-renders) — the
+    // radio + picker update reactively from the model.
+    let _vm = null;
+    function visitsVM() {
+        if (_vm && _vm.$data && _vm.$data.Model && Array.isArray(_vm.$data.Model.Visits)) return _vm;
+        const seeds = [document.getElementById('ppmVisits'), document.getElementById('visitsTab'), ...document.querySelectorAll('#visitsTab *')];
+        for (const el of seeds) {
+            let n = el;
+            for (let i = 0; i < 8 && n; i++) {
+                if (n.__vue__ && n.__vue__.$data && n.__vue__.$data.Model && Array.isArray(n.__vue__.$data.Model.Visits)) { _vm = n.__vue__; return _vm; }
+                n = n.parentElement;
+            }
+        }
+        return null;
+    }
+    // Write a resolved assignee onto a visit model object (mirrors a manual
+    // selection: AssignType + matching Id + Name, other types cleared).
+    function applyAssigneeToModel(visit, resolved) {
+        if (!resolved || resolved.type === 'none') return;
+        if (resolved.type === 'engineer') {
+            visit.AssignType = 0;
+            visit.EngineerId = String(resolved.id);
+            visit.EngineerName = resolved.name;
+            visit.EngineerTeamId = null; visit.EngineerTeamName = null;
+            visit.SubcontractorId = null; visit.SubcontractorName = null;
+        } else {
+            visit.AssignType = 3;
+            visit.SubcontractorId = String(resolved.id);
+            visit.SubcontractorName = resolved.name;
+            visit.EngineerId = null; visit.EngineerName = null;
+            visit.EngineerTeamId = null; visit.EngineerTeamName = null;
+        }
+    }
+    // Cosmetic: show the assignee name in the row's (re-rendered) combobox so
+    // it's visible on review. Never throws — the model is the source of truth.
+    async function showAssigneeText(row, resolved) {
+        if (!resolved || resolved.type === 'none') return;
+        await sleep(150); // let Vue render the picker for the active type
+        try {
+            const sel = resolved.type === 'engineer' ? '#Visit_EngineerId' : '#Visit_SubcontractorId';
+            const el = row.querySelector(sel);
+            const combo = el && window.jQuery ? jQuery(el).data('kendoComboBox') : null;
+            if (combo) combo.text(resolved.name);
+        } catch (e) { /* display-only */ }
     }
 
     // ------------------------------------------------------------------
@@ -261,6 +366,8 @@
 
     async function createOneVisit(v, startTime) {
         const before = new Set(visitRows());
+        const vm = visitsVM();
+        const modelBefore = vm ? new Set(vm.$data.Model.Visits) : null;
         const btn = addVisitButton();
         if (!btn) throw new Error('Add Visit button not found — are you on the Visits tab?');
         btn.click();
@@ -284,6 +391,15 @@
         await sleep(120);
         // sanity: the Vue model echoes the date into the row header once bound
         if (date.value.indexOf(fmtDate(v.date)) !== 0) throw new Error('date did not stick');
+        // assignee (engineer / subcontractor): write straight onto the new
+        // visit's model object, then show the name in the row for review.
+        if (v.assignee && v.assignee.type !== 'none') {
+            if (!vm || !modelBefore) throw new Error('visits model not found — cannot set assignee');
+            const nv = vm.$data.Model.Visits.find(x => !modelBefore.has(x));
+            if (!nv) throw new Error('new visit object not found in model');
+            applyAssigneeToModel(nv, v.assignee);
+            await showAssigneeText(row, v.assignee);
+        }
     }
 
     // ------------------------------------------------------------------ UI
@@ -292,13 +408,13 @@
         p.id = SCRIPT_ID + '-panel';
         p.style.cssText = 'position:fixed;top:70px;right:8px;z-index:99999;width:430px;max-height:84vh;overflow:auto;background:#fff;border:1px solid #c9d4da;border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,.25);font-family:"Open Sans",sans-serif;font-size:12px;color:#243b46;padding:12px;';
         p.innerHTML = `
-            <div style="font-weight:700;font-size:14px;margin-bottom:8px;">📋 Create Visits From Table <span style="font-weight:400;color:#888;">v0.5</span></div>
+            <div style="font-weight:700;font-size:14px;margin-bottom:8px;">📋 Create Visits From Table <span style="font-weight:400;color:#888;">v0.7</span></div>
             <div style="display:flex;gap:8px;margin-bottom:8px;">
                 <label style="flex:1;">PPM number<br><input id="cvft-ppm" class="form-control" style="width:100%;font-size:12px;" placeholder="PM0001234"></label>
                 <label style="flex:1;">Contract start (DD/MM/YYYY)<br><input id="cvft-start" class="form-control" style="width:100%;font-size:12px;" placeholder="01/05/2026"></label>
                 <label style="width:70px;">Time<br><input id="cvft-time" class="form-control" style="width:100%;font-size:12px;" value="08:00"></label>
             </div>
-            <label style="display:block;margin-bottom:8px;">Paste table (tab-separated, straight from Excel)<br>
+            <label style="display:block;margin-bottom:8px;">Paste table (tab-separated, straight from Excel). Optional <b>Engineer</b> column (header "Engineer") assigns each visit.<br>
                 <textarea id="cvft-table" style="width:100%;height:130px;font-family:monospace;font-size:11px;white-space:pre;" spellcheck="false"></textarea>
             </label>
             <div style="display:flex;gap:8px;margin-bottom:8px;">
@@ -326,19 +442,43 @@
             if (!$('start').value) $('start').value = pageStartDate();
         }, 1500);
 
-        $('preview').addEventListener('click', () => {
+        const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+
+        $('preview').addEventListener('click', async () => {
             const start = parseUkDate($('start').value);
             if (!start) { status('⚠ Enter a valid contract start date (DD/MM/YYYY).'); return; }
-            const { items, skipped } = parseTable($('table').value);
+            const { items, skipped, hasEngineerCol } = parseTable($('table').value);
             if (!items.length) { status('⚠ No usable rows found — paste the table tab-separated (copy straight from Excel).'); return; }
             plan = scheduleVisits(items, start);
+
+            // Resolve engineer names (Engineer list first, then Subcontractors).
+            let resolveErr = null;
+            if (hasEngineerCol) {
+                status('Looking up engineers / subcontractors…');
+                try { await loadDirectories(); plan.forEach(v => { v.assignee = resolveAssignee(v.engineer); }); }
+                catch (e) { resolveErr = e.message; plan.forEach(v => { v.assignee = { type: 'none', reason: 'lookup failed' }; }); }
+            } else {
+                plan.forEach(v => { v.assignee = { type: 'none', reason: 'no column' }; });
+            }
+
             const byKind = plan.filter(v => v.kind === 'weekly').length;
             const cats = [...new Set(plan.map(v => v.cat))];
-            let html = `<div style="margin-bottom:6px;"><b>${items.length}</b> activities → <b>${plan.length}</b> visits (${byKind} weekly, ${plan.length - byKind} monthly-style) across <b>${cats.length}</b> categories: ${cats.join(', ')}.</div>`;
-            if (skipped.length) html += `<div style="color:#9a6b00;margin-bottom:6px;">Skipped ${skipped.length} row(s): ${skipped.map(s => `${s.desc} <i>(${s.why})</i>`).join('; ')}</div>`;
-            html += '<table style="width:100%;border-collapse:collapse;">' + plan.map(v =>
-                `<tr style="border-bottom:1px solid #eee;"><td style="padding:2px 4px;">${v.desc}</td><td style="padding:2px 4px;color:#777;">${v.cat}</td><td style="padding:2px 4px;white-space:nowrap;">${fmtDate(v.date)}</td><td style="padding:2px 4px;text-align:right;">${v.duration}m</td></tr>`
-            ).join('') + '</table>';
+            const unresolved = hasEngineerCol ? [...new Set(plan.filter(v => normName(v.engineer) && v.assignee.type === 'none').map(v => v.engineer))] : [];
+            const assignedCount = plan.filter(v => v.assignee.type !== 'none').length;
+
+            let html = `<div style="margin-bottom:6px;"><b>${items.length}</b> activities → <b>${plan.length}</b> visits (${byKind} weekly, ${plan.length - byKind} monthly-style) across <b>${cats.length}</b> categories: ${esc(cats.join(', '))}.</div>`;
+            if (hasEngineerCol) html += `<div style="margin-bottom:6px;">${assignedCount} visit(s) will be assigned.</div>`;
+            if (resolveErr) html += `<div style="color:#b71c1c;margin-bottom:6px;">⚠ Couldn't load engineer/subcontractor lists (${esc(resolveErr)}) — visits will be created unassigned.</div>`;
+            if (unresolved.length) html += `<div style="color:#b71c1c;margin-bottom:6px;">⚠ ${unresolved.length} name(s) not found in Engineers or Subcontractors — these will be left unassigned: ${esc(unresolved.join(', '))}.</div>`;
+            if (skipped.length) html += `<div style="color:#9a6b00;margin-bottom:6px;">Skipped ${skipped.length} row(s): ${skipped.map(s => `${esc(s.desc)} <i>(${esc(s.why)})</i>`).join('; ')}</div>`;
+            html += '<table style="width:100%;border-collapse:collapse;">' + plan.map(v => {
+                const a = v.assignee || { type: 'none' };
+                let who = '';
+                if (a.type === 'engineer') who = `<span title="Engineer">👷 ${esc(a.name)}</span>`;
+                else if (a.type === 'subcontractor') who = `<span title="Subcontractor">🏢 ${esc(a.name)}</span>`;
+                else if (normName(v.engineer)) who = `<span style="color:#b71c1c;" title="not found">⚠ ${esc(v.engineer)}</span>`;
+                return `<tr style="border-bottom:1px solid #eee;"><td style="padding:2px 4px;">${esc(v.desc)}</td><td style="padding:2px 4px;color:#777;">${esc(v.cat)}</td><td style="padding:2px 4px;white-space:nowrap;">${fmtDate(v.date)}</td><td style="padding:2px 4px;text-align:right;">${v.duration}m</td><td style="padding:2px 4px;">${who}</td></tr>`;
+            }).join('') + '</table>';
             $('out').innerHTML = html;
             $('create').style.display = '';
             $('create').textContent = `Create ${plan.length} visits`;
@@ -371,11 +511,14 @@
             }
             $('cancel').style.display = 'none';
             if (!cancelled) {
+                const assigned = plan.filter(v => v.assignee && v.assignee.type !== 'none').length;
+                const unassignedNames = [...new Set(plan.filter(v => normName(v.engineer) && (!v.assignee || v.assignee.type === 'none')).map(v => v.engineer))];
+                const tail = (assigned ? ` ${assigned} assigned.` : '') + (unassignedNames.length ? ` ⚠ Left unassigned (name not found): ${unassignedNames.join(', ')}.` : '');
                 if (failed.length) {
-                    status(`⚠ Done with ${failed.length} failure(s) — see list below. NOT saved yet.`);
-                    $('out').innerHTML = '<div style="color:#b71c1c;">' + failed.join('<br>') + '</div>' + $('out').innerHTML;
+                    status(`⚠ Done with ${failed.length} failure(s) — see list below. NOT saved yet.${tail}`);
+                    $('out').innerHTML = '<div style="color:#b71c1c;">' + failed.map(esc).join('<br>') + '</div>' + $('out').innerHTML;
                 } else {
-                    status(`✅ ${plan.length} visits created — review them, then press Joblogic's SAVE button at the top of the visits list (or Undo Changes to discard).`);
+                    status(`✅ ${plan.length} visits created.${tail} Review them, then press Joblogic's SAVE button at the top of the visits list (or Undo Changes to discard).`);
                 }
             }
         });
