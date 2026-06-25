@@ -136,7 +136,8 @@
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;';
         const title = document.createElement('strong');
         title.style.fontSize = '14px';
-        title.textContent = 'Set Completed Date from Status Audit (v1.13)';
+        const jlVer = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? ' (v' + GM_info.script.version + ')' : '';
+        title.textContent = 'Set Completed Date from Status Audit' + jlVer;
         const closeBtn = document.createElement('button');
         closeBtn.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
         closeBtn.textContent = 'X';
