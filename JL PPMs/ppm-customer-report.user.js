@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Contract Customer Report
 // @namespace    https://go.joblogic.com/
-// @version      4.11
+// @version      4.12
 // @downloadURL https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-customer-report.user.js
 // @updateURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-customer-report.user.js
 // @description  Generate a branded Untitled Projects PPM matrix report — services as rows, months as columns, colour-coded completion status. Share with the customer monthly. v4.1: collapses to a launcher button in the shared dock (drag to reorder).
@@ -392,7 +392,10 @@
             }
         }
         const upcoming = total - complete - overdue;
-        const pct = total > 0 ? Math.round((complete / total) * 100) : 0;
+        // "Done to date" — completion measured against visits that should be done
+        // by now (complete + overdue), excluding upcoming/future visits.
+        const dueToDate = complete + overdue;
+        const pct = dueToDate > 0 ? Math.round((complete / dueToDate) * 100) : 0;
 
         // ── This-month stats ──────────────────────────────────────────────────
         let mTotal = 0, mComplete = 0, mOverdue = 0;
@@ -406,7 +409,8 @@
             }
         }
         const mUpcoming = mTotal - mComplete - mOverdue;
-        const mPct      = mTotal > 0 ? Math.round((mComplete / mTotal) * 100) : 0;
+        const mDueToDate = mComplete + mOverdue;
+        const mPct      = mDueToDate > 0 ? Math.round((mComplete / mDueToDate) * 100) : 0;
         const thisMonthName = sortedMonths.includes(thisMonthKey) ? monthLabel(thisMonthKey) : '';
 
         const contractPeriod = sortedMonths.length >= 2
@@ -600,7 +604,7 @@
 
       <!-- Progress bar -->
       <div style="display:flex;align-items:center;gap:10px;margin-top:14px;">
-        <div style="font-size:10.5px;color:#4a6fa0;">Overall completion</div>
+        <div style="font-size:10.5px;color:#4a6fa0;">Completion to date</div>
         <div style="width:160px;height:5px;background:rgba(255,255,255,0.08);border-radius:99px;overflow:hidden;">
           <div style="width:${pct}%;height:100%;background:#0097A7;border-radius:99px;"></div>
         </div>
@@ -632,7 +636,7 @@
             ).join('')}
             <div style="text-align:center;width:64px;flex-shrink:0;border-left:1px solid rgba(255,255,255,0.08);padding-left:16px;margin-left:4px;">
               <div style="font-family:'Montserrat',sans-serif;font-size:28px;font-weight:800;color:#0097A7;line-height:1;">${pct}%</div>
-              <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.1em;color:#3d5a80;margin-top:4px;">Complete</div>
+              <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.1em;color:#3d5a80;margin-top:4px;">Done To Date</div>
             </div>
           </div>
         </div>
@@ -656,7 +660,7 @@
             ).join('')}
             <div style="text-align:center;width:64px;flex-shrink:0;border-left:1px solid rgba(255,255,255,0.08);padding-left:16px;margin-left:4px;">
               <div style="font-family:'Montserrat',sans-serif;font-size:28px;font-weight:800;color:#0097A7;line-height:1;">${mPct}%</div>
-              <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.1em;color:#3d5a80;margin-top:4px;">Complete</div>
+              <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.1em;color:#3d5a80;margin-top:4px;">Done To Date</div>
             </div>
           </div>
         </div>` : ''}
