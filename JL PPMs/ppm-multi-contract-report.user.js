@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.39
+// @version      3.40
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -113,7 +113,7 @@
     const VERSION   = '3.26';   // saved-state schema version — bump only when state shape changes
     // Displayed version — reads the userscript @version so the button header and
     // load log always track the installed version (bump @version, this follows).
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.39';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.40';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -239,6 +239,14 @@
     function categorise(desc) {
         for (const rule of CAT_RULES) if (rule.re.test(desc)) return rule;
         return CAT_GENERAL;
+    }
+
+    // Strip the per-visit suffix ("- Visit 3 of 12") so every visit of the same
+    // recurring service consolidates into a single row with dots across the months.
+    // Joblogic names PPM visit jobs "<Service Name> - Visit N of M".
+    function serviceName(desc) {
+        const s = String(desc || '').trim();
+        return s.replace(/\s*[-–—]\s*Visit\s+\d+\s*(?:of\s*\d+)?\s*$/i, '').trim() || s;
     }
 
     // ─── Visit status detection ───────────────────────────────────────────────
@@ -604,7 +612,7 @@
             // Prefer the meta description read from the detail page; fall back to the
             // first visit's description (contracts with visits share their service name).
             const contractDesc = (cd.meta && cd.meta.description)
-                || (cd.visits && cd.visits.length > 0 ? cd.visits[0].description : '')
+                || (cd.visits && cd.visits.length > 0 ? serviceName(cd.visits[0].description) : '')
                 || '';
 
             // Visit rows
@@ -615,13 +623,15 @@
                 const day = d.getDate();
                 monthSet.add(mk);
 
-                // Find or create a row for this (contractRef, description) pair
-                let row = rows.find(r => r.type === 'visit' && r.contractRef === contractRef && r.description === v.description);
+                // Consolidate by service name (sans "- Visit N of M") so all visits
+                // of one recurring service share a single row keyed on (contractRef, service)
+                const svc = serviceName(v.description);
+                let row = rows.find(r => r.type === 'visit' && r.contractRef === contractRef && r.description === svc);
                 if (!row) {
                     row = {
                         contractRef,
-                        description: v.description,
-                        category: categorise(v.description),
+                        description: svc,
+                        category: categorise(svc),
                         months: {},
                         type: 'visit',
                     };
@@ -1292,6 +1302,21 @@
                 const activeTabEl    = qs('ul.nav li.active a, ul.nav li a.active');
                 const activeTabTxt   = (activeTabEl?.textContent || '').trim();
                 const tabIsSuspended = /suspend/i.test(activeTabTxt);
+                // Resolve columns by HEADER LABEL, never by fixed position, so the
+                // report keeps working if Joblogic reorders or inserts columns.
+                // Standard layout: No. | Site Name | Customer Name | Account Manager |
+                // Start | End | Progress | Description | Tags | Date Created.
+                // Use the LAST header row (handles grouped/multi-row headers) and, per
+                // row, anchor the header→body mapping on the "No." cell so a leading
+                // checkbox/icon column in the body can't shift every value.
+                const headRows  = qsa('thead tr', tbl);
+                const headCells = headRows.length ? [...headRows[headRows.length - 1].children] : [];
+                const heads     = headCells.map(h => (h.textContent || '').trim().toLowerCase());
+                const headIdx   = re => heads.findIndex(h => re.test(h));
+                const noHdr     = headIdx(/^no\b|^no\.|number|^ref/);
+                const siteHdr   = headIdx(/\bsite\b/);
+                const custHdr   = headIdx(/customer|client/);
+                const descHdr   = headIdx(/\bdescription\b/);
                 let added = 0;
                 for (const row of qsa('tr', tbl).filter(r => r.querySelector('a[href*="/PPMContract/Detail/"]'))) {
                     const a = row.querySelector('a[href*="/PPMContract/Detail/"]');
@@ -1300,11 +1325,16 @@
                     const id = m[1];
                     if (seen.has(id)) continue;
                     seen.add(id);
-                    const cells    = [...row.querySelectorAll('td')];
-                    const ref      = cells[0]?.textContent.trim() || id;
-                    const planRef  = cells[1]?.textContent.trim() || '';
-                    const site     = cells[2]?.textContent.trim() || '';
-                    const customer = cells[3]?.textContent.trim() || '';
+                    const cells      = [...row.querySelectorAll('td')];
+                    // The "No." cell in the body is the one carrying the detail link;
+                    // align the header indices to the body using its position.
+                    const refBodyIdx = cells.findIndex(c => c.querySelector('a[href*="/PPMContract/Detail/"]'));
+                    const offset     = (noHdr >= 0 && refBodyIdx >= 0) ? refBodyIdx - noHdr : 0;
+                    const at         = hdr => { const i = hdr >= 0 ? hdr + offset : -1; return (i >= 0 && cells[i]) ? cells[i].textContent.trim() : ''; };
+                    const ref        = (refBodyIdx >= 0 ? cells[refBodyIdx].textContent.trim() : (cells[0]?.textContent.trim() || '')) || id;
+                    const site       = at(siteHdr >= 0 ? siteHdr : 1);   // "Site Name"
+                    const customer   = at(custHdr >= 0 ? custHdr : 2);   // "Customer Name"
+                    const planRef    = at(descHdr);                       // "Description" col (may be blank)
                     if (tabIsSuspended || /suspend/i.test(row.textContent)) {
                         suspended.push({ id, ref, status: 'Suspended' });
                         ppmLog('[PPM-Multi]  → suspended:', ref);
@@ -1456,11 +1486,14 @@
         // Read visits (safe even if the tab didn't load — returns [] gracefully)
         try {
             const meta   = readContractMeta();
-            // Fill any meta gaps from the stored contract data
             if (!meta.ref)         meta.ref         = contract.ref;
-            if (!meta.site)        meta.site        = contract.site;
-            if (!meta.customer)    meta.customer    = contract.customer;
-            // Plan Reference — captured from list page col 1; used for Service column
+            // The contracts-list "Site Name"/"Customer Name" columns are the
+            // authoritative source — the detail-page "Site" field can hold the
+            // customer org instead of the actual site — so list values win.
+            if (contract.site)     meta.site        = contract.site;
+            if (contract.customer) meta.customer    = contract.customer;
+            if (!meta.site)        meta.site        = contract.site || '';
+            if (!meta.customer)    meta.customer    = contract.customer || '';
             if (!meta.description) meta.description = contract.planRef || '';
 
             contract.meta   = meta;
