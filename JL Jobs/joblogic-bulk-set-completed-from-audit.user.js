@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Set Completed Date from Status Audit
 // @namespace    http://tampermonkey.net/
-// @version      1.13
+// @version      1.14
 // @description  Paste a list of Job IDs. For each, look up the Status Audit log, find when status changed to "Completed", and write that date into DateComplete. Jobs with no Completed entry are queued so you can revert them all to New Job in one click. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -511,17 +511,34 @@
         }
     }
 
-    // From the audit rows, find the most recent row where StatusDescription === "Completed".
+    // Statuses that mean "the job has reached (or passed) completion". A job often
+    // progresses Completed -> Costed -> Invoiced, and may skip straight to Costed/Invoiced
+    // without ever logging an explicit "Completed" row. Any of these counts as done.
+    const COMPLETION_STATUSES = ['Completed', 'Costed', 'Invoiced'];
+
+    // From the audit rows, find the date the job reached completion.
     // StatusDate format: "dd/MM/yyyy HH:mm" — same shape DateComplete expects, so no reformat needed.
+    // Returns { date, status } or null.
     function findCompletedDate(auditRows) {
         if (!Array.isArray(auditRows)) return null;
-        // Audit is returned in chronological order. Take the LAST "Completed" entry
+        // Audit is returned in chronological order. Prefer the LAST "Completed" entry
         // (handles the rare case where a job was completed, reopened, then completed again).
-        let found = null;
+        let completed = null;
         for (const row of auditRows) {
-            if ((row.StatusDescription || '').trim() === 'Completed') found = row;
+            if ((row.StatusDescription || '').trim() === 'Completed') completed = row;
         }
-        return found ? (found.StatusDate || '').trim() : null;
+        // If there's no explicit Completed row, fall back to the FIRST Costed/Invoiced
+        // entry — that's the earliest evidence the job had finished.
+        let fallback = null;
+        if (!completed) {
+            for (const row of auditRows) {
+                const s = (row.StatusDescription || '').trim();
+                if (s === 'Costed' || s === 'Invoiced') { fallback = row; break; }
+            }
+        }
+        const found = completed || fallback;
+        if (!found) return null;
+        return { date: (found.StatusDate || '').trim(), status: (found.StatusDescription || '').trim() };
     }
 
     // Extract embedded job-state JSON blob from the detail page HTML
@@ -701,16 +718,17 @@
                 log(`  Resolved -> internalId=${job.id} (status=${job.statusDescription})`, '#0af');
 
                 const audit = await getStatusAudit(job.id);
-                const completedDate = findCompletedDate(audit);
+                const completion = findCompletedDate(audit);
 
-                if (!completedDate) {
-                    log(`  No "Completed" entry in Status Audit (${audit.length} rows). Queued for revert-to-New-Job.`, '#fa0');
+                if (!completion) {
+                    log(`  No ${COMPLETION_STATUSES.join('/')} entry in Status Audit (${audit.length} rows). Queued for revert-to-New-Job.`, '#fa0');
                     stats.noCompletion++;
                     noCompletionList.push({ ref, internalId: job.id });
                     continue;
                 }
 
-                log(`  Audit Completed date: ${completedDate}`, '#0af');
+                const completedDate = completion.date;
+                log(`  Audit completed date: ${completedDate} (from "${completion.status}")`, '#0af');
 
                 const res = await editJobDetail(job.id, { dateComplete: completedDate }, dryRun);
                 if (res.dry) {
