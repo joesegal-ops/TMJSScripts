@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.37
+// @version      3.38
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -760,7 +760,10 @@
             }
         }
         const upcoming = total - complete - overdue;
-        const pct      = total > 0 ? Math.round((complete / total) * 100) : 0;
+        // "Done to date" — completion measured against visits that should be done
+        // by now (complete + overdue), excluding upcoming/future visits.
+        const dueToDate = complete + overdue;
+        const pct      = dueToDate > 0 ? Math.round((complete / dueToDate) * 100) : 0;
         const pctColor = pct === 100 ? '#15803d' : overdue > 0 ? '#b91c1c' : '#0097A7';
 
         // Stats — this month only
@@ -775,7 +778,8 @@
             }
         }
         const mUpcoming     = mTotal - mComplete - mOverdue;
-        const mPct          = mTotal > 0 ? Math.round((mComplete / mTotal) * 100) : 0;
+        const mDueToDate    = mComplete + mOverdue;
+        const mPct          = mDueToDate > 0 ? Math.round((mComplete / mDueToDate) * 100) : 0;
         const thisMonthName = sortedMonths.includes(thisMonthKey) ? monthFull(thisMonthKey) : '';
 
         // Site column — only shown when contracts span more than one site
@@ -974,7 +978,7 @@
           Untitled Projects Management &nbsp;·&nbsp; ${contractDataList.length} Contract${contractDataList.length!==1?'s':''} &nbsp;·&nbsp; ${genDate}
         </div>
         <div style="display:flex;align-items:center;gap:10px;margin-top:14px;">
-          <span style="font-size:10px;color:#4a6fa0;">Overall completion</span>
+          <span style="font-size:10px;color:#4a6fa0;">Completion to date</span>
           <div style="width:160px;height:5px;background:rgba(255,255,255,0.08);border-radius:99px;overflow:hidden;">
             <div style="width:${pct}%;height:100%;background:${pctColor};border-radius:99px;"></div>
           </div>
@@ -1003,7 +1007,7 @@
               <div style="text-align:center;min-width:60px;flex-shrink:0;
                   border-left:1px solid rgba(255,255,255,0.08);padding-left:12px;">
                 <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:${pctColor};line-height:1;">${pct}%</div>
-                <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">Done</div>
+                <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">Done To Date</div>
               </div>
             </div>
           </div>
@@ -1020,7 +1024,7 @@
               <div style="text-align:center;min-width:60px;flex-shrink:0;
                   border-left:1px solid rgba(255,255,255,0.08);padding-left:12px;">
                 <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:#0097A7;line-height:1;">${mPct}%</div>
-                <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">Done</div>
+                <div style="font-size:8px;text-transform:uppercase;letter-spacing:0.08em;color:#3d5a80;margin-top:3px;">Done To Date</div>
               </div>
             </div>
           </div>` : ''}
