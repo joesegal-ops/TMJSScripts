@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.38
+// @version      3.39
 // @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
@@ -110,7 +110,10 @@
     if (window.__ppmMultiReportLoaded) return;
     window.__ppmMultiReportLoaded = true;
 
-    const VERSION   = '3.26';
+    const VERSION   = '3.26';   // saved-state schema version — bump only when state shape changes
+    // Displayed version — reads the userscript @version so the button header and
+    // load log always track the installed version (bump @version, this follows).
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.39';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -1663,7 +1666,7 @@
 
         const btn = document.createElement('button');
         btn.id    = 'ppm-multi-btn';
-        btn.textContent = `📋 Multi-Contract Report  v${VERSION}`;
+        btn.textContent = `📋 Multi-Contract Report  v${SCRIPT_VERSION}`;
         btn.style.cssText = 'background:#0f2347;color:#fff;border:1px solid #1a3a6b;' +
             'border-radius:6px;padding:10px 18px;font-size:13px;font-weight:600;' +
             'cursor:pointer;white-space:nowrap;box-shadow:0 3px 14px rgba(0,0,0,.3);' +
@@ -1714,7 +1717,7 @@
                 statusBox.textContent        = `✓ Cached data ready — ${n} contract${n!==1?'s':''} · click to re-generate`;
                 btn.style.background         = '#065f46';
                 btn.style.borderColor        = '#059669';
-                btn.textContent              = `⟳ Re-generate Report  v${VERSION}`;
+                btn.textContent              = `⟳ Re-generate Report  v${SCRIPT_VERSION}`;
             } else if (existingBootSt.phase === 'visiting') {
                 const done  = existingBootSt.contracts ? existingBootSt.contracts.filter(c => c.visited).length : 0;
                 const total = existingBootSt.contracts ? existingBootSt.contracts.length : 0;
@@ -1804,7 +1807,7 @@
             btn.disabled               = false;
             btn.style.background       = '#0f2347';
             btn.style.borderColor      = '#1a3a6b';
-            btn.textContent            = `📋 Multi-Contract Report  v${VERSION}`;
+            btn.textContent            = `📋 Multi-Contract Report  v${SCRIPT_VERSION}`;
         });
     }
 
@@ -1893,5 +1896,5 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
     else boot();
 
-    ppmLog(`[PPM-Multi-Report] v${VERSION} loaded`);
+    ppmLog(`[PPM-Multi-Report] v${SCRIPT_VERSION} loaded`);
 })();
