@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Set Completed Date from Status Audit
 // @namespace    http://tampermonkey.net/
-// @version      1.10
+// @version      1.11
 // @description  Paste a list of Job IDs. For each, look up the Status Audit log, find when status changed to "Completed", and write that date into DateComplete. Jobs with no Completed entry are queued so you can revert them all to New Job in one click. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -103,8 +103,8 @@
     // ===== end shared dock =====
 
     const SCRIPT_ID = 'completed-from-audit';
-    const SCRIPT_LABEL = '📅 Completed from Audit';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_LABEL = '📅 Bulk Update Completed Date from Audit';
+    const SCRIPT_COLOR = '#7c2d12';
     const SCRIPT_DESC = 'Paste Job IDs. For each it reads the Status Audit log, finds when the status became Completed, and writes that as the Completed date. Jobs with no Completed entry are queued so you can revert them to New Job in one click.';
 
     // --- CONFIG ---
