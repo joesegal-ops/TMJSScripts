@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer.
+// @version      2.5
+// @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer. v2.2: Copy results now also emits Job ID, Cost description and Chargeable (No for project/quoted jobs) columns so the companion "Enter checked costs into jobs" writer can consume the filtered export.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.1');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.5');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -235,7 +235,9 @@
                     lines.push({
                         source: 'job',
                         category: g.Heading || l.LineType || '',
+                        lineType: l.LineType || g.Heading || '',
                         id: l.Id,
+                        invoiced: !!l.HasBeenInvoiced,
                         desc: l.Description || '',
                         date: l.DateIncurred || '',
                         engineer: l.EngineerName || '',
@@ -568,7 +570,7 @@
     async function processRow(row, idx) {
         const m = mapRow(row);
         const label = m.receipt ? `#${m.receipt}` : `row ${idx + 1}`;
-        const base = { idx, receipt: m.receipt, merchant: m.merchant, owner: m.owner, date: m.date, net: m.net, gross: m.gross, xeroDesc: m.xeroDesc };
+        const base = { idx, receipt: m.receipt, merchant: m.merchant, note: m.note, owner: m.owner, date: m.date, net: m.net, gross: m.gross, xeroDesc: m.xeroDesc };
 
         if (m.net == null) {
             return { ...base, status: 'NO VALUE', detail: 'No Net/Amount could be read from this row.' };
@@ -673,8 +675,14 @@
             let action;
             if (isProject || quoteLabel) action = `Project/quoted job${quoteLabel ? ' (quote ' + quoteLabel + ')' : ''} — likely covered/forecasted in the quote. If it must be added, use a NON-CHARGEABLE materials line.`;
             else action = `Not on the job — add it as a materials line (£${m.net.toFixed(2)} net).`;
-            const noMatchStatus = (jobValued.length || quoteValued.length || poLines.length) ? 'NOT IN JOB' : 'NO COSTS';
-            return { ...base, ...cols, status: noMatchStatus, costNear: 'No', costLine: top.length ? fmtLineObj(top[0].line) + ' (not a match)' : '',
+            // Labour / Travel / Mileage are not material/expense costs — a job whose
+            // only lines are those has no costs to reconcile against, so treat it as
+            // NO COSTS (a fresh material line to add), not NOT IN JOB.
+            const noMatchStatus = (jobMats.length || quoteValued.length || poLines.length) ? 'NOT IN JOB' : 'NO COSTS';
+            // Project / quoted jobs should be costed NON-chargeably (the customer is billed
+            // off the quote, not the line). Everything else is a normal chargeable cost.
+            const chargeable = (isProject || quoteLabel) ? 'No' : 'Yes';
+            return { ...base, ...cols, status: noMatchStatus, chargeable, costNear: 'No', costLine: top.length ? fmtLineObj(top[0].line) + ' (not a match)' : '',
                 other: landscape + (cancelled ? `  \u26a0 ${job.jobStatus}` : ''),
                 detail: `Job ${job.jobNumber} found (${job.via}). ${landscape}. No cost line near £${m.net.toFixed(2)} net.${candText}${statusNote}` + (parseOk ? '' : ' [could not read cost model]'),
                 suggest: action };
@@ -716,7 +724,13 @@
                 (jobInvoiced ? ' \u26a0 This job already has invoiced amounts — if this line is invoiced do NOT change the total; flag it and raise a credit/adjustment instead.'
                              : ' If the line has already been invoiced, do NOT change the total — flag it and raise a credit/adjustment instead.');
         }
+        // A single job (non-quote, non-combo) INCORRECT line can be auto-fixed by the
+        // writer: surface its id + invoiced flag so the writer can target it and skip if invoiced.
+        const editable = !inQuote && !best.combo && best.line && best.line.id != null;
+        const lineId = editable ? best.line.id : '';
+        const lineInvoiced = editable ? (best.line.invoiced ? 'Yes' : 'No') : '';
         return { ...base, ...cols, status: 'INCORRECT', factor: best.factor, costNear: 'Yes', costLine: matchedLineText, other: otherText,
+            lineId, lineInvoiced,
             detail: best.why + secondaryNote + statusNote + (soft.length ? '  [' + soft.join('; ') + ']' : ''),
             suggest: fix };
     }
@@ -933,17 +947,21 @@
     function copyResults() {
         const hl = (url, label) => url ? `=HYPERLINK("${url}","${String(label || '').replace(/"/g, '""')}")` : (label || '');
         const cell = v => String(v == null ? '' : v).replace(/[\t\n]/g, ' ');
-        const headers = ['Receipt', 'Merchant', 'Owner', 'Date', 'Net', 'Gross', 'Status',
-            'Job Found', 'Undelivered SPO', 'Related Quote', 'Cost near value', 'Matched / closest line', 'Other info', 'Suggested fix'];
+        const headers = ['Receipt', 'Merchant', 'Note', 'Owner', 'Date', 'Net', 'Gross', 'Status',
+            'Job Found', 'Job ID', 'Undelivered SPO', 'Related Quote', 'Cost near value', 'Matched / closest line', 'Other info', 'Suggested fix',
+            'Cost description', 'Chargeable', 'Line ID', 'Line invoiced'];
         const lines = [headers.join('\t')];
         results.forEach(r => lines.push([
-            cell(r.receipt), cell(r.merchant), cell(r.owner), cell(r.date),
+            cell(r.receipt), cell(r.merchant), cell(r.note), cell(r.owner), cell(r.date),
             r.net != null ? r.net.toFixed(2) : '', r.gross != null ? r.gross.toFixed(2) : '',
             cell(r.status),
             r.jobFound ? hl(r.jobLink, r.jobFound) : 'No',
+            cell(r.jobId),
             (r.spoText && r.spoText !== 'No') ? hl(r.spoUrl, r.spoText) : 'No',
             (r.quoteText && r.quoteText !== 'No') ? hl(r.quoteUrl, r.quoteText) : 'No',
-            cell(r.costNear), cell(r.costLine), cell(r.other), cell(r.suggest)
+            cell(r.costNear), cell(r.costLine), cell(r.other), cell(r.suggest),
+            cell(r.xeroDesc || r.merchant), cell(r.chargeable || ''),
+            cell(r.lineId || ''), cell(r.lineInvoiced || '')
         ].join('\t')));
         navigator.clipboard.writeText(lines.join('\n')).then(
             () => setProgress('Results copied — paste into your sheet.'),
