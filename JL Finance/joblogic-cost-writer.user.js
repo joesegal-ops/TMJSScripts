@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Enter checked costs into jobs (Cost Reconciler writer)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Companion to the Cost Reconciler. Paste the reconciler's exported rows (after you've filtered out the ones you don't want to touch, header row included). Two actions per row, decided by the Status column: (1) NO COSTS / NOT IN JOB -> ADD a new Material line (cost = Net, qty 1, 20% VAT, the job's default uplift, Xero/Cost description + date; quoted/project jobs flagged Chargeable=No are added NON-chargeable, sell 0). (2) INCORRECT with a Line ID -> FIX the existing line's unit cost to Net (sell follows the line's own uplift) UNLESS it has been invoiced, in which case it is skipped. Every fix is re-read to confirm it applied. Dry-run first, then Confirm & write. No engineer is set (assign in JobLogic).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -35,7 +35,7 @@
 
     const SCRIPT_ID = 'cost-writer';
     const SCRIPT_LABEL = '📥 Enter checked costs into jobs';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.1');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.2');
     const SCRIPT_COLOR = '#8e44ad';
     const SCRIPT_DESC = 'Paste the Cost Reconciler export (with header row) AFTER filtering out rows you do not want. NO COSTS / NOT IN JOB rows are ADDED as Material lines (non-chargeable for quoted/project jobs); INCORRECT rows have the existing line\'s cost FIXED to Net (skipped if invoiced). Dry-run, review, then Confirm & write.';
 
@@ -305,7 +305,9 @@
     // Status -> action. ADD = a genuinely missing cost; FIX = wrong value on an
     // existing line. Anything else is skipped (it is either already on the job,
     // on a PO, or needs a human).
-    const ADD_OK = new Set(['NO COSTS', 'NOT IN JOB', '']);
+    // POSSIBLE MATCH is included: the reconciler only flags it as "a similar line may
+    // exist" — if the user kept the row after filtering, they want the cost added.
+    const ADD_OK = new Set(['NO COSTS', 'NOT IN JOB', 'POSSIBLE MATCH', '']);
 
     async function dryRun() {
         if (running) return;
