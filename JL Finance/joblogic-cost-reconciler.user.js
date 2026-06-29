@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer. v2.2: Copy results now also emits Job ID, Cost description and Chargeable (No for project/quoted jobs) columns so the companion "Enter checked costs into jobs" writer can consume the filtered export.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.5');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.6');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -622,7 +622,11 @@
             spoText: poNos.length ? poNos.join(', ') : 'No',
             spoUrl: (poLines[0] && poLines[0].poId) ? `${location.origin}/PurchaseOrder/Detail/${poLines[0].poId}` : '',
             quoteText: quoteLabel || 'No', quoteUrl,
-            jobStatusText: job.jobStatus || ''
+            jobStatusText: job.jobStatus || '',
+            // Project / quoted jobs are billed off the quote, so any cost added to them
+            // should be NON-chargeable. Carry the flag on every job row so the writer
+            // honours it whichever status the user chooses to enter.
+            chargeable: (isProject || quoteLabel) ? 'No' : 'Yes'
         };
         const valOf = l => (l.unit && l.unit > 0) ? l.unit : l.subtotal;
         const fmtLineObj = l => `"${(l.desc || l.category || 'line').slice(0, 48)}" ${valOf(l) != null ? '£' + valOf(l).toFixed(2) : ''}${(l.source || '').indexOf('quote') === 0 ? ' [' + l.source + ']' : ''}`;
@@ -679,10 +683,7 @@
             // only lines are those has no costs to reconcile against, so treat it as
             // NO COSTS (a fresh material line to add), not NOT IN JOB.
             const noMatchStatus = (jobMats.length || quoteValued.length || poLines.length) ? 'NOT IN JOB' : 'NO COSTS';
-            // Project / quoted jobs should be costed NON-chargeably (the customer is billed
-            // off the quote, not the line). Everything else is a normal chargeable cost.
-            const chargeable = (isProject || quoteLabel) ? 'No' : 'Yes';
-            return { ...base, ...cols, status: noMatchStatus, chargeable, costNear: 'No', costLine: top.length ? fmtLineObj(top[0].line) + ' (not a match)' : '',
+            return { ...base, ...cols, status: noMatchStatus, costNear: 'No', costLine: top.length ? fmtLineObj(top[0].line) + ' (not a match)' : '',
                 other: landscape + (cancelled ? `  \u26a0 ${job.jobStatus}` : ''),
                 detail: `Job ${job.jobNumber} found (${job.via}). ${landscape}. No cost line near £${m.net.toFixed(2)} net.${candText}${statusNote}` + (parseOk ? '' : ' [could not read cost model]'),
                 suggest: action };
