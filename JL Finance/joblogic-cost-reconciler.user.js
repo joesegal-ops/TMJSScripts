@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.9
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer. v2.2: Copy results now also emits Job ID, Cost description and Chargeable (No for project/quoted jobs) columns so the companion "Enter checked costs into jobs" writer can consume the filtered export.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.6');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.9');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -339,9 +339,12 @@
         if (eqMoney(u, net)) {
             return { verdict: 'OK', why: `Unit cost £${u.toFixed(2)} = receipt net £${net.toFixed(2)}`, score: 0 };
         }
-        // Sometimes the line has qty>1 and the receipt net is the line subtotal (ex-VAT) — also correct.
-        if (eqMoney(sub, net) && (q == null || q <= 1)) {
-            return { verdict: 'OK', why: `Line subtotal £${sub.toFixed(2)} = receipt net £${net.toFixed(2)}`, score: 0 };
+        // The receipt net can equal the line SUBTOTAL (total ex-VAT) even when qty>1
+        // (e.g. 7 × £38.55 = £269.85). The full net is on the job, so that's correct —
+        // do NOT require qty<=1 here, or correct multi-qty lines get missed and a wrong
+        // duplicate line elsewhere gets matched as INCORRECT instead.
+        if (eqMoney(sub, net)) {
+            return { verdict: 'OK', why: `Line subtotal £${sub.toFixed(2)}${q != null && q > 1 ? ` (qty ${q} × unit £${u != null ? u.toFixed(2) : '?'})` : ''} = receipt net £${net.toFixed(2)}`, score: 0 };
         }
 
         // ---- WRONG forms (what's there vs what should be there = net) ----
@@ -631,14 +634,15 @@
         const valOf = l => (l.unit && l.unit > 0) ? l.unit : l.subtotal;
         const fmtLineObj = l => `"${(l.desc || l.category || 'line').slice(0, 48)}" ${valOf(l) != null ? '£' + valOf(l).toFixed(2) : ''}${(l.source || '').indexOf('quote') === 0 ? ' [' + l.source + ']' : ''}`;
 
-        // ---- match: job lines -> job combo -> quote lines -> quote combo ----
+        // ---- match against the JOB's own cost lines only (job line -> job combo) ----
         let best = matchAgainstLines(m.net, m.gross, m.vat, jobLines, m.owner, m.date);
         if (!best) best = matchCombination(m.net, m.gross, m.vat, jobLines, 'job');
         let secondaryNote = '';
-        if (!best && rwLines.length) {
-            best = matchAgainstLines(m.net, m.gross, m.vat, rwLines, m.owner, m.date) || matchCombination(m.net, m.gross, m.vat, rwLines, 'quote');
-            if (best) secondaryNote = ' (found in ' + best.line.source + ')';
-        }
+        // We deliberately do NOT match against the related QUOTE. A quote line is a
+        // forecast, not an actual job cost — even when it matches (or was mis-entered as
+        // gross instead of net), the real cost still needs to go ON the job. Quoted/project
+        // jobs get it added as a NON-chargeable line via the "not in job" path below; the
+        // quote remains informational (shown in the Related Quote column).
 
         // ---- ON UNDELIVERED PO (ordered but not yet delivered) ----
         if (!best && poLines.length) {
@@ -665,7 +669,9 @@
             else landscape += '; no related quote';
             if (poLines.length) landscape += `; ${poLines.length} undelivered PO line${poLines.length === 1 ? '' : 's'}`;
 
-            const cands = candidateLines(m.net, m.gross, jobLines.concat(rwLines).concat(poLines), m.merchant);
+            // Candidates are the job's own lines (+ undelivered PO) only — NOT quote lines,
+            // which are forecasts and must not block adding the real cost to the job.
+            const cands = candidateLines(m.net, m.gross, jobLines.concat(poLines), m.merchant);
             const top = cands.slice(0, 2);
             const plausible = top.find(c => c.dist <= 0.30 || c.descMatch);
             const candText = top.length ? '  Closest: ' + top.map(c => fmtLineObj(c.line)).join(' ; ') : '';
@@ -721,13 +727,15 @@
         } else if (inQuote) {
             fix = `Found in ${best.line.source}. Do NOT change quote lines — quoted values are fixed forecasts (spend under and the margin is kept). Flag for manual review: confirm this £${m.net.toFixed(2)} receipt against the quoted material line(s).`;
         } else {
-            fix = `Change job "${(best.line.desc || '').slice(0, 40)}" unit cost to £${m.net.toFixed(2)} (net).` +
+            fix = `Set job "${(best.line.desc || '').slice(0, 40)}" so the line TOTAL = £${m.net.toFixed(2)} (net).` +
                 (jobInvoiced ? ' \u26a0 This job already has invoiced amounts — if this line is invoiced do NOT change the total; flag it and raise a credit/adjustment instead.'
                              : ' If the line has already been invoiced, do NOT change the total — flag it and raise a credit/adjustment instead.');
         }
-        // A single job (non-quote, non-combo) INCORRECT line can be auto-fixed by the
-        // writer: surface its id + invoiced flag so the writer can target it and skip if invoiced.
-        const editable = !inQuote && !best.combo && best.line && best.line.id != null;
+        // A single job (non-quote, non-combo) Material/Expense INCORRECT line can be
+        // auto-fixed by the writer: surface its id + invoiced flag. Labour/Travel/Mileage
+        // and other types are not auto-fixable, so don't export a Line ID for them.
+        const editable = !inQuote && !best.combo && best.line && best.line.id != null
+            && /material|expense/i.test(best.line.lineType || best.line.category || '');
         const lineId = editable ? best.line.id : '';
         const lineInvoiced = editable ? (best.line.invoiced ? 'Yes' : 'No') : '';
         return { ...base, ...cols, status: 'INCORRECT', factor: best.factor, costNear: 'Yes', costLine: matchedLineText, other: otherText,

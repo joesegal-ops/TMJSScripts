@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Enter checked costs into jobs (Cost Reconciler writer)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Companion to the Cost Reconciler. Paste the reconciler's exported rows (after you've filtered out the ones you don't want to touch, header row included). Two actions per row, decided by the Status column: (1) NO COSTS / NOT IN JOB -> ADD a new Material line (cost = Net, qty 1, 20% VAT, the job's default uplift, Xero/Cost description + date; quoted/project jobs flagged Chargeable=No are added NON-chargeable, sell 0). (2) INCORRECT with a Line ID -> FIX the existing line's unit cost to Net (sell follows the line's own uplift) UNLESS it has been invoiced, in which case it is skipped. Every fix is re-read to confirm it applied. Dry-run first, then Confirm & write. No engineer is set (assign in JobLogic).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -35,7 +35,7 @@
 
     const SCRIPT_ID = 'cost-writer';
     const SCRIPT_LABEL = '📥 Enter checked costs into jobs';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.2');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3');
     const SCRIPT_COLOR = '#8e44ad';
     const SCRIPT_DESC = 'Paste the Cost Reconciler export (with header row) AFTER filtering out rows you do not want. NO COSTS / NOT IN JOB rows are ADDED as Material lines (non-chargeable for quoted/project jobs); INCORRECT rows have the existing line\'s cost FIXED to Net (skipped if invoiced). Dry-run, review, then Confirm & write.';
 
@@ -238,40 +238,47 @@
     }
 
     // ===================================================================
-    // API: EDIT EXISTING MATERIAL LINE  (verified: POST /api/JobLine/SaveMaterialCost)
+    // API: EDIT AN EXISTING COST LINE  (verified for Material AND Expense)
+    //   Material -> GET GetEditMaterialCostMetadata, POST /api/JobLine/SaveMaterialCost
+    //   Expense  -> GET GetEditExpenseCostMetadata,  POST /api/JobLine/SaveExpenseCost
     // The save body is the FLAT line object (JobId inside, money as strings,
-    // Status:'Required', TagIds:[]) — captured from the live editor. We build it
-    // from the line's OWN edit-metadata so description/date/tax/qty/chargeable are
-    // preserved; only the unit cost changes (sell follows the line's own uplift).
-    // HasBeenInvoiced is the authoritative gate — invoiced lines are never touched.
+    // Status:'Required') — captured/verified from the live editor. We build it from the
+    // line's OWN edit-metadata so description/date/tax/chargeable/engineer are preserved.
+    // To fix the cost we target the LINE TOTAL: set Quantity=1 and unit=Net, so the total
+    // equals the receipt net exactly regardless of the original quantity (per user: the
+    // total must be right; the quantity split does not matter). Sell follows the line's
+    // own uplift. HasBeenInvoiced is the authoritative gate — invoiced lines are skipped.
     // ===================================================================
+    // Returns { meta, type } where type is 'Material' | 'Expense', or null if not found.
     async function fetchEditMeta(jobId, lineId) {
-        const r = await fetch(`/api/JobCost/GetEditMaterialCostMetadata?jobId=${jobId}&id=${lineId}`, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
-        if (!r.ok) return null;
-        const j = await r.json();
-        if (!j || j.success === false || !j.AdditionalData) return null;
-        const ad = j.AdditionalData;
-        if (String(ad.Id) !== String(lineId)) return null;   // line moved/removed
-        return ad;
+        for (const type of ['Material', 'Expense']) {
+            try {
+                const r = await fetch(`/api/JobCost/GetEdit${type}CostMetadata?jobId=${jobId}&id=${lineId}`, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+                if (!r.ok) continue;
+                const j = await r.json();
+                if (j && j.success !== false && j.AdditionalData && String(j.AdditionalData.Id) === String(lineId)) {
+                    return { meta: j.AdditionalData, type };
+                }
+            } catch (e) { /* try next type */ }
+        }
+        return null;
     }
-    function buildEditBody(meta, net) {
+    function buildEditBody(meta, type, net) {
         const chargeable = !!meta.IsChargeable;
         const uplift = Number(meta.Uplift) || 0;
-        const cost = Number(net);
-        // Keep the line's pricing behaviour: fixed-sell lines keep their sell; otherwise
-        // sell tracks the existing uplift (non-chargeable lines stay at 0).
+        const unit = Number(net);                       // qty forced to 1 -> total = net exactly
         const sell = meta.HasFixedSell ? (Number(meta.SellPerUnit) || 0)
-                   : (chargeable ? cost * (1 + uplift / 100) : 0);
+                   : (chargeable ? unit * (1 + uplift / 100) : 0);
         const s = (n) => (Number(n) || 0).toFixed(2);
-        return {
-            Id: meta.Id, PartNumber: meta.PartNumber ?? null, Quantity: meta.Quantity, ReturnQuantity: meta.ReturnQuantity ?? 0,
+        const body = {
+            Id: meta.Id, PartNumber: meta.PartNumber ?? null, Quantity: 1, ReturnQuantity: meta.ReturnQuantity ?? 0,
             IsReturnItemToStock: !!meta.IsReturnItemToStock,
-            CostPerUnit: String(cost), CostPerHour: '0.00', Uplift: s(uplift), SellPerUnit: s(sell), SellPerHour: '0.00',
-            CreateLibraryAllowed: !!meta.CreateLibraryAllowed, CategoryId: meta.CategoryId ?? null, CategoryDescription: meta.CategoryDescription || '',
+            CostPerUnit: s(unit), CostPerHour: '0.00', Uplift: s(uplift), SellPerUnit: s(sell), SellPerHour: '0.00',
+            CategoryId: meta.CategoryId ?? null, CategoryDescription: meta.CategoryDescription || '',
             ForEquipmentUse: !!meta.ForEquipmentUse, Make: meta.Make ?? null, Model: meta.Model ?? null,
             HasFixedSell: !!meta.HasFixedSell, SetupSell: meta.SetupSell ?? 0,
             TaxCodeId: meta.TaxCodeId, TaxCodeValue: meta.TaxCodeValue, TaxCodeDescription: meta.TaxCodeDescription,
-            IsChargeable: chargeable, PriceCalculationType: meta.PriceCalculationType ?? 1,
+            IsChargeable: chargeable, PriceCalculationType: meta.PriceCalculationType ?? (type === 'Expense' ? 0 : 1),
             Description: meta.Description, CreatePayBandAllowed: !!meta.CreatePayBandAllowed,
             DateIncurred: meta.DateIncurred, HasQuote: !!meta.HasQuote, ItemId: meta.ItemId || 0, JobLineOption: meta.LineType,
             QuotedValueTaxCodeId: meta.QuotedValueTaxCodeId, QuotedValueTaxCodeDescription: meta.QuotedValueTaxCodeDescription,
@@ -282,20 +289,39 @@
             Status: 'Required', LimitedSORAccess: !!meta.LimitedSORAccess, PartSerial: meta.PartSerial ?? null,
             SellingRateId: meta.SellingRateId ?? null, JobId: meta.JobId
         };
+        if (type === 'Material') {
+            body.CreateLibraryAllowed = !!meta.CreateLibraryAllowed;
+            body.LibraryId = meta.LibraryId ?? null;
+            body.LibraryName = meta.LibraryName ?? null;
+        } else { // Expense: preserve the expense link, engineer and trade
+            body.ExpenseId = meta.ExpenseId ?? null;
+            body.ExpenseDescription = meta.ExpenseDescription ?? '';
+            body.EngineerId = meta.EngineerId ?? null;
+            body.EngineerName = meta.EngineerName || '';
+            body.EngineerTeamId = meta.EngineerTeamId ?? null;
+            body.EngineerTeamName = meta.EngineerTeamName || '';
+            body.TradeId = meta.TradeId ?? null;
+            body.TradeDescription = meta.TradeDescription ?? null;
+            body.PayBandId = meta.PayBandId ?? null;
+            body.PayBandDescription = meta.PayBandDescription ?? null;
+        }
+        return body;
     }
-    async function saveMaterialEdit(it) {
-        const r = await fetch('/api/JobLine/SaveMaterialCost', {
+    async function saveEdit(it) {
+        const endpoint = it.lineType === 'Expense' ? '/api/JobLine/SaveExpenseCost' : '/api/JobLine/SaveMaterialCost';
+        const r = await fetch(endpoint, {
             method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', '__RequestVerificationToken': csrf() },
-            body: JSON.stringify(buildEditBody(it.meta, it.net))
+            body: JSON.stringify(buildEditBody(it.meta, it.lineType, it.net))
         });
         const txt = await r.text(); let j = null; try { j = JSON.parse(txt); } catch (e) {}
         if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + txt.slice(0, 120));
-        if (j && j.success === false) throw new Error((j.errors && j.errors.join('; ')) || j.Message || 'SaveMaterialCost returned success=false');
-        // self-verify: re-read the line and confirm the new cost actually applied
-        const after = await fetchEditMeta(it.jobId, it.lineId);
-        if (!after) throw new Error('saved but could not re-read line to verify');
-        if (Math.abs(Number(after.CostPerUnit) - Number(it.net)) > 0.005) throw new Error(`saved but value not applied (line still £${after.CostPerUnit})`);
+        if (j && j.success === false) throw new Error((j.errors && j.errors.join('; ')) || j.Message || 'Save returned success=false');
+        // self-verify: re-read the line and confirm the new TOTAL (qty 1 × unit) = net
+        const re = await fetchEditMeta(it.jobId, it.lineId);
+        if (!re) throw new Error('saved but could not re-read line to verify');
+        const total = Number(re.meta.CostPerUnit) * (Number(re.meta.Quantity) || 1);
+        if (Math.abs(total - Number(it.net)) > 0.02) throw new Error(`saved but total not applied (line total now £${total.toFixed(2)})`);
         return true;
     }
 
@@ -347,13 +373,15 @@
             if (!it.jobId) { skip++; renderItem(it, { kind: 'skip', text: 'job not found (' + it.jobNumber + ')' }); continue; }
 
             if (it.action === 'edit') {
-                let meta = null;
-                try { meta = await fetchEditMeta(it.jobId, it.lineId); } catch (e) { /* handled below */ }
-                if (!meta) { skip++; renderItem(it, { kind: 'skip', text: `line ${it.lineId} not found (changed/removed)` }); continue; }
+                let res = null;
+                try { res = await fetchEditMeta(it.jobId, it.lineId); } catch (e) { /* handled below */ }
+                if (!res) { skip++; renderItem(it, { kind: 'skip', text: `line ${it.lineId} not found as a Material/Expense line (changed/removed)` }); continue; }
+                const meta = res.meta;
                 if (meta.HasBeenInvoiced) { skip++; renderItem(it, { kind: 'skip', text: 'line HAS been invoiced — ignored (raise a credit instead)' }); continue; }
                 const uplift = Number(meta.Uplift) || 0;
                 it.meta = meta;
-                it.currentCost = Number(meta.CostPerUnit);
+                it.lineType = res.type;
+                it.currentCost = Number(meta.CostPerUnit) * (Number(meta.Quantity) || 1);   // current line TOTAL
                 it.chargeable = !!meta.IsChargeable;
                 it.uplift = uplift;
                 it.sell = meta.HasFixedSell ? (Number(meta.SellPerUnit) || 0).toFixed(2) : (it.chargeable ? (it.net * (1 + uplift / 100)).toFixed(2) : '0.00');
@@ -378,7 +406,7 @@
         log('');
         log(`DRY RUN: ${ready} ready (${addN} add, ${editN} fix), ${skip} skipped.`, '#0af');
         log('ADD: new Material line — cost = Net, qty 1, 20% VAT, job uplift (0 if non-chargeable), date = sheet date or today. No engineer.', '#9cf');
-        log('FIX: existing line\'s unit cost set to Net (sell follows the line\'s uplift); invoiced lines skipped; each fix re-read to confirm.', '#9cf');
+        log('FIX: existing Material/Expense line set so its TOTAL = Net (qty 1 × Net; sell follows the line\'s uplift); invoiced lines skipped; each fix re-read to confirm the total.', '#9cf');
         setProgress(`Dry run: ${ready} ready, ${skip} skipped. Review, then Confirm & write.`);
         running = false;
         parseBtn.style.display = 'inline-block'; stopBtn.style.display = 'none';
@@ -403,8 +431,8 @@
             setProgress(`Writing ${i + 1}/${items.length}: ${it.jobNumber}`);
             try {
                 if (it.action === 'edit') {
-                    await saveMaterialEdit(it);
-                    log(`  ✓ ${it.jobNumber}: FIXED £${it.currentCost.toFixed(2)} → £${it.net.toFixed(2)} "${(it.description || '').slice(0, 30)}"`, '#0fa');
+                    await saveEdit(it);
+                    log(`  ✓ ${it.jobNumber}: FIXED ${it.lineType} total £${it.currentCost.toFixed(2)} → £${it.net.toFixed(2)} "${(it.description || '').slice(0, 28)}"`, '#0fa');
                 } else {
                     await addMaterialLine(it);
                     log(`  ✓ ${it.jobNumber}: ADDED £${it.net.toFixed(2)} ${it.chargeable ? 'chargeable' : 'NON-chargeable'} "${it.description.slice(0, 30)}"`, '#0fa');
