@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Paste a list of Jobs + PO numbers. For each: creates an invoice against the job, sets the Customer Order Number to "PROJ | PO-XXXX - SITEID" (SITEID auto-derived from the job's site), approves it, then opens the Share→Email composer prefilled with the standard recipients. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -349,21 +349,29 @@
     // The composer loads its DEFAULT recipient asynchronously after the modal opens,
     // and that late load clobbers whatever we set — so we (a) wait for the default to
     // arrive first, then (b) apply our list and re-apply if it gets reset again.
-    async function setRecipients(ui, emails) {
-        const box = ui.box;
-        const tokensNow = () => [...box.querySelectorAll('.vs__selected')].map(t => t.innerText.replace(/\s*×\s*$/, '').trim()).filter(Boolean);
+    // Re-query the live recipient box every time — the modal (jlSwitchModalContent)
+    // swaps its content after opening, so a box captured early becomes a detached
+    // node whose __vue__ is an orphaned component (updateValue on it does nothing).
+    function liveBox() {
+        const modal = document.getElementById('emailInvoice_modal');
+        return (modal || document).querySelector('.email-dropdownlist, .v-select');
+    }
+    async function setRecipients(emails) {
+        const tokensNow = () => { const b = liveBox(); return b ? [...b.querySelectorAll('.vs__selected')].map(t => t.innerText.replace(/\s*×\s*$/, '').trim()).filter(Boolean) : []; };
         const allSet = () => { const p = tokensNow().map(x => x.toLowerCase()); return p.length === emails.length && emails.every(e => p.includes(e.toLowerCase())); };
-        const comp = box.__vue__; // available because @grant none runs us in page context
 
         // 1. Wait for the composer to finish loading its default recipient(s).
         for (let i = 0; i < 24 && tokensNow().length === 0; i++) await sleep(150); // up to ~3.6s
         await sleep(700); // let any late re-init settle
 
-        // 2. Apply our list; retry because a late re-init can still overwrite it.
-        for (let attempt = 0; attempt < 6; attempt++) {
+        // 2. Apply our list; retry (re-querying the live box each time) because a late
+        //    re-init can overwrite it or replace the whole component.
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const box = liveBox();
+            const comp = box && box.__vue__; // page context (@grant none) → real component
             if (comp && typeof comp.updateValue === 'function') {
                 comp.updateValue(emails.slice());
-            } else {
+            } else if (box) {
                 // Fallback: type each email into the search box + Enter, one at a time.
                 const search = box.querySelector('input.vs__search, input[type="search"], input');
                 box.querySelectorAll('.vs__deselect').forEach(x => x.click());
@@ -389,14 +397,15 @@
     }
 
     async function runEmailStep(job, autoSend) {
-        const ui = await openEmailModal(job.invoiceId);
-        const tokens = await setRecipients(ui, RECIPIENTS);
+        await openEmailModal(job.invoiceId);
+        const tokens = await setRecipients(RECIPIENTS);
         const missing = RECIPIENTS.filter(r => !tokens.some(t => t.toLowerCase() === r.toLowerCase()));
         if (missing.length) log(`    ⚠ recipients not auto-added: ${missing.join(', ')} — add them before sending`, '#fd0');
         else log(`    recipients set: ${tokens.length}`, '#8fd');
 
         if (autoSend && !missing.length) {
-            ui.send.click();
+            const send = document.getElementById('sendEmailButton'); // re-query live
+            if (send) send.click();
             // Give the send a moment; success usually closes the modal.
             await waitFor(() => !document.getElementById('emailInvoice_modal') || document.getElementById('emailInvoice_modal').offsetParent === null, 15000).catch(() => {});
             return { sent: true };
