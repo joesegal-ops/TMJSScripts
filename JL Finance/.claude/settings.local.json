@@ -14,7 +14,8 @@
       "Bash(ls ~/Documents/\"Claude Code\"/)",
       "mcp__Control_Chrome__list_tabs",
       "mcp__Control_Chrome__execute_javascript",
-      "mcp__Control_Chrome__open_url"
+      "mcp__Control_Chrome__open_url",
+      "Bash(cd \"/Users/joesegal/Documents/Claude Code\" && ls -la && echo \"---JL Finance---\" && ls -la \"JL Finance\")"
     ]
   }
 }
