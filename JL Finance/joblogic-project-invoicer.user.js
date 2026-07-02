@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Paste a list of Jobs + PO numbers. For each: creates an invoice against the job, sets the Customer Order Number to "PROJ | PO-XXXX - SITEID" (SITEID auto-derived from the job's site), approves it, then opens the Share→Email composer prefilled with the standard recipients. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -346,36 +346,46 @@
     // plain array of email strings; the page keeps #EmailAddress + #validEmailAddress
     // in sync off that array. Driving the component's own updateValue() is far more
     // reliable than simulating typing (which loses items to Vue's async reactivity).
+    // The composer loads its DEFAULT recipient asynchronously after the modal opens,
+    // and that late load clobbers whatever we set — so we (a) wait for the default to
+    // arrive first, then (b) apply our list and re-apply if it gets reset again.
     async function setRecipients(ui, emails) {
         const box = ui.box;
+        const tokensNow = () => [...box.querySelectorAll('.vs__selected')].map(t => t.innerText.replace(/\s*×\s*$/, '').trim()).filter(Boolean);
+        const allSet = () => { const p = tokensNow().map(x => x.toLowerCase()); return p.length === emails.length && emails.every(e => p.includes(e.toLowerCase())); };
         const comp = box.__vue__; // available because @grant none runs us in page context
-        if (comp && typeof comp.updateValue === 'function') {
-            comp.updateValue(emails.slice());
-            await sleep(300);
-        } else {
-            // Fallback: type each email into the search box + Enter, one at a time.
-            const search = box.querySelector('input.vs__search, input[type="search"], input');
-            box.querySelectorAll('.vs__deselect').forEach(x => x.click());
-            await sleep(150);
-            for (const email of emails) {
-                if (!search) break;
-                search.focus();
-                nativeSet(search, email);
+
+        // 1. Wait for the composer to finish loading its default recipient(s).
+        for (let i = 0; i < 24 && tokensNow().length === 0; i++) await sleep(150); // up to ~3.6s
+        await sleep(700); // let any late re-init settle
+
+        // 2. Apply our list; retry because a late re-init can still overwrite it.
+        for (let attempt = 0; attempt < 6; attempt++) {
+            if (comp && typeof comp.updateValue === 'function') {
+                comp.updateValue(emails.slice());
+            } else {
+                // Fallback: type each email into the search box + Enter, one at a time.
+                const search = box.querySelector('input.vs__search, input[type="search"], input');
+                box.querySelectorAll('.vs__deselect').forEach(x => x.click());
                 await sleep(150);
-                ['keydown', 'keypress', 'keyup'].forEach(type =>
-                    search.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })));
-                await sleep(200);
+                for (const email of emails) {
+                    if (!search) break;
+                    search.focus();
+                    nativeSet(search, email);
+                    await sleep(150);
+                    ['keydown', 'keypress', 'keyup'].forEach(type =>
+                        search.dispatchEvent(new KeyboardEvent(type, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })));
+                    await sleep(200);
+                }
+                const hidden = document.getElementById('EmailAddress');
+                if (hidden) nativeSet(hidden, emails.join(','));
+                const valid = document.getElementById('validEmailAddress');
+                if (valid) nativeSet(valid, 'true');
             }
-            // Last resort: set the hidden fields the server reads.
-            const hidden = document.getElementById('EmailAddress');
-            if (hidden) nativeSet(hidden, emails.join(','));
-            const valid = document.getElementById('validEmailAddress');
-            if (valid) nativeSet(valid, 'true');
-            await sleep(150);
+            await sleep(600);
+            if (allSet()) break;
         }
-        // Report what tokens are actually present so the log is honest.
-        const tokens = [...box.querySelectorAll('.vs__selected')].map(t => t.innerText.replace(/\s*×\s*$/, '').trim()).filter(Boolean);
-        return tokens;
+        return tokensNow();
     }
 
     async function runEmailStep(job, autoSend) {
