@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Paste a list of Jobs + PO numbers. For each: creates an invoice against the job, sets the Customer Order Number to "PROJ | PO-XXXX - SITEID" (SITEID auto-derived from the job's site), approves it, then opens the Share→Email composer prefilled with the standard recipients. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -98,6 +98,10 @@
         return btn;
     }
     // ===== end shared dock =====
+
+    // Read the version straight from the userscript metadata so it never drifts
+    // from the @version header (GM_info is available under @grant none in Tampermonkey).
+    const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '';
 
     const SCRIPT_ID = 'project-invoicer';
     const SCRIPT_LABEL = '📧 Project Invoicer';
@@ -562,7 +566,7 @@
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
         const title = document.createElement('strong');
         title.style.fontSize = '14px';
-        title.textContent = 'Project Invoicer';
+        title.textContent = 'Project Invoicer' + (VERSION ? ' v' + VERSION : '');
         const closeBtn = document.createElement('button');
         closeBtn.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
         closeBtn.textContent = 'X';
