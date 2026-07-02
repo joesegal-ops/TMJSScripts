@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.5
-// @description  Paste a list of Jobs + PO numbers. For each: creates an invoice against the job, sets the Customer Order Number to "PROJ | PO-XXXX - SITEID" (SITEID auto-derived from the job's site), approves it, then opens the Share→Email composer prefilled with the standard recipients. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
+// @version      1.9
+// @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -218,16 +218,24 @@
         const txt = await r.text();
         let json = {}; try { json = JSON.parse(txt); } catch (e) {}
         if (!r.ok || json.success === false) throw new Error('Set order number failed: ' + (json.Message || (json.errors || []).join('; ') || ('HTTP ' + r.status)));
-        // Read back the invoice number (if now shown) for the output.
-        return readInvoiceNumber(doc) || '';
+        return true;
     }
 
-    function readInvoiceNumber(doc) {
-        // Try a few likely spots; a draft may not have a number yet.
-        const cand = doc.querySelector('[data-invoice-number], .invoice-number, #InvoiceNumber');
-        if (cand) return (cand.value || cand.textContent || '').trim();
-        const m = (doc.title || '').match(/Invoice\s*[-#]?\s*([A-Z0-9\/-]+)/i);
-        return m ? m[1] : '';
+    // The human-facing Invoice Number (e.g. "002132") is only assigned on Approve — a
+    // draft's title is "Draft - Invoice - JobLogic", an approved one "002132 - Invoice -
+    // JobLogic". Parse that leading token (ignoring "Draft").
+    function invoiceNumberFromTitle(title) {
+        const m = String(title || '').match(/^\s*([^<]*?)\s*-\s*Invoice\b/i);
+        const v = m ? m[1].trim() : '';
+        return /draft/i.test(v) ? '' : v;
+    }
+    // Fetch the approved invoice's detail page and read its number from the <title>.
+    async function fetchInvoiceNumber(invoiceId) {
+        try {
+            const html = await fetchText('/Invoice/Detail/' + invoiceId);
+            const m = html.match(/<title>([\s\S]*?)<\/title>/i);
+            return invoiceNumberFromTitle(m ? m[1] : '');
+        } catch (e) { return ''; }
     }
 
     async function approveInvoice(invoiceId) {
@@ -250,52 +258,64 @@
             const t = line.trim();
             if (!t) return;
             const parts = t.split(/\t|,|\s{2,}|\s*\|\s*/).map(x => x.trim()).filter(Boolean);
-            if (parts.length < 2) { rows.push({ jobNumber: parts[0] || t, po: '', bad: true }); return; }
-            rows.push({ jobNumber: parts[0], po: parts[1] });
+            const jobNumber = parts[0] || '';
+            // Skip header/label/blank rows — every real Joblogic job number contains a
+            // digit, so "Job Number", "PO Number", etc. are dropped automatically.
+            // (Without this, "Job Number" fuzzy-matches a random job via SearchJsonData.)
+            if (!/\d/.test(jobNumber)) return;
+            if (parts.length < 2) { rows.push({ jobNumber, po: '', bad: true }); return; }
+            rows.push({ jobNumber, po: parts[1] });
         });
         return rows;
     }
 
-    async function runPrep() {
-        const s = loadState();
-        for (let i = 0; i < s.jobs.length; i++) {
-            if (!loadState() || !loadState().running) { log('Stopped.', '#f55'); return; }
-            const job = s.jobs[i];
-            if (job.prepStatus === 'approved') continue; // resume-safe
-            setProgress(`Preparing ${i + 1}/${s.jobs.length}: ${job.jobNumber}`);
-            try {
-                if (job.bad) throw new Error('Row needs Job number AND PO');
-                // 1. resolve
+    // Create + set order number + approve a single job (all headless). Resume-safe:
+    // won't re-resolve or re-create if that was already done for this job.
+    // Returns 'approved' | 'error' | 'stopped'.
+    async function prepOne(i) {
+        let s = loadState();
+        if (!s || !s.running) return 'stopped';
+        const job = s.jobs[i];
+        setProgress(`Job ${i + 1}/${s.jobs.length}: ${job.jobNumber} — creating & approving`);
+        try {
+            if (job.bad) throw new Error('Row needs Job number AND PO');
+            if (!job.jobId) {
                 const info = await resolveJob(job.jobNumber);
                 job.jobId = info.jobId;
                 job.jobNumber = info.jobNumber;
                 job.siteName = info.siteName;
-                job.siteId = siteIdFrom(info.siteName);
-                job.reference = buildReference(job.po, job.siteId);
-                log(`[${i + 1}] ${job.jobNumber} → site "${job.siteName}" (${job.siteId}) | ${job.reference}`, '#0af');
-                await sleep(DELAY);
-                // 2. create
+            }
+            job.siteId = siteIdFrom(job.siteName);
+            job.reference = buildReference(job.po, job.siteId);
+            log(`[${i + 1}] ${job.jobNumber} → site "${job.siteName}" (${job.siteId}) | ${job.reference}`, '#0af');
+            await sleep(DELAY);
+            if (!job.invoiceId) {
                 job.invoiceId = await createInvoice(job.jobId);
                 log(`    created invoice #${job.invoiceId}`, '#8fd');
                 await sleep(DELAY);
-                // 3. set order number
-                job.invoiceNumber = await setOrderNumber(job.invoiceId, job.reference);
-                log(`    order number set`, '#8fd');
-                await sleep(DELAY);
-                // 4. approve
-                await approveInvoice(job.invoiceId);
-                job.prepStatus = 'approved';
-                job.emailStatus = 'pending';
-                log(`    ✓ approved`, '#0fa');
-            } catch (e) {
-                job.prepStatus = 'error';
-                job.error = e.message;
-                log(`    ✗ ${job.jobNumber}: ${e.message}`, '#f55');
             }
-            saveState(s);
-            renderResults(s);
+            await setOrderNumber(job.invoiceId, job.reference);
+            log(`    order number set`, '#8fd');
             await sleep(DELAY);
+            await approveInvoice(job.invoiceId);
+            job.invoiceNumber = await fetchInvoiceNumber(job.invoiceId); // number is assigned on approve
+            job.prepStatus = 'approved';
+            job.emailStatus = 'pending';
+            log(`    ✓ approved${job.invoiceNumber ? ` — invoice ${job.invoiceNumber}` : ''}`, '#0fa');
+        } catch (e) {
+            job.prepStatus = 'error';
+            job.error = e.message;
+            log(`    ✗ ${job.jobNumber}: ${e.message}`, '#f55');
         }
+        // Persist onto the LATEST state (preserves the running flag if Stop was pressed
+        // mid-job) so a Stop can't be clobbered back to true.
+        const latest = loadState();
+        if (!latest) return 'stopped';
+        latest.jobs[i] = job;
+        saveState(latest);
+        renderResults(latest);
+        if (!latest.running) return 'stopped';
+        return job.prepStatus;
     }
 
     // =======================================================================
@@ -399,91 +419,108 @@
         return tokensNow();
     }
 
-    async function runEmailStep(job, autoSend) {
-        await openEmailModal(job.invoiceId);
-        const tokens = await setRecipients(RECIPIENTS);
-        const missing = RECIPIENTS.filter(r => !tokens.some(t => t.toLowerCase() === r.toLowerCase()));
-        if (missing.length) log(`    ⚠ recipients not auto-added: ${missing.join(', ')} — add them before sending`, '#fd0');
-        else log(`    recipients set: ${tokens.length}`, '#8fd');
-
-        if (autoSend && !missing.length) {
-            const send = document.getElementById('sendEmailButton'); // re-query live
-            if (send) send.click();
-            // Give the send a moment; success usually closes the modal.
-            await waitFor(() => !document.getElementById('emailInvoice_modal') || document.getElementById('emailInvoice_modal').offsetParent === null, 15000).catch(() => {});
-            return { sent: true };
+    // Compose (and, if auto-send, send) the email for one job. Assumes we are on that
+    // invoice's detail page.
+    async function emailOne(i) {
+        const job = loadState().jobs[i];
+        // We're on the invoice page now — the title is the authoritative invoice number.
+        if (!job.invoiceNumber) {
+            const num = invoiceNumberFromTitle(document.title);
+            if (num) { const cur = loadState(); cur.jobs[i].invoiceNumber = num; saveState(cur); renderResults(cur); job.invoiceNumber = num; }
         }
-        return { sent: false, missing };
-    }
-
-    // Boot-time resume of the email phase (runs after each navigation).
-    async function resumeEmailPhase() {
-        const s = loadState();
-        if (!s || !s.running || s.phase !== 'email') return;
-        const job = emailQueue(s)[s.emailIdx];
-        if (!job) { finishRun(s); return; }
-        const m = location.pathname.match(/\/Invoice\/Detail\/(\d+)/);
-        if (!m || m[1] !== String(job.invoiceId)) {
-            // Not on the right page yet — navigate there.
-            setProgress(`Emailing ${s.emailIdx + 1}/${emailQueue(s).length}: opening invoice #${job.invoiceId}`);
-            location.href = '/Invoice/Detail/' + job.invoiceId;
-            return;
-        }
-        // We're on the right invoice — compose the email.
         try {
-            log(`Email ${s.emailIdx + 1}/${emailQueue(s).length}: ${job.jobNumber} (invoice #${job.invoiceId})`, '#0af');
-            const res = await runEmailStep(job, s.autoSend);
-            if (res.sent) {
-                job.emailStatus = 'sent';
-                job.sentAt = nowStamp();
+            log(`Email ${i + 1}: ${job.jobNumber} (invoice ${job.invoiceNumber || '#' + job.invoiceId})`, '#0af');
+            await openEmailModal(job.invoiceId);
+            const tokens = await setRecipients(RECIPIENTS);
+            const missing = RECIPIENTS.filter(r => !tokens.some(t => t.toLowerCase() === r.toLowerCase()));
+            if (missing.length) log(`    ⚠ recipients not auto-added: ${missing.join(', ')} — add them before sending`, '#fd0');
+            else log(`    recipients set: ${tokens.length}`, '#8fd');
+
+            const s = loadState();
+            if (s.autoSend && !missing.length) {
+                const send = document.getElementById('sendEmailButton'); // re-query live
+                if (send) send.click();
+                await waitFor(() => !document.getElementById('emailInvoice_modal') || document.getElementById('emailInvoice_modal').offsetParent === null, 15000).catch(() => {});
+                const cur = loadState(); cur.jobs[i].emailStatus = 'sent'; cur.jobs[i].sentAt = nowStamp();
+                saveState(cur); renderResults(cur);
                 log(`    ✓ sent`, '#0fa');
-                saveState(s);
-                renderResults(s);
-                advanceEmail();
+                advanceJob(); // → prep + navigate to the next job
             } else {
-                job.emailStatus = 'composed';
-                saveState(s);
-                renderResults(s);
-                setProgress(`Review invoice #${job.invoiceId}, click Send, then press "Sent → Next".`);
+                const cur = loadState(); cur.jobs[i].emailStatus = 'composed';
+                saveState(cur); renderResults(cur);
+                setProgress(`Review invoice #${job.invoiceId}, click Send, then press "Sent → Next ▶".`);
                 showNextButton(true);
             }
         } catch (e) {
-            job.emailStatus = 'error';
-            job.error = (job.error ? job.error + ' | ' : '') + 'Email: ' + e.message;
+            const cur = loadState(); cur.jobs[i].emailStatus = 'error';
+            cur.jobs[i].error = (cur.jobs[i].error ? cur.jobs[i].error + ' | ' : '') + 'Email: ' + e.message;
+            saveState(cur); renderResults(cur);
             log(`    ✗ email: ${e.message}`, '#f55');
-            saveState(s);
-            renderResults(s);
-            setProgress(`Email failed for #${job.invoiceId}. Fix manually, then press "Sent → Next" to continue.`);
+            setProgress(`Email failed for #${job.invoiceId}. Send manually if needed, then press "Sent → Next ▶".`);
             showNextButton(true);
         }
     }
 
-    function emailQueue(s) { return s.jobs.filter(j => j.prepStatus === 'approved'); }
+    // The one sequential driver: for the current job, prep it (headless), then navigate
+    // to its invoice and email it, then advance. Re-entered on every page load via boot().
+    async function drive() {
+        while (true) {
+            let s = loadState();
+            if (!s || !s.running) return;
+            if (s.idx >= s.jobs.length) { finishRun(s); return; }
+            let job = s.jobs[s.idx];
 
-    function advanceEmail() {
+            // 1. Ensure this job is created + approved (headless, runs on any JL page).
+            if (job.prepStatus !== 'approved' && job.prepStatus !== 'error') {
+                const st = await prepOne(s.idx);
+                if (st === 'stopped') { setProgress(`Stopped at job ${loadState().idx + 1}.`); return; }
+                s = loadState();
+                if (!s || !s.running) return;
+                job = s.jobs[s.idx];
+            }
+
+            // 2. If we can't/shouldn't email this job, move to the next one.
+            if (job.prepStatus === 'error' || s.skipEmail || job.emailStatus === 'sent') {
+                const cur = loadState(); cur.idx += 1; saveState(cur);
+                continue;
+            }
+
+            // 3. Emailing needs the invoice detail page. Navigate there if not already.
+            const m = location.pathname.match(/\/Invoice\/Detail\/(\d+)/);
+            if (!m || m[1] !== String(job.invoiceId)) {
+                setProgress(`Job ${s.idx + 1}/${s.jobs.length}: opening invoice #${job.invoiceId} to email`);
+                location.href = '/Invoice/Detail/' + job.invoiceId; // resumes via boot()→drive()
+                return;
+            }
+
+            // 4. On the right page — compose/send. emailOne decides what happens next.
+            await emailOne(s.idx);
+            return;
+        }
+    }
+
+    // Advance to the next job after a send (auto, or manual "Sent → Next").
+    function advanceJob() {
         const s = loadState();
         if (!s) return;
-        // Mark current as sent if the user pressed Next after a manual send.
-        const q = emailQueue(s);
-        const cur = q[s.emailIdx];
-        if (cur && cur.emailStatus === 'composed') { cur.emailStatus = 'sent'; cur.sentAt = nowStamp(); }
-        s.emailIdx += 1;
+        const j = s.jobs[s.idx];
+        if (j && j.emailStatus === 'composed') { j.emailStatus = 'sent'; j.sentAt = nowStamp(); }
+        s.idx += 1;
         saveState(s);
+        renderResults(s);
         showNextButton(false);
-        if (s.emailIdx >= q.length) { finishRun(s); return; }
-        const next = q[s.emailIdx];
-        location.href = '/Invoice/Detail/' + next.invoiceId;
+        drive();
     }
 
     function finishRun(s) {
         s.running = false;
-        s.phase = 'done';
         saveState(s);
         renderResults(s);
         showNextButton(false);
         const sent = s.jobs.filter(j => j.emailStatus === 'sent').length;
+        const appr = s.jobs.filter(j => j.prepStatus === 'approved').length;
         const errs = s.jobs.filter(j => j.prepStatus === 'error' || j.emailStatus === 'error').length;
-        setProgress(`Done. ${sent} emailed, ${errs} error(s). Copy the results into Google Sheets.`);
+        setProgress(`Done. ${appr} approved, ${sent} emailed, ${errs} error(s). Copy the results into Google Sheets.`);
         log('===== FINISHED =====', '#0af');
         setRunningUI(false);
     }
@@ -491,9 +528,21 @@
     // =======================================================================
     // Start
     // =======================================================================
-    async function start() {
+    function start() {
         const existing = loadState();
         if (existing && existing.running) { alert('A run is already in progress. Use Stop or Reset first.'); return; }
+
+        // Offer to resume a stopped, unfinished run so we never re-create done invoices.
+        if (existing && existing.jobs && existing.idx < existing.jobs.length &&
+            existing.jobs.some(j => j.prepStatus === 'approved' || j.prepStatus === 'error')) {
+            if (confirm(`Resume the previous run from job ${existing.idx + 1}/${existing.jobs.length}?\n\nOK = resume where you stopped.\nCancel = start a NEW run from the box above.`)) {
+                const s = loadState(); s.running = true; saveState(s);
+                setRunningUI(true);
+                log(`Resuming from job ${s.idx + 1}/${s.jobs.length}...`, '#0af');
+                drive();
+                return;
+            }
+        }
 
         const rows = parseRows(inputArea.value);
         if (!rows.length) { alert('Paste at least one "JobNumber <tab> PO" row.'); return; }
@@ -502,8 +551,7 @@
             running: true,
             autoSend: autoSendCheck.checked,
             skipEmail: skipEmailCheck.checked,
-            phase: 'prep',
-            emailIdx: 0,
+            idx: 0,
             jobs: rows.map(r => ({
                 jobNumber: r.jobNumber, po: r.po, bad: !!r.bad,
                 jobId: null, siteName: '', siteId: '', reference: '',
@@ -514,31 +562,18 @@
         saveState(s);
         logArea.innerHTML = '';
         setRunningUI(true);
-        log(s.autoSend ? 'AUTO-SEND is ON — emails will be sent without pausing.' : 'DRY-RUN — each email will be composed and paused for your review.', s.autoSend ? '#f80' : '#ff0');
+        log(`Processing ${s.jobs.length} job(s), one at a time: create → approve → email → next.`, '#0af');
+        log(s.autoSend ? 'AUTO-SEND is ON — emails will be sent without pausing.' : 'DRY-RUN — each email is composed and paused for your review.', s.autoSend ? '#f80' : '#ff0');
         if (s.skipEmail) log('SKIP EMAIL is ON — invoices will be created & approved only.', '#ff0');
-
-        await runPrep();
-
-        const s2 = loadState();
-        if (!s2 || !s2.running) return; // stopped
-        const q = emailQueue(s2);
-        if (s2.skipEmail || !q.length) {
-            finishRun(s2);
-            return;
-        }
-        // Move to email phase — navigate to first approved invoice.
-        s2.phase = 'email';
-        s2.emailIdx = 0;
-        saveState(s2);
-        setProgress(`Prep done. Emailing ${q.length} invoice(s)...`);
-        location.href = '/Invoice/Detail/' + q[0].invoiceId;
+        drive();
     }
 
     function stopRun() {
         const s = loadState();
         if (s) { s.running = false; saveState(s); }
         setRunningUI(false);
-        setProgress('Stopped. Reset to start over, or Start to resume prep.');
+        showNextButton(false);
+        setProgress(`Stopped${s ? ` at job ${s.idx + 1}/${s.jobs.length}` : ''}. Press Start to resume from here, or Reset to clear.`);
     }
 
     function resetRun() {
@@ -597,7 +632,7 @@
 
         const help = document.createElement('div');
         help.style.cssText = 'color:#9fb;margin-bottom:8px;line-height:1.4;';
-        help.innerHTML = 'Paste one row per job: <b>Job Number</b> then a tab (or comma) then <b>PO number</b>.<br>Ref becomes <b>PROJ | PO-XXXX - SITEID</b> (SITEID = first 6 letters of the site, no spaces).';
+        help.innerHTML = 'Paste one row per job: <b>Job Number</b> then a tab (or comma) then <b>PO number</b>. A header row is fine — it\'s skipped automatically.<br>Ref becomes <b>PROJ | PO-XXXX - SITEID</b> (SITEID = first 6 letters of the site, no spaces).';
 
         inputArea = document.createElement('textarea');
         inputArea.placeholder = 'PM0000579/001\tPO-01041292\nPM0000580/001\tPO-01041293';
@@ -623,7 +658,7 @@
         ctl.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;';
         startBtn = mkBtn('Start', '#0a8'); startBtn.addEventListener('click', start);
         stopBtn = mkBtn('Stop', '#a22'); stopBtn.style.display = 'none'; stopBtn.addEventListener('click', stopRun);
-        nextBtn = mkBtn('Sent → Next ▶', '#c60'); nextBtn.style.display = 'none'; nextBtn.addEventListener('click', () => advanceEmail());
+        nextBtn = mkBtn('Sent → Next ▶', '#c60'); nextBtn.style.display = 'none'; nextBtn.addEventListener('click', () => advanceJob());
         resetBtn = mkBtn('Reset', '#555'); resetBtn.addEventListener('click', resetRun);
         ctl.appendChild(startBtn); ctl.appendChild(stopBtn); ctl.appendChild(nextBtn); ctl.appendChild(resetBtn);
 
@@ -695,12 +730,12 @@
     // --- BOOT ---
     function boot() {
         createUI();
-        // Resume the email phase after a navigation.
+        // Resume the run after a navigation (drive() figures out prep vs. email).
         const s = loadState();
-        if (s && s.running && s.phase === 'email') {
+        if (s && s.running) {
             // Auto-open the panel so the user sees progress.
             if (panel && panel.style.display === 'none') { const btn = document.getElementById('jl-launch-' + SCRIPT_ID); if (btn) btn.click(); }
-            setTimeout(resumeEmailPhase, 800);
+            setTimeout(drive, 800);
         }
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
