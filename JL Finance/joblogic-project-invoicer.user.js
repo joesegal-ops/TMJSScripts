@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Paste a list of Jobs + PO numbers. For each: creates an invoice against the job, sets the Customer Order Number to "PROJ | PO-XXXX - SITEID" (SITEID auto-derived from the job's site), approves it, then opens the Share→Email composer prefilled with the standard recipients. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -335,7 +335,7 @@
         return waitFor(() => {
             const modal = document.getElementById('emailInvoice_modal');
             if (!modal) return null;
-            const box = modal.querySelector('.email-dropdownlist, .v-select');
+            const box = modal.querySelector('#EmailAddressDropdown') || modal.querySelector('.email-dropdownlist');
             const send = document.getElementById('sendEmailButton');
             return (box && send) ? { modal, box, send } : null;
         });
@@ -352,9 +352,12 @@
     // Re-query the live recipient box every time — the modal (jlSwitchModalContent)
     // swaps its content after opening, so a box captured early becomes a detached
     // node whose __vue__ is an orphaned component (updateValue on it does nothing).
+    // Target the RECIPIENT box specifically. The modal has two vue-selects — the
+    // Email Template dropdown comes first in the DOM, so a combined selector would
+    // grab that by mistake. The recipient box is #EmailAddressDropdown/.email-dropdownlist.
     function liveBox() {
-        const modal = document.getElementById('emailInvoice_modal');
-        return (modal || document).querySelector('.email-dropdownlist, .v-select');
+        const modal = document.getElementById('emailInvoice_modal') || document;
+        return modal.querySelector('#EmailAddressDropdown') || modal.querySelector('.email-dropdownlist');
     }
     async function setRecipients(emails) {
         const tokensNow = () => { const b = liveBox(); return b ? [...b.querySelectorAll('.vs__selected')].map(t => t.innerText.replace(/\s*×\s*$/, '').trim()).filter(Boolean) : []; };
