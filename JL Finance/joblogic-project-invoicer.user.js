@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.9
+// @version      1.10
 // @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -126,7 +126,7 @@
     function clearState() { localStorage.removeItem(STATE_KEY); }
 
     // --- UI refs ---
-    let panel, inputArea, autoSendCheck, skipEmailCheck, startBtn, stopBtn, resetBtn, copyBtn, nextBtn, logArea, progressText, resultsArea;
+    let panel, inputArea, autoSendCheck, skipEmailCheck, startBtn, stopBtn, resetBtn, copyBtn, nextBtn, refillBtn, logArea, progressText, resultsArea;
 
     // =======================================================================
     // Helpers
@@ -485,6 +485,15 @@
                 continue;
             }
 
+            // 2b. Already composed and waiting for you (dry-run) — go fully hands-off.
+            // Don't re-open/re-fill on reloads or when you click around (e.g. previewing
+            // the template PDF). You proceed only via the "Sent → Next ▶" button.
+            if (!s.autoSend && job.emailStatus === 'composed') {
+                setProgress(`Waiting: review invoice ${job.invoiceNumber || '#' + job.invoiceId}, Send it, then press "Sent → Next ▶". (Use "Re-fill emails" if the recipients got cleared.)`);
+                showNextButton(true);
+                return;
+            }
+
             // 3. Emailing needs the invoice detail page. Navigate there if not already.
             const m = location.pathname.match(/\/Invoice\/Detail\/(\d+)/);
             if (!m || m[1] !== String(job.invoiceId)) {
@@ -659,8 +668,15 @@
         startBtn = mkBtn('Start', '#0a8'); startBtn.addEventListener('click', start);
         stopBtn = mkBtn('Stop', '#a22'); stopBtn.style.display = 'none'; stopBtn.addEventListener('click', stopRun);
         nextBtn = mkBtn('Sent → Next ▶', '#c60'); nextBtn.style.display = 'none'; nextBtn.addEventListener('click', () => advanceJob());
+        refillBtn = mkBtn('Re-fill emails', '#0b6e99'); refillBtn.style.display = 'none';
+        refillBtn.title = 'Re-add the standard recipients if a template change cleared them.';
+        refillBtn.addEventListener('click', async () => {
+            const t = await setRecipients(RECIPIENTS);
+            const miss = RECIPIENTS.filter(r => !t.some(x => x.toLowerCase() === r.toLowerCase()));
+            log(miss.length ? `Re-fill: still missing ${miss.join(', ')}` : `Re-filled ${t.length} recipients.`, miss.length ? '#fd0' : '#8fd');
+        });
         resetBtn = mkBtn('Reset', '#555'); resetBtn.addEventListener('click', resetRun);
-        ctl.appendChild(startBtn); ctl.appendChild(stopBtn); ctl.appendChild(nextBtn); ctl.appendChild(resetBtn);
+        ctl.appendChild(startBtn); ctl.appendChild(stopBtn); ctl.appendChild(nextBtn); ctl.appendChild(refillBtn); ctl.appendChild(resetBtn);
 
         // Progress
         const pd = document.createElement('div');
@@ -725,7 +741,10 @@
         startBtn.style.display = running ? 'none' : 'inline-block';
         stopBtn.style.display = running ? 'inline-block' : 'none';
     }
-    function showNextButton(show) { if (nextBtn) nextBtn.style.display = show ? 'inline-block' : 'none'; }
+    function showNextButton(show) {
+        if (nextBtn) nextBtn.style.display = show ? 'inline-block' : 'none';
+        if (refillBtn) refillBtn.style.display = show ? 'inline-block' : 'none';
+    }
 
     // --- BOOT ---
     function boot() {
