@@ -1,169 +1,181 @@
 """
-Joblogic API -> BigQuery loader (VM edition).
+Joblogic API -> BigQuery raw-layer loader (VM edition).
 
-Runs on the fixed-IP VM via hourly cron. Uses the VM's attached service account for
-BigQuery auth (Application Default Credentials - no key files). Joblogic API creds are
-read from /opt/jl-loader/secrets.env.
+Confirmed pattern (verified live 2026-07-03):
+  token: POST https://identityservice.joblogic.com/connect/token
+         (grant_type=client_credentials, scope=JL.Api)  -> Bearer, ~1h TTL
+  list:  POST https://api.joblogic.com/api/v1/<Entity>/GetAll
+         body {"TenantId": <guid>, "PageIndex": n(1-based), "PageSize": <=50}
+         resp {"Items": [...], "TotalCount": int, "PageIndex": int, "PageSize": int}
+  limits: PageSize max 50; 100 requests/min (429 + backoff).
 
-Phase 2 TODO is the transform(): the API returns nested entities, but the downstream
-views need the report's exact flat columns (dd/mm/yyyy strings, Engineer_Active Yes/No).
-Until that mapping is built and validated, run with LOADER_TARGET=staging + autodetect.
+Loads each entity verbatim into dataset `raw` (one table per entity) with a `_ingested_at`
+timestamp. WRITE_TRUNCATE snapshot per run. The `models` dataset (built separately in SQL)
+does typing/joins to reproduce the report tables.
+
+Auth to BigQuery uses the VM's service account (ADC). Joblogic creds come from Secret Manager
+via run.sh (exported as env vars). Config via env; sane defaults below.
+
+Run one entity:      JL_ENTITIES=Job/getall:jobs python3 loader.py
+Run the whole suite: (default JL_ENTITIES list below)
 """
 
+import datetime as dt
 import json
 import logging
 import os
 import sys
 import time
 from io import BytesIO
-from typing import Any, Iterator
 
 import requests
 from google.cloud import bigquery
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("jl-report-bq")
+log = logging.getLogger("jl-raw")
 
 
-def env(name: str, default: str | None = None, required: bool = False) -> str:
-    val = os.environ.get(name, default)
-    if required and not val:
-        log.error("Missing required env var: %s", name)
-        sys.exit(2)
-    return val  # type: ignore[return-value]
+def env(name, default=None, required=False):
+    v = os.environ.get(name, default)
+    if required and not v:
+        log.error("Missing required env var: %s", name); sys.exit(2)
+    return v
 
 
-# --- Config (from secrets.env / environment) --------------------------------
-TOKEN_URL   = env("JL_TOKEN_URL", "https://identityserver.joblogic.com/connect/token")
-API_BASE    = env("JL_API_BASE", "https://api.joblogic.com")
-SCOPE       = env("JL_SCOPE", "JL.Api")
-CLIENT_ID   = env("JL_CLIENT_ID", required=True)
+TOKEN_URL = env("JL_TOKEN_URL", "https://identityservice.joblogic.com/connect/token")
+API_BASE  = env("JL_API_BASE", "https://api.joblogic.com")
+SCOPE     = env("JL_SCOPE", "JL.Api")
+CLIENT_ID = env("JL_CLIENT_ID", required=True)
 CLIENT_SECRET = env("JL_CLIENT_SECRET", required=True)
+TENANT_ID = env("JL_TENANT_ID", required=True)
 
-TENANT_ID   = env("JL_TENANT_ID", required=True)         # required on every JL request
-API_PATH    = env("JL_API_PATH", required=True)          # e.g. /job or /visit  (confirm in apidocs.joblogic.com)
-PAGE_PARAM  = env("JL_PAGE_PARAM", "PageIndex")          # JL uses PageIndex (1-based)
-SIZE_PARAM  = env("JL_SIZE_PARAM", "PageSize")
-PAGE_SIZE   = min(int(env("JL_PAGE_SIZE", "50")), 50)    # JL hard max is 50
-RECORDS_KEY = env("JL_RECORDS_KEY", "")                  # dot-path to the array, "" if body is the array
-EXTRA_QUERY = env("JL_EXTRA_QUERY", "")                  # e.g. modifiedSince=... once JL confirms the field
+BQ_PROJECT = env("BQ_PROJECT", "vmimporteddata")
+BQ_DATASET = env("BQ_DATASET", "raw")
 
-BQ_PROJECT  = env("BQ_PROJECT", "importdata-494110")
-BQ_DATASET  = env("BQ_DATASET", "JobLogic")
-# Safety: default to a STAGING table so a half-built mapping never clobbers the live table.
-LOADER_TARGET = env("LOADER_TARGET", "staging")          # "staging" | "prod"
-BQ_TABLE = (
-    "Job_and_Visit_Details" if LOADER_TARGET == "prod"
-    else "Job_and_Visit_Details_api_staging"
-)
-WRITE_MODE  = env("BQ_WRITE_MODE", "WRITE_TRUNCATE")
-AUTODETECT  = env("BQ_AUTODETECT", "true").lower() == "true"  # Phase 2: set false + explicit schema
+PAGE_SIZE = min(int(env("JL_PAGE_SIZE", "50")), 50)     # hard max 50
+RATE_MIN_INTERVAL = float(env("JL_MIN_INTERVAL", "0.65"))  # ~92 req/min, under the 100 cap
+HTTP_TIMEOUT = int(env("JL_HTTP_TIMEOUT", "60"))
+MAX_RETRIES = int(env("JL_MAX_RETRIES", "5"))
 
-HTTP_TIMEOUT = int(env("HTTP_TIMEOUT", "60"))
-MAX_RETRIES  = int(env("HTTP_MAX_RETRIES", "4"))
+# entity GetAll path : BigQuery table  (exact casing from the swagger spec)
+DEFAULT_ENTITIES = [
+    "Job/getall:jobs",
+    "Visit/GetAll:visits",
+    "Customer/GetAll:customers",
+    "Site/GetAll:sites",
+    "Quote/GetAll:quotes",
+    "Invoice/getall:invoices",
+    "Asset/GetAll:assets",
+    "Subcontractor/GetAll:subcontractors",
+    "Supplier/GetAll:suppliers",
+    "Part/GetAll:parts",
+    "Staff/GetAll:staff",
+    "Timesheet/GetAll:timesheets",
+    "Expense/GetAll:expenses",
+    "purchaseorder/getall:purchase_orders",
+    "FormsLogbook/getall:forms_logbook",
+    "ContractPurchaseOrder/GetAll:contract_purchase_orders",
+    "JobAsset/GetAll:job_assets",
+]
+ENTITIES = [e for e in env("JL_ENTITIES", ",".join(DEFAULT_ENTITIES)).split(",") if e.strip()]
 
-
-# --- Auth -------------------------------------------------------------------
-def get_token() -> str:
-    log.info("Requesting access token from %s", TOKEN_URL)
-    resp = requests.post(
-        TOKEN_URL,
-        data={"grant_type": "client_credentials", "client_id": CLIENT_ID,
-              "client_secret": CLIENT_SECRET, "scope": SCOPE},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=HTTP_TIMEOUT,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+_last_req = [0.0]
 
 
-# --- Fetch ------------------------------------------------------------------
-def _dig(obj: Any, dotted: str) -> Any:
-    if not dotted:
-        return obj
-    for part in dotted.split("."):
-        obj = obj[part]
-    return obj
+def _pace():
+    wait = RATE_MIN_INTERVAL - (time.monotonic() - _last_req[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_req[0] = time.monotonic()
 
 
-def _request_with_retry(url: str, headers: dict, params: dict) -> dict:
-    resp = None
+def get_token():
+    r = requests.post(TOKEN_URL, data={
+        "grant_type": "client_credentials", "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET, "scope": SCOPE,
+    }, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def post_page(url, token, page):
+    body = {"TenantId": TENANT_ID, "PageIndex": page, "PageSize": PAGE_SIZE}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+               "Accept": "application/json"}
     for attempt in range(1, MAX_RETRIES + 1):
-        resp = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
-        if resp.status_code in (429, 500, 502, 503, 504):
+        _pace()
+        r = requests.post(url, json=body, headers=headers, timeout=HTTP_TIMEOUT)
+        if r.status_code == 429 or r.status_code >= 500:
             wait = min(2 ** attempt, 30)
-            log.warning("HTTP %s (attempt %s/%s) - retry in %ss", resp.status_code, attempt, MAX_RETRIES, wait)
+            log.warning("HTTP %s on %s p%s (try %s/%s) — wait %ss",
+                        r.status_code, url, page, attempt, MAX_RETRIES, wait)
             time.sleep(wait)
             continue
-        resp.raise_for_status()
-        return resp.json()
-    resp.raise_for_status()
-    return {}
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
 
 
-def fetch_all(token: str) -> Iterator[dict]:
-    url = f"{API_BASE}{API_PATH}"
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    page, total = 1, 0
+def fetch_entity(path, token):
+    """Page through POST /api/v1/<path>. Returns (rows, error_or_None)."""
+    url = f"{API_BASE}/api/v1/{path}"
+    rows, page = [], 1
     while True:
-        params: dict[str, Any] = {PAGE_PARAM: page, SIZE_PARAM: PAGE_SIZE, "tenantId": TENANT_ID}
-        for kv in filter(None, EXTRA_QUERY.split("&")):
-            k, _, v = kv.partition("=")
-            params[k] = v
-        records = _dig(_request_with_retry(url, headers, params), RECORDS_KEY)
-        if not isinstance(records, list):
-            raise ValueError(f"Expected a list at JL_RECORDS_KEY='{RECORDS_KEY}', got {type(records)}")
-        if not records:
-            break
-        yield from records
-        total += len(records)
-        log.info("page %s: %s rows (%s total)", page, len(records), total)
-        if len(records) < PAGE_SIZE:
+        try:
+            body = post_page(url, token, page)
+        except Exception as e:
+            return rows, f"{type(e).__name__}: {e}"
+        items = body.get("Items") if isinstance(body, dict) else None
+        if items is None:
+            return rows, f"no 'Items' in response (keys={list(body)[:8] if isinstance(body,dict) else type(body)})"
+        rows.extend(items)
+        total = body.get("TotalCount")
+        if not items or len(items) < PAGE_SIZE or (total is not None and len(rows) >= total):
             break
         page += 1
-    log.info("fetch complete: %s rows", total)
+    return rows, None
 
 
-# --- Transform (PHASE 2) ----------------------------------------------------
-def transform(row: dict) -> dict:
-    """Map one API entity to the report's flat columns.
-
-    PHASE 2: fill this in once we see a real API response. Target columns + formats:
-        Customer, Site, Area, ID, Job_Description, Job_Status, Order_Number,
-        Task_Type_ID, Task_Type, Date_Logged(dd/mm/yyyy),
-        Target_Completion_Date(dd/mm/yyyy), Date_Complete(dd/mm/yyyy), Engineer,
-        Engineer_Active('Yes'/'No'), VisitDateTime(dd/mm/yyyy HH:MM),
-        VisitEndDateTime(dd/mm/yyyy HH:MM), Visit_Status, Revisit_Reason, Site_id
-    For now (staging + autodetect) we pass rows through untouched.
-    """
-    if LOADER_TARGET == "prod" and AUTODETECT:
-        raise SystemExit("Refusing to write prod with autodetect - build transform() first (Phase 2).")
-    return row
-
-
-# --- Load -------------------------------------------------------------------
-def load_to_bq(rows: list[dict]) -> None:
+def load_to_bq(client, table, rows, ingested_at):
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{table}"
     if not rows:
-        log.warning("0 rows fetched - skipping load (table left unchanged).")
+        log.warning("  %s: 0 rows — skipping load (table left unchanged)", table_id)
         return
-    client = bigquery.Client(project=BQ_PROJECT)
-    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    for r in rows:
+        if isinstance(r, dict):
+            r["_ingested_at"] = ingested_at
     cfg = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-        write_disposition=WRITE_MODE,
-        autodetect=AUTODETECT,
+        write_disposition="WRITE_TRUNCATE", autodetect=True,
     )
     payload = "\n".join(json.dumps(r, default=str) for r in rows).encode("utf-8")
     job = client.load_table_from_file(BytesIO(payload), table_id, job_config=cfg)
     job.result()
-    log.info("loaded %s rows into %s (target=%s)", len(rows), table_id, LOADER_TARGET)
+    log.info("  loaded %s rows -> %s", len(rows), table_id)
 
 
-def main() -> None:
+def main():
     token = get_token()
-    rows = [transform(r) for r in fetch_all(token)]
-    load_to_bq(rows)
-    log.info("done.")
+    log.info("token acquired; loading %s entities", len(ENTITIES))
+    client = bigquery.Client(project=BQ_PROJECT)
+    ingested_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    summary = []
+    for spec in ENTITIES:
+        path, _, table = spec.partition(":")
+        path, table = path.strip(), table.strip()
+        log.info("== %s -> raw.%s ==", path, table)
+        rows, err = fetch_entity(path, token)
+        if err:
+            log.error("  %s FAILED after %s rows: %s", path, len(rows), err)
+            summary.append((table, len(rows), err))
+            if rows:
+                load_to_bq(client, table, rows, ingested_at)  # load what we got
+            continue
+        load_to_bq(client, table, rows, ingested_at)
+        summary.append((table, len(rows), "ok"))
+    log.info("=== SUMMARY ===")
+    for t, n, s in summary:
+        log.info("  %-26s %8d  %s", t, n, s)
 
 
 if __name__ == "__main__":
