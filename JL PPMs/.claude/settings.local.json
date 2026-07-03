@@ -23,7 +23,9 @@
       "Bash(python3)",
       "Bash(ls -la \"/Users/joesegal/Documents/Claude Code/JL PPMs/\" && ls \"/Users/joesegal/Documents/Claude Code/\")",
       "Bash(node --check \"/Users/joesegal/Documents/Claude Code/JL PPMs/ppm-create-visits-from-table.user.js\")",
-      "Bash(node --check ppm-create-visits-from-table.user.js)"
+      "Bash(node --check ppm-create-visits-from-table.user.js)",
+      "Bash(bq query *)",
+      "mcp__Control_Chrome__open_url"
     ]
   }
 }
