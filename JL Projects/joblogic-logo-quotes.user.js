@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - WeWork Member Logo Quotes (Monday → Quote → Email)
 // @namespace    http://tampermonkey.net/
-// @version      0.2.0
+// @version      0.2.2
 // @description  Pulls the "Members' logos Wework" Monday board, drops Artwork-Rejected items, and builds quotes from the "Logo - WeWork Member" template: one consolidated quote per site for WeWork-paid logos, one quote per logo for Member-paid. Per quote it sets the reference "Members Logos | MMMYY", rewrites the last description lines to "Office Number - Member Name", adds the site contact, sets the "per logo" quantity (sum) and "batch delivery cost" quantity (distinct logged weeks; 1 for member-paid), then Share→Email. Finally flips the Monday Financial Status to "Added To Quote". DRY-RUN by default: it stops at each email for you to review + Send, and only writes back to Monday after the email step. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @connect      api.monday.com
@@ -149,6 +149,16 @@
 
     // --- UI refs ---
     let panel, tokenInput, autoSendCheck, planArea, logArea, progressText, loadBtn, startBtn, stopBtn, resetBtn, nextBtn;
+    let phaseBusy = false, stopping = false;   // phaseBusy: a request is mid-flight; stopping: Stop pressed, waiting for it to settle
+    function setStopBtn(mode) {
+        if (!stopBtn) return;
+        const busy = mode === 'stopping';
+        stopBtn.textContent = busy ? 'Stopping…' : 'Stop';
+        stopBtn.disabled = busy;
+        stopBtn.style.opacity = busy ? '0.6' : '1';
+        stopBtn.style.cursor = busy ? 'default' : 'pointer';
+        stopBtn.style.background = busy ? '#5a1620' : '#8a1f2f';
+    }
 
     // =======================================================================
     // Small helpers
@@ -475,11 +485,21 @@
     // =======================================================================
     // The sequential driver — resumes on every JL page load via boot().
     // =======================================================================
+    // Between-phase stop check: Stop flips running=false in storage; re-read it after
+    // each awaited phase so a Stop mid-quote halts before the next step (incl. Monday write-back).
+    function haltIfStopped(q) {
+        const cur = loadState();
+        if (cur && cur.running) return false;
+        setProgress(`Stopped on "${q.site}" at ${q.phase}. Press "Start run" to resume from here.`);
+        log(`⏸ Stopped by user before "${q.phase}".`, '#fd0');
+        return true;
+    }
     async function drive() {
         let s = loadState();
         if (!s || !s.running) return;
         if (s.idx >= s.quotes.length) { finishRun(s); return; }
         const q = s.quotes[s.idx];
+        phaseBusy = true;
         try {
             // If we're on a fresh quote and not yet on the detail page, kick off create.
             if (q.phase === 'pending') {
@@ -496,8 +516,11 @@
                 if (q.phase === 'pending') { q.phase = 'detail'; commitQuote(s.idx, q); }
 
                 if (q.phase === 'detail') { await jlFillDetail(q); log('   details saved', '#8fd'); q.phase = 'contacts'; commitQuote(s.idx, q); }
+                if (haltIfStopped(q)) return;
                 if (q.phase === 'contacts') { await jlAddContact(q); q.phase = 'prices'; commitQuote(s.idx, q); }
+                if (haltIfStopped(q)) return;
                 if (q.phase === 'prices') { await jlSetPrices(q); q.phase = 'email'; commitQuote(s.idx, q); }
+                if (haltIfStopped(q)) return;
                 if (q.phase === 'email') {
                     const res = await jlOpenEmail(q, loadState().autoSend);
                     if (res === 'composed') {
@@ -508,6 +531,7 @@
                     }
                     q.phase = 'monday'; commitQuote(s.idx, q);
                 }
+                if (haltIfStopped(q)) return;   // don't write back to Monday if Stop was pressed
                 if (q.phase === 'monday') { await writeMonday(q); q.phase = 'done'; commitQuote(s.idx, q); }
                 if (q.phase === 'done') { advance(); }
             }
@@ -516,6 +540,9 @@
             log(`   ✗ ${q.site}: ${e.message}`, '#f55');
             setProgress(`Stopped on "${q.site}" at ${q.phase}. Fix/complete manually, then press "Sent → Next ▶" to continue.`);
             showNext(true);
+        } finally {
+            phaseBusy = false;
+            if (stopping) { stopping = false; setStopBtn('idle'); }   // Stop has now settled
         }
     }
     async function writeMonday(q) {
@@ -613,7 +640,16 @@
 
         loadBtn.addEventListener('click', onLoad);
         startBtn.addEventListener('click', onStart);
-        stopBtn.addEventListener('click', () => { const s = loadState(); if (s) { s.running = false; saveState(s); } setProgress('Stopped.'); log('Stopped by user.', '#fd0'); });
+        stopBtn.addEventListener('click', () => {
+            const s = loadState(); if (s) { s.running = false; saveState(s); }
+            if (phaseBusy) {
+                stopping = true; setStopBtn('stopping');
+                setProgress('Stopping — finishing the current step, then halting…');
+                log('Stop requested — will halt after the current step.', '#fd0');
+            } else {
+                setProgress('Stopped.'); log('Stopped by user.', '#fd0');
+            }
+        });
         resetBtn.addEventListener('click', () => { clearState(); planArea.innerHTML = ''; setProgress(''); log('State cleared.', '#fd0'); });
         nextBtn.addEventListener('click', onNext);
 
