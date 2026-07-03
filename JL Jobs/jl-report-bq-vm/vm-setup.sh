@@ -26,21 +26,16 @@ python3 -m venv "$APP_DIR/venv"
 echo "==> non-secret config (edit endpoint/target here; secrets come from Secret Manager)"
 if [ ! -f "$APP_DIR/config.env" ]; then
   cat > "$APP_DIR/config.env" <<EOF
-# Confirm the PRODUCTION hosts with Joblogic (docs show UAT hosts):
-JL_TOKEN_URL=https://identityserver.joblogic.com/connect/token
+# Verified production hosts (2026-07-03):
+JL_TOKEN_URL=https://identityservice.joblogic.com/connect/token
 JL_API_BASE=https://api.joblogic.com
 JL_SCOPE=JL.Api
-# The entity to pull for this cron entry (Phase 2 will run several, one per raw table):
-JL_API_PATH=/job
-JL_RECORDS_KEY=
-# BigQuery target
 BQ_PROJECT=vmimporteddata
 BQ_DATASET=raw
-BQ_TABLE=jobs
-BQ_WRITE_MODE=WRITE_TRUNCATE
-# Keep autodetect for raw landing; models layer does the typing.
-BQ_AUTODETECT=true
-LOADER_TARGET=prod
+# Leave JL_ENTITIES unset to load the full default suite (see loader.py),
+# or set it for a tiered cron entry, e.g.:
+#   JL_ENTITIES=Job/getall:jobs,Visit/GetAll:visits
+# JL_ENTITIES=
 EOF
 fi
 chmod 644 "$APP_DIR/config.env"

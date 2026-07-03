@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Move PPM Visits to a New Date
 // @namespace    https://go.joblogic.com/
-// @version      4.00
+// @version      4.01
 // @description  On the Jobs list, paste "PMxxxx/nnn - Move to WC|MC: date" lines spanning ANY number of PPM contracts. For each visit it moves BOTH the contract due-date (SavePPMContractVisits) and the planner appointment (Scheduler/UpdateVisit) to the new window — WC = that Mon–Fri week, MC = 1st of month for 28 days. Resolves each contract automatically, verifies every change by re-reading, and skips visits already at the target. Preview first, then Move.
 // @match        https://go.joblogic.com/Job*
 // @grant        none
@@ -127,7 +127,7 @@
     }
     // ===== end shared dock =====
 
-    const SCRIPT_VERSION = '4.00';   // keep in sync with @version header
+    const SCRIPT_VERSION = '4.01';   // keep in sync with @version header
     const SCRIPT_ID = 'move-jobs-to-date';
     const SCRIPT_LABEL = '📆 Move PPM Visits to Date';
     const SCRIPT_COLOR = '#0b7285';
@@ -250,13 +250,10 @@
         return list.find(x => norm(x.JobNumber) === want) || null;
     }
 
-    // Get the PPM contract GUID a job belongs to. Prefer a GUID already on the
-    // search record, otherwise scrape the job detail page (it links the contract).
+    // Get the PPM contract GUID a job belongs to by scraping the job detail page
+    // (it links its contract as /PPMContract/Detail/<guid>). NB: don't use the
+    // search record's UniqueId — that's the JOB's GUID, not the contract's.
     async function contractGuidForJob(job) {
-        for (const k of ['PPMContractId', 'PpmContractId', 'ContractUniqueId', 'ContractId', 'UniqueId']) {
-            const v = job[k];
-            if (typeof v === 'string' && /^[0-9a-f-]{36}$/i.test(v)) return v;
-        }
         const t = await (await fetch(JOB_DETAIL_URL(job.Id), { credentials: 'same-origin' })).text();
         const m = t.match(/\/PPMContract\/Detail\/([0-9a-fA-F-]{36})/);
         return m ? m[1] : null;
