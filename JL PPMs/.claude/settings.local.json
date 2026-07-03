@@ -25,7 +25,17 @@
       "Bash(node --check \"/Users/joesegal/Documents/Claude Code/JL PPMs/ppm-create-visits-from-table.user.js\")",
       "Bash(node --check ppm-create-visits-from-table.user.js)",
       "Bash(bq query *)",
-      "mcp__Control_Chrome__open_url"
+      "mcp__Control_Chrome__open_url",
+      "mcp__Claude_in_Chrome__get_page_text",
+      "mcp__Claude_in_Chrome__find",
+      "mcp__Claude_in_Chrome__read_page",
+      "Bash(gcloud projects *)",
+      "Bash(gcloud billing *)",
+      "Bash(bq --project_id=vmimporteddata ls)",
+      "Bash(set -e)",
+      "Bash(gcloud services *)",
+      "Bash(bq --location=US --project_id=vmimporteddata mk --dataset --description \"Raw Joblogic API entities, loaded as-is\" vmimporteddata:raw)",
+      "Bash(bq --location=US --project_id=vmimporteddata mk --dataset --description \"Modelled/cleaned tables built from raw\" vmimporteddata:models)"
     ]
   }
 }

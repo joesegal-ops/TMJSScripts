@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Joblogic - Move Jobs to a New Date
+// @name         Joblogic - Move PPM Visits to a New Date
 // @namespace    https://go.joblogic.com/
-// @version      2.00
-// @description  On the Job list, paste a block of "PMxxxx/nnn - Move to WC|MC: date" lines. For each job it finds the visit and MOVES it (same engineer) to the new window — WC = that Mon–Fri working week, MC = 1st of month + 28 days. Headers and blank lines are ignored. Preview first, then Move. Collapses to a launcher button in the shared dock.
-// @match        https://go.joblogic.com/Job*
+// @version      3.00
+// @description  On a PPM Contract page, paste "PMxxxx/nnn - Move to WC|MC: date" lines. For each visit on THIS contract it moves BOTH the contract due-date (SavePPMContractVisits) and the planner appointment (Scheduler/UpdateVisit) to the new window — WC = that Mon–Fri week, MC = 1st of month for 28 days. Verifies every change by re-reading (won't falsely report success). Headers/blanks and other-contract lines are ignored. Preview first, then Move.
+// @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
 // @run-at       document-start
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-move-jobs-to-date.user.js
@@ -12,36 +12,6 @@
 
 (function () {
     'use strict';
-
-    // =========================================================================
-    // SEARCH-JSON CAPTURE  (must run at document-start, before the page's own
-    // load-time search fires). The Job list posts a big filter body to
-    // /api/Job/SearchJsonData (JSON, needs the anti-forgery token). Rather than
-    // reconstruct ~70 filter fields we capture the page's own request and replay
-    // it with SearchTerm swapped to the job number we want. Hook both fetch and
-    // XHR because JL_SERVICES may use either.
-    // =========================================================================
-    window.__jlJobSearchBody = window.__jlJobSearchBody || null;
-    (function hookSearch() {
-        if (window.__jlJobSearchHooked) return;
-        window.__jlJobSearchHooked = true;
-        const stash = (url, body) => {
-            try {
-                if (!/\/api\/Job\/SearchJsonData/i.test(url || '')) return;
-                if (typeof body !== 'string') { try { body = JSON.stringify(body); } catch (e) { return; } }
-                if (body && body[0] === '{') window.__jlJobSearchBody = body;
-            } catch (e) {}
-        };
-        const F = window.fetch;
-        if (F) window.fetch = function (u, o) {
-            try { stash((typeof u === 'string') ? u : (u && u.url), o && o.body); } catch (e) {}
-            return F.apply(this, arguments);
-        };
-        const proto = XMLHttpRequest.prototype;
-        const oOpen = proto.open, oSend = proto.send;
-        proto.open = function (m, u) { this.__jlUrl = u; return oOpen.apply(this, arguments); };
-        proto.send = function (b) { stash(this.__jlUrl, b); return oSend.apply(this, arguments); };
-    })();
 
     // ===== Shared JL userscript launcher dock (identical in every script) =====
     const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order', JL_MIN_KEY = 'jl-userscript-dock-min', JL_TOP_KEY = 'jl-userscript-dock-top';
@@ -129,25 +99,28 @@
     }
     // ===== end shared dock =====
 
-    const SCRIPT_VERSION = '2.00';   // keep in sync with @version header
+    const SCRIPT_VERSION = '3.00';   // keep in sync with @version header
     const SCRIPT_ID = 'move-jobs-to-date';
-    const SCRIPT_LABEL = '📆 Move Jobs to Date';
+    const SCRIPT_LABEL = '📆 Move PPM Visits to Date';
     const SCRIPT_COLOR = '#0b7285';
-    const SCRIPT_DESC = 'On the Job list, paste "PMxxxx/nnn - Move to WC|MC: date" lines. Each job\'s visit is MOVED (same engineer) to the new window — WC = that Mon–Fri week, MC = 1st of month for 28 days. Headers/blanks ignored. Preview first, then Move.';
+    const SCRIPT_DESC = 'On a PPM Contract page, paste "PMxxxx/nnn - Move to WC|MC: date" lines. Moves matching visits\' contract due-date AND planner slot to the new window (WC = Mon–Fri week, MC = 1st + 28 days). Verifies each change. Run once per contract. Preview first.';
 
-    if (window.__jlMoveJobsToDateLoaded) return;
-    window.__jlMoveJobsToDateLoaded = true;
+    const PERSIST_KEY = 'jl-move-ppm-visits-input';
+
+    if (window.__jlMovePpmVisitsLoaded) return;
+    window.__jlMovePpmVisitsLoaded = true;
 
     // =========================================================================
     // CONFIG
     // =========================================================================
-    const SEARCH_URL     = '/api/Job/SearchJsonData';
-    const VISITS_URL     = (jobId) => `/api/Visit/GetVisitsJson?&jobId=${jobId}&isAxaJob=false&isReadOnly=false&pageIndex=1&pageSize=200`;
-    const UPDATE_URL     = '/Scheduler/UpdateVisit';
-    const DELAY_BETWEEN  = 500;      // ms between writes (be gentle on the API)
-    const WORK_START     = '08:00';  // working-day start (visit window start)
-    const WORK_END       = '17:00';  // working-day end   (visit window end)
-    const MC_DAYS        = 28;        // MC visits run for this many days from the 1st
+    const GET_VISITS_URL   = (guid)  => `/api/Visit/GetVisits/${guid}`;
+    const SAVE_PPM_URL      = '/api/Visit/SavePPMContractVisits';
+    const GET_VISITSJSON_URL = (jobId) => `/api/Visit/GetVisitsJson?&jobId=${jobId}&isAxaJob=false&isReadOnly=false&pageIndex=1&pageSize=200`;
+    const UPDATE_VISIT_URL  = '/Scheduler/UpdateVisit';
+    const DELAY_BETWEEN     = 500;      // ms between scheduler writes
+    const WORK_START        = '08:00';  // working-day start
+    const WORK_END          = '17:00';  // working-day end
+    const MC_DAYS           = 28;        // MC visits run this many days from the 1st
 
     // =========================================================================
     // HELPERS
@@ -156,63 +129,62 @@
     const pad2  = n => String(n).padStart(2, '0');
     const norm  = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
-    // Anti-forgery token — required as a request header on Scheduler + SearchJsonData POSTs.
     function getToken() {
         const i = document.querySelector('input[name="__RequestVerificationToken"]');
         return i ? i.value : null;
     }
-
-    // Parse a Joblogic "DD/MM/YYYY HH:mm" (time optional) into a sortable key.
-    function parseDMY(str) {
-        const m = String(str || '').match(/^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{2}):(\d{2}))?/);
-        if (!m) return null;
-        const [, d, mo, y, hh, mm] = m;
-        return { d, mo, y, hh: hh || null, mm: mm || null, key: `${y}${mo}${d}${hh || '00'}${mm || '00'}` };
+    // Contract GUID from the URL: /PPMContract/Detail/<guid>
+    function contractGuid() {
+        const m = location.pathname.match(/\/PPMContract\/Detail\/([0-9a-fA-F-]{36})/);
+        return m ? m[1] : null;
     }
-    // 2-digit year -> 4-digit (26 -> 2026); leaves 4-digit years alone.
-    function fullYear(y) { y = +y; return y < 100 ? 2000 + y : y; }
-    // Date -> "DD/MM/YYYY HH:mm".
-    function fmtDateTime(dt) { return `${pad2(dt.getDate())}/${pad2(dt.getMonth() + 1)}/${dt.getFullYear()} ${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`; }
+    // Contract number from the page title: "PM0001706 - PPM Contract - JobLogic"
+    function contractNumber() {
+        const m = (document.title || '').match(/\b(PM\d+)\b/);
+        return m ? m[1] : null;
+    }
+    // The contract number embedded in a visit job number: "PM0001706/008" -> "PM0001706"
+    const baseContract = jn => String(jn || '').split('/')[0].trim();
+
+    const fullYear = y => { y = +y; return y < 100 ? 2000 + y : y; };
+    const fmtDateTime = dt => `${pad2(dt.getDate())}/${pad2(dt.getMonth() + 1)}/${dt.getFullYear()} ${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`;
     const dayName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-    // Compute the {start, end} visit window (strings "DD/MM/YYYY HH:mm") for a
-    // WC (week-commencing → Mon–Fri) or MC (month-commencing → 1st + 28 days)
-    // target. Returns { error } instead if the date can't be parsed.
+    // Compute the visit window for a WC / MC target.
+    // Returns { startStr, endStr, durMin, human } or { error }.
+    //  WC (DD/MM/YY): start on the date @ WORK_START, end that week's Friday @ WORK_END.
+    //  MC (MM/YY):    start on the 1st @ WORK_START, end +MC_DAYS days @ WORK_END.
     function computeWindow(mode, dateStr) {
         const [sh, sm] = WORK_START.split(':').map(Number);
         const [eh, em] = WORK_END.split(':').map(Number);
+        let start, end;
         if (mode === 'WC') {
             const m = String(dateStr).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
             if (!m) return { error: `bad WC date "${dateStr}" — expected DD/MM/YY` };
             const [, d, mo, y] = m;
-            const start = new Date(fullYear(y), +mo - 1, +d, sh, sm);
+            start = new Date(fullYear(y), +mo - 1, +d, sh, sm);
             if (isNaN(start.getTime()) || +mo < 1 || +mo > 12 || +d < 1 || +d > 31) return { error: `invalid WC date "${dateStr}"` };
-            // Friday of the working week that contains the start date.
-            const toFri = (5 - start.getDay() + 7) % 7;
-            const end = new Date(start.getTime());
-            end.setDate(end.getDate() + toFri);
-            end.setHours(eh, em, 0, 0);
-            return { start: fmtDateTime(start), end: fmtDateTime(end), human: `WC ${pad2(start.getDate())}/${pad2(start.getMonth() + 1)}/${start.getFullYear()} (${dayName[start.getDay()]}→Fri ${pad2(end.getDate())}/${pad2(end.getMonth() + 1)})` };
-        }
-        if (mode === 'MC') {
+            const toFri = (5 - start.getDay() + 7) % 7;   // Friday of this working week
+            end = new Date(start.getTime()); end.setDate(end.getDate() + toFri); end.setHours(eh, em, 0, 0);
+        } else if (mode === 'MC') {
             const m = String(dateStr).match(/^(\d{1,2})\/(\d{2,4})$/);
             if (!m) return { error: `bad MC date "${dateStr}" — expected MM/YY` };
             const [, mo, y] = m;
             if (+mo < 1 || +mo > 12) return { error: `invalid MC month "${dateStr}"` };
-            const start = new Date(fullYear(y), +mo - 1, 1, sh, sm);
-            if (isNaN(start.getTime())) return { error: `invalid MC date "${dateStr}"` };
-            const end = new Date(start.getTime());
-            end.setDate(end.getDate() + MC_DAYS);
-            end.setHours(eh, em, 0, 0);
-            return { start: fmtDateTime(start), end: fmtDateTime(end), human: `MC 01/${pad2(+mo)}/${fullYear(y)} (+${MC_DAYS}d → ${pad2(end.getDate())}/${pad2(end.getMonth() + 1)})` };
+            start = new Date(fullYear(y), +mo - 1, 1, sh, sm);
+            end = new Date(start.getTime()); end.setDate(end.getDate() + MC_DAYS); end.setHours(eh, em, 0, 0);
+        } else {
+            return { error: `unknown mode "${mode}"` };
         }
-        return { error: `unknown mode "${mode}"` };
+        const durMin = Math.round((end.getTime() - start.getTime()) / 60000);
+        const human = mode === 'WC'
+            ? `WC ${fmtDateTime(start).slice(0, 10)} (${dayName[start.getDay()]}→Fri ${fmtDateTime(end).slice(0, 10)})`
+            : `MC ${fmtDateTime(start).slice(0, 10)} (+${MC_DAYS}d → ${fmtDateTime(end).slice(0, 10)})`;
+        return { startStr: fmtDateTime(start), endStr: fmtDateTime(end), durMin, human };
     }
 
-    // Parse the pasted block into targets. One target per line matching
-    //   "<jobNumber> - Move to WC|MC: <date>"
-    // Blank lines and header lines (no job number) are ignored.
-    // jobNumber examples: PM0000495/129, M0000027, AT0000004.
+    // Parse the pasted block. One target per line matching
+    //   "<jobNumber> - Move to WC|MC: <date>". Blank/header lines ignored.
     function parseTargets(text) {
         const re = /^([A-Za-z]{1,5}\d+(?:\/\d+)?)\s*-\s*move\s*to\s*(wc|mc)\s*:\s*([0-9/]+)\s*$/i;
         const out = [];
@@ -220,12 +192,11 @@
             const line = raw.trim();
             if (!line) continue;
             const m = line.match(re);
-            if (!m) continue;   // header / commentary / unrecognised — skip silently
+            if (!m) continue;
             const jobNumber = m[1].trim();
             const mode = m[2].toUpperCase();
             const dateStr = m[3].trim();
-            const win = computeWindow(mode, dateStr);
-            out.push({ jobNumber, mode, dateStr, start: win.start, end: win.end, human: win.human, error: win.error });
+            out.push({ jobNumber, mode, dateStr, ...computeWindow(mode, dateStr) });
         }
         return out;
     }
@@ -234,61 +205,80 @@
     // API CALLS
     // =========================================================================
 
-    // Wait for the page's own SearchJsonData body to be captured (fires on load).
-    async function ensureSearchBody() {
-        for (let i = 0; i < 40 && !window.__jlJobSearchBody; i++) await sleep(150);
-        return window.__jlJobSearchBody;
-    }
-
-    // Resolve a job number -> its job record {Id, JobNumber, ...} using the page's
-    // own captured search body with SearchTerm swapped. Returns null if not found.
-    async function resolveJob(jobNumber) {
-        const tmpl = window.__jlJobSearchBody;
-        if (!tmpl) throw new Error('No search template captured yet');
-        let body;
-        try { body = JSON.parse(tmpl); } catch (e) { throw new Error('Bad search template'); }
-        body.SearchTerm = jobNumber;
-        body.QuickSearchTerm = jobNumber;
-        body.PageIndex = 1;
-        if (!body.PageSize || body.PageSize < 25) body.PageSize = 50;
-        const r = await fetch(SEARCH_URL, {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json', '__RequestVerificationToken': getToken() },
-            body: JSON.stringify(body)
-        });
-        if (!r.ok) throw new Error('SearchJsonData HTTP ' + r.status);
-        const j = await r.json().catch(() => null);
-        const jobs = (j && j.AdditionalData && j.AdditionalData.Jobs) || [];
-        const want = norm(jobNumber);
-        // Exact match on job number first, then a forgiving "starts-with" fallback.
-        return jobs.find(x => norm(x.JobNumber) === want)
-            || jobs.find(x => norm(x.JobNumber).replace(/\s+/g, '') === want.replace(/\s+/g, ''))
-            || null;
-    }
-
-    // Fetch visits for a job. Returns { visits:[...], typeOfJob }.
-    async function getJobVisits(jobId) {
-        const r = await fetch(VISITS_URL(jobId), { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
-        if (!r.ok) throw new Error('GetVisitsJson HTTP ' + r.status);
+    // Full PPM contract visit model (AdditionalData: PPMContractId, SiteId, Visits[]).
+    async function getContractVisits(guid) {
+        const r = await fetch(GET_VISITS_URL(guid), { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('GetVisits HTTP ' + r.status);
         const j = await r.json();
-        const ad = j.AdditionalData || {};
-        return { visits: ad.Visits || [], typeOfJob: ad.TypeOfJob };
+        return j.AdditionalData || {};
     }
-    // The most recent visit by start date/time.
-    function latestVisit(visits) {
+
+    // Build the trimmed per-visit submit object (matches the page's GetSubmitData).
+    function buildSubmitVisit(v, startStr, durMin) {
+        const at = v.AssignType;
+        return {
+            Id: v.Id,
+            AssignType: at,
+            EngineerId: (at === 0 || at === 2) ? v.EngineerId : null,
+            EngineerTeamId: (at === 1) ? v.EngineerTeamId : null,
+            SubcontractorId: (at === 3) ? v.SubcontractorId : null,
+            JobId: v.JobId,
+            JobCategoryId: v.JobCategoryId,
+            Description: v.Description,
+            StartDate: startStr,
+            EstDuration: durMin,
+            FixedPriceValue: v.FixedPriceValue,
+            Appointment: v.Appointment,
+            SendEmailSMS: false,
+            IsNew: false,
+            Edited: true,
+            IsDeleted: false,
+            FixedDuration: true,
+            Assets: [],
+            Tasks: [],
+            LastUsedServiceOrder: v.LastUsedServiceOrder || null,
+            TradeId: v.TradeId,
+            TradeDescription: v.TradeDescription,
+            IsDateAndTimeLocked: v.IsDateAndTimeLocked,
+            AdminEnforcedLock: v.AdminEnforcedLock
+        };
+    }
+
+    // Save changed PPM contract visits in one call (matches the page's save: the
+    // whole model JSON in a single "dataFile" blob field).
+    async function savePpmVisits(ppmContractId, siteId, submitVisits) {
+        const model = { PPMContractId: ppmContractId, SiteId: siteId, Visits: submitVisits };
+        const fd = new FormData();
+        fd.append('dataFile', new Blob([JSON.stringify(model)], { type: 'application/json' }), 'dataFileBlob');
+        const r = await fetch(SAVE_PPM_URL, {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json', '__RequestVerificationToken': getToken() },
+            body: fd
+        });
+        const j = await r.json().catch(() => null);
+        if (!r.ok) throw new Error('SavePPMContractVisits HTTP ' + r.status);
+        // NB: this endpoint returns success:true even when it silently ignores a
+        // non-editable visit — callers MUST verify by re-reading.
+        if (!j || j.success !== true) throw new Error((j && j.errors && j.errors.join(', ')) || 'SavePPMContractVisits returned failure');
+        return j;
+    }
+
+    // Scheduler side: find the (latest) planner appointment for a job.
+    async function getSchedulerVisit(jobId) {
+        const r = await fetch(GET_VISITSJSON_URL(jobId), { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+        if (!r.ok) throw new Error('GetVisitsJson HTTP ' + r.status);
+        const ad = (await r.json()).AdditionalData || {};
+        const visits = ad.Visits || [];
         let best = null, bestKey = '';
-        for (const v of visits || []) {
-            const p = parseDMY(v.StartDate);
-            const key = p ? p.key : '';
+        for (const v of visits) {
+            const m = String(v.StartDate || '').match(/^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{2}):(\d{2}))?/);
+            const key = m ? `${m[3]}${m[2]}${m[1]}${m[4] || '00'}${m[5] || '00'}` : '';
             if (!best || key >= bestKey) { best = v; bestKey = key; }
         }
-        return best;
+        return { visit: best, typeOfJob: ad.TypeOfJob };
     }
-
-    // Move a visit to a new window (Scheduler/UpdateVisit, FormData + token). The
-    // engineer/subcontractor already on the visit is kept — it is not in the
-    // payload. deploy=true re-sends it to the engineer; false just re-dates it.
-    async function moveVisit({ visitId, jobId, jobNumber, typeOfJob, isTeamVisit, deploy, startStr, endStr }) {
+    // Move (re-date) a planner appointment. Keeps its engineer.
+    async function moveSchedulerVisit({ visitId, jobId, jobNumber, typeOfJob, isTeamVisit, deploy, startStr, endStr }) {
         const fd = new FormData();
         fd.append('id', visitId);
         fd.append('jobId', jobId);
@@ -299,7 +289,7 @@
         fd.append('deploy', !!deploy);
         fd.append('startDate', startStr);
         fd.append('endDate', endStr);
-        const r = await fetch(UPDATE_URL, {
+        const r = await fetch(UPDATE_VISIT_URL, {
             method: 'POST', credentials: 'same-origin',
             headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json', '__RequestVerificationToken': getToken() },
             body: fd
@@ -313,101 +303,74 @@
     // =========================================================================
     // BUILD A PLAN  (shared by Preview + Move)
     //
-    // For each parsed target: resolve -> latest visit -> compute the new window.
-    // Flags a conflict when the same job number is targeted at two different
-    // windows in the same paste. Returns [{ ...target, ok, reason, ... }].
+    // Reads THIS contract's visits, matches each pasted target for this contract,
+    // and works out the new window + whether the due-date is editable.
     // =========================================================================
-    async function buildPlan(targets) {
-        // Group by job number to detect conflicting duplicates.
-        const byJob = {};
-        targets.forEach(t => { (byJob[t.jobNumber] = byJob[t.jobNumber] || []).push(t); });
+    async function buildPlan() {
+        const guid = contractGuid();
+        const num = contractNumber();
+        if (!guid) throw new Error('No PPM contract GUID in the URL — open a PPM Contract detail page.');
 
-        const plan = [];
-        for (let i = 0; i < targets.length; i++) {
-            if (!running) break;
-            const t = targets[i];
-            setProgress(`Looking up ${i + 1}/${targets.length}: ${t.jobNumber}`);
+        const all = parseTargets(jobsInputEl ? jobsInputEl.value : '');
+        const mine = [], others = [];
+        for (const t of all) (num && baseContract(t.jobNumber) === num ? mine : others).push(t);
+
+        const ad = await getContractVisits(guid);
+        const visits = ad.Visits || [];
+        const byNum = new Map(visits.map(v => [norm(v.JobNumber), v]));
+
+        const rows = [];
+        for (const t of mine) {
             const row = { ...t, ok: false, reason: '' };
-
-            const grp = byJob[t.jobNumber];
-            if (grp.length > 1 && new Set(grp.map(x => `${x.start}|${x.end}`)).size > 1) row.conflict = true;
-
-            if (t.error) { row.reason = t.error; plan.push(row); continue; }
-            try {
-                const job = await resolveJob(t.jobNumber);
-                if (!job) { row.reason = 'job number not found on the Job list'; plan.push(row); continue; }
-                row.jobId = job.Id;
-                row.jobNumberResolved = job.JobNumber;
-
-                const { visits, typeOfJob } = await getJobVisits(job.Id);
-                if (!visits.length) { row.reason = 'job has no visits to move'; plan.push(row); continue; }
-                const lv = latestVisit(visits);
-                row.visitId = lv.Id;
-                row.typeOfJob = typeOfJob;
-                row.engineerName = (lv.EngineerName || '').trim();
-                row.latestStart = lv.StartDate;
-                row.latestStatus = lv.StatusDescription;
-                // GetVisitsJson doesn't expose IsTeamVisit; an engineer name means
-                // it's an engineer visit. A blank name is likely team/subcontractor.
-                row.isTeamVisit = !row.engineerName;
-                row.ok = true;
-            } catch (e) {
-                row.reason = 'error: ' + e.message;
-            }
-            plan.push(row);
-            await sleep(120);
+            if (t.error) { row.reason = t.error; rows.push(row); continue; }
+            const v = byNum.get(norm(t.jobNumber));
+            if (!v) { row.reason = 'not found on this contract'; rows.push(row); continue; }
+            row.visit = v;
+            row.jobId = v.JobId;
+            row.currentStart = v.StartDate;
+            row.editable = !!v.EditVisitAllowed;
+            row.isTeamVisit = v.AssignType === 1;
+            row.engineerName = (v.EngineerName || v.EngineerTeamName || v.SubcontractorName || '').trim();
+            row.status = v.JobStatusDescription;
+            row.ok = true;
+            rows.push(row);
         }
-        return plan;
+        return { guid, num, ppmContractId: ad.PPMContractId, siteId: ad.SiteId, rows, others, allCount: all.length };
     }
 
     // =========================================================================
     // ACTIONS
     // =========================================================================
     let running = false;
-    let lastPlan = [];          // ok rows from the most recent Preview
-
-    function readInputs() {
-        return {
-            targets: parseTargets(jobsInputEl ? jobsInputEl.value : ''),
-            deploy: !!(deployEl && deployEl.checked)
-        };
-    }
+    let lastPlan = null;
 
     async function onPreview() {
         if (running) return;
-        running = true; setRunningUI(true); clearLog(); lastPlan = [];
+        running = true; setRunningUI(true); clearLog(); lastPlan = null;
         if (runBtn) runBtn.disabled = true;
         try {
-            const { targets } = readInputs();
-            if (!getToken()) { log('Could not find the verification token on this page — refresh and try again.', '#f55'); return; }
-            if (!targets.length) { log('No "… - Move to WC|MC: date" lines found. Paste your list and try again.', '#f55'); return; }
-
-            log('Waiting for the job-list search to be ready…', '#0af');
-            if (!await ensureSearchBody()) {
-                log('Could not capture the job-list search. Run a normal search on this page once, then Preview again.', '#f55');
-                return;
+            if (!getToken()) { log('No verification token on this page — refresh and try again.', '#f55'); return; }
+            const plan = await buildPlan();
+            if (!plan.num) log('⚠ Could not read this contract\'s number from the page title.', '#fa0');
+            log(`This contract: ${plan.num || '?'}  •  ${plan.rows.length} of your pasted line(s) belong here.`, '#0af');
+            if (plan.others.length) {
+                const otherNums = [...new Set(plan.others.map(o => baseContract(o.jobNumber)))].join(', ');
+                log(`${plan.others.length} line(s) are for other contracts (${otherNums}) — open each and run there.`, '#89b4fa');
             }
-            log(`${targets.length} line(s) parsed. Looking them up…`, '#0af');
-
-            const plan = await buildPlan(targets);
-            lastPlan = plan.filter(r => r.ok);
-
             log('', '#ccc');
             log('========== PREVIEW ==========', '#0fa');
-            for (const r of plan) {
-                if (r.ok) {
-                    const eng = r.engineerName || '⚠ no engineer (team/subcontractor?)';
-                    const warn = r.conflict ? '  ⚠ SAME JOB targeted twice — last one wins' : '';
-                    log(`✓ ${r.jobNumberResolved}  →  ${eng}\n     ${r.human}   [${r.start} → ${r.end}]\n     (was ${r.latestStart || '?'}, ${r.latestStatus || '?'})${warn}`, r.conflict ? '#fd0' : '#0fa');
-                } else {
-                    log(`✗ ${r.jobNumber}  —  ${r.reason}`, '#f77');
-                }
+            let movable = 0;
+            for (const r of plan.rows) {
+                if (!r.ok) { log(`✗ ${r.jobNumber}  —  ${r.reason}`, '#f77'); continue; }
+                movable++;
+                const dueNote = r.editable ? 'due-date: editable' : 'due-date: LOCKED (deployed) — planner only';
+                log(`✓ ${r.jobNumber}  [${r.status || '?'}, ${r.engineerName || 'no engineer'}]\n     ${r.human}   start ${r.startStr}  dur ${r.durMin}m\n     was ${r.currentStart}  •  ${dueNote}`, r.editable ? '#0fa' : '#fd0');
             }
-            const okN = lastPlan.length, skipN = plan.length - okN;
+            lastPlan = plan;
             log('', '#ccc');
-            log(`Ready to move ${okN} visit(s)${skipN ? `, ${skipN} skipped` : ''}.`, '#0fa');
-            setProgress(okN ? `Preview done — ${okN} ready. Click "Move Visits" to commit.` : 'Preview done — nothing to move.');
-            if (runBtn) runBtn.disabled = okN === 0;
+            log(`Ready: ${movable} visit(s) to move on this contract.`, '#0fa');
+            setProgress(movable ? `Preview done — ${movable} ready. Click "Move Visits".` : 'Preview done — nothing to move here.');
+            if (runBtn) runBtn.disabled = movable === 0;
         } catch (e) {
             log('ERROR: ' + e.message, '#f55');
             setProgress('Error during preview.');
@@ -418,37 +381,72 @@
 
     async function onMove() {
         if (running) return;
-        if (!lastPlan.length) { log('Nothing to move — run Preview first.', '#fa0'); return; }
-        const { deploy } = readInputs();
-        if (!confirm(`Move ${lastPlan.length} visit(s) to their new dates${deploy ? ' and DEPLOY (re-send) each to its engineer' : ''}?\n\nThe original date is replaced. This cannot be auto-undone.`)) return;
+        if (!lastPlan) { log('Run Preview first.', '#fa0'); return; }
+        const rows = lastPlan.rows.filter(r => r.ok);
+        if (!rows.length) { log('Nothing to move on this contract.', '#fa0'); return; }
+        const deploy = !!(deployEl && deployEl.checked);
+        if (!confirm(`Move ${rows.length} visit(s) on ${lastPlan.num}?\n\nUpdates the contract due-date (where editable) AND the planner appointment${deploy ? ', deploying each to its engineer' : ''}. Each change is verified.`)) return;
 
         running = true; setRunningUI(true);
-        let moved = 0, failed = 0;
         try {
-            for (let i = 0; i < lastPlan.length; i++) {
-                if (!running) { log('Stopped by user.', '#fa0'); break; }
-                const r = lastPlan[i];
-                setProgress(`Moving ${i + 1}/${lastPlan.length}: ${r.jobNumberResolved}`);
-                log(`${r.jobNumberResolved} | ${r.engineerName || '(no engineer)'} | ${r.start} → ${r.end}${deploy ? ' | deploy' : ''}`, '#fff');
+            // ---- 1) Contract due-date, batched, then verified by re-reading ----
+            const editable = rows.filter(r => r.editable);
+            const dueOk = new Set();
+            if (editable.length) {
+                setProgress(`Saving ${editable.length} contract due-date(s)…`);
                 try {
-                    await moveVisit({
-                        visitId: r.visitId, jobId: r.jobId, jobNumber: r.jobNumberResolved,
-                        typeOfJob: r.typeOfJob, isTeamVisit: r.isTeamVisit,
-                        deploy, startStr: r.start, endStr: r.end
-                    });
-                    moved++;
-                    log('  moved', '#0fa');
+                    const submit = editable.map(r => buildSubmitVisit(r.visit, r.startStr, r.durMin));
+                    await savePpmVisits(lastPlan.ppmContractId, lastPlan.siteId, submit);
+                    await sleep(1000);
+                    const ad = await getContractVisits(lastPlan.guid);
+                    const after = new Map((ad.Visits || []).map(v => [norm(v.JobNumber), v]));
+                    for (const r of editable) {
+                        const v = after.get(norm(r.jobNumber));
+                        if (v && norm(v.StartDate) === norm(r.startStr)) dueOk.add(r.jobNumber);
+                    }
                 } catch (e) {
-                    failed++;
-                    log('  FAILED: ' + e.message, '#f55');
+                    log('Contract save failed: ' + e.message, '#f55');
                 }
+            }
+
+            // ---- 2) Planner appointment, per visit, verified via the response ----
+            let done = 0;
+            for (let i = 0; i < rows.length; i++) {
+                if (!running) { log('Stopped by user.', '#fa0'); break; }
+                const r = rows[i];
+                setProgress(`Planner ${i + 1}/${rows.length}: ${r.jobNumber}`);
+                let schedMsg = '';
+                try {
+                    const { visit, typeOfJob } = await getSchedulerVisit(r.jobId);
+                    if (!visit) {
+                        schedMsg = 'no planner appointment';
+                    } else {
+                        await moveSchedulerVisit({
+                            visitId: visit.Id, jobId: r.jobId, jobNumber: r.jobNumber,
+                            typeOfJob: typeOfJob != null ? typeOfJob : 2, isTeamVisit: r.isTeamVisit,
+                            deploy, startStr: r.startStr, endStr: r.endStr
+                        });
+                        schedMsg = 'planner moved' + (deploy ? ' + deployed' : '');
+                    }
+                } catch (e) {
+                    schedMsg = 'planner FAILED: ' + e.message;
+                }
+
+                const duePart = !r.editable ? 'due-date LOCKED (planner only)'
+                    : (dueOk.has(r.jobNumber) ? 'due-date moved' : 'due-date NOT applied (verify failed)');
+                const good = (r.editable ? dueOk.has(r.jobNumber) : true) && !/FAILED/.test(schedMsg);
+                if (good) done++;
+                log(`${r.jobNumber}  →  ${r.startStr}\n     ${duePart}  |  ${schedMsg}`, good ? '#0fa' : '#fd0');
                 await sleep(DELAY_BETWEEN);
             }
+
             log('', '#ccc');
             log('========== SUMMARY ==========', '#0fa');
-            log(`Moved: ${moved}  •  Failed: ${failed}`, '#0fa');
-            setProgress(`Done — moved ${moved}, failed ${failed}.`);
-            lastPlan = [];
+            log(`${done}/${rows.length} fully applied on ${lastPlan.num}.`, '#0fa');
+            const lockedN = rows.filter(r => !r.editable).length;
+            if (lockedN) log(`${lockedN} had a LOCKED contract due-date (deployed) — only their planner slot moved. Re-date those in the planner if needed.`, '#fd0');
+            setProgress(`Done — ${done}/${rows.length} moved on ${lastPlan.num}.`);
+            lastPlan = null;
             if (runBtn) runBtn.disabled = true;
         } catch (e) {
             log('Fatal error: ' + e.message, '#f55');
@@ -486,7 +484,7 @@
         panelEl.id = 'jl-movejobs-panel';
         panelEl.innerHTML = `
 <style>
-#jl-movejobs-panel { position:fixed; top:10px; right:10px; z-index:99999; background:#1a1a2e; color:#eee; border-radius:8px; width:600px; max-height:88vh; display:flex; flex-direction:column; font-family:monospace; font-size:12px; box-shadow:0 4px 20px rgba(0,0,0,.55); }
+#jl-movejobs-panel { position:fixed; top:10px; right:10px; z-index:99999; background:#1a1a2e; color:#eee; border-radius:8px; width:620px; max-height:88vh; display:flex; flex-direction:column; font-family:monospace; font-size:12px; box-shadow:0 4px 20px rgba(0,0,0,.55); }
 #jl-movejobs-panel header { display:flex; justify-content:space-between; align-items:center; padding:10px 14px; border-bottom:1px solid #333; cursor:move; user-select:none; }
 #jl-movejobs-panel header b { font-size:13px; }
 #jl-movejobs-panel .body { padding:10px 14px; display:flex; flex-direction:column; gap:8px; overflow-y:auto; }
@@ -504,18 +502,18 @@
 #jl-movejobs-panel button[disabled] { opacity:.4; cursor:not-allowed; }
 #jl-movejobs-panel .controls { display:flex; gap:6px; flex-wrap:wrap; }
 #jl-movejobs-panel .hint { color:#6b7280; font-size:11px; line-height:1.45; }
-#jl-movejobs-panel .log { background:#0a0a1a; padding:8px; border-radius:4px; overflow-y:auto; max-height:38vh; white-space:pre-wrap; word-break:break-word; }
+#jl-movejobs-panel .log { background:#0a0a1a; padding:8px; border-radius:4px; overflow-y:auto; max-height:40vh; white-space:pre-wrap; word-break:break-word; }
 #jl-movejobs-panel .log div { padding:1px 0; line-height:1.35; }
 #jl-movejobs-panel .ver { color:#64748b; font-weight:400; font-size:11px; }
 </style>
-<header><b>Move Jobs to a New Date <span class="ver">v${SCRIPT_VERSION}</span></b><button class="btn-close">×</button></header>
+<header><b>Move PPM Visits to a New Date <span class="ver">v${SCRIPT_VERSION}</span></b><button class="btn-close">×</button></header>
 <div class="body">
   <div class="progress">Paste your list, then Preview.</div>
-  <label class="fld"><span>Paste lines — "&lt;job&gt; - Move to WC|MC: date" (headers &amp; blank lines ignored)</span>
-    <textarea class="jobs" placeholder="PM0000495/129 - Move to WC: 24/08/26&#10;PM0000603/189 - Move to WC: 24/08/26&#10;&#10;EICR:&#10;PM0000495/290 - Move to WC: 07/09/26&#10;&#10;Emergency Lighting Drain Test:&#10;PM0000495/037 - Move to MC: 12/26"></textarea>
+  <label class="fld"><span>Paste lines — "&lt;PMxxxx/nnn&gt; - Move to WC|MC: date" (headers, blanks &amp; other-contract lines ignored)</span>
+    <textarea class="jobs" placeholder="PM0001706/005 - Move to WC: 19/10/26&#10;PM0001706/008 - Move to MC: 12/26&#10;&#10;Lighting Controls:&#10;PM0001706/014 - Move to MC: 07/26"></textarea>
   </label>
   <div class="row">
-    <label class="chk"><input type="checkbox" class="deploy"><span>Also deploy (re-send to engineer) after moving</span></label>
+    <label class="chk"><input type="checkbox" class="deploy"><span>Deploy (send to engineer) after moving the planner slot</span></label>
   </div>
   <div class="controls">
     <button class="btn-preview">Preview</button>
@@ -523,11 +521,12 @@
     <button class="btn-stop">Stop</button>
   </div>
   <div class="hint">
-    For each line the script finds the job's <b>latest visit</b> and <b>moves it</b> (keeping its engineer) to a new window:
-    <b>WC</b> = start on the date given, end on that week's <b>Friday</b> (Mon–Fri, ${WORK_START}–${WORK_END}); date is <b>DD/MM/YY</b>.
-    <b>MC</b> = start on the <b>1st</b> of the month and run <b>${MC_DAYS} days</b> (${WORK_START}–${WORK_END}); date is <b>MM/YY</b>.
-    Header lines and blank lines are ignored. If the same job appears twice with different dates it's flagged and the last one wins.
-    <b>Preview</b> shows the exact new dates before anything is written.
+    Run this <b>on each PPM Contract page</b> — it only touches visits belonging to the contract you're on (paste the whole list; it filters).
+    For each match it moves <b>both</b> the contract <b>due-date</b> and the <b>planner appointment</b> to the new window:
+    <b>WC</b> = start that Monday, run to Friday (Mon–Fri, ${WORK_START}–${WORK_END}); date <b>DD/MM/YY</b>.
+    <b>MC</b> = start the 1st, run <b>${MC_DAYS} days</b> (${WORK_START}–${WORK_END}); date <b>MM/YY</b>.
+    Already-deployed visits have a <b>locked</b> due-date — only their planner slot can move; these are flagged.
+    Every change is <b>verified by re-reading</b>, so the summary reflects what actually moved.
   </div>
   <div class="log"></div>
 </div>`;
@@ -540,6 +539,9 @@
         deployEl = panelEl.querySelector('.deploy');
         runBtn = panelEl.querySelector('.btn-run');
 
+        // Persist the paste across contracts (you run this on each contract in turn).
+        try { const saved = localStorage.getItem(PERSIST_KEY); if (saved) jobsInputEl.value = saved; } catch (e) {}
+
         const hdr = panelEl.querySelector('header');
         let drag = null;
         hdr.addEventListener('mousedown', e => { if (e.target.closest('button')) return; drag = { x: e.clientX - panelEl.offsetLeft, y: e.clientY - panelEl.offsetTop }; });
@@ -550,8 +552,7 @@
         panelEl.querySelector('.btn-preview').onclick = onPreview;
         panelEl.querySelector('.btn-run').onclick = onMove;
         panelEl.querySelector('.btn-stop').onclick = onStop;
-        // Invalidate a stale plan if the user edits inputs after previewing.
-        const invalidate = () => { if (lastPlan.length && runBtn) { runBtn.disabled = true; lastPlan = []; setProgress('Inputs changed — Preview again before moving.'); } };
+        const invalidate = () => { try { localStorage.setItem(PERSIST_KEY, jobsInputEl.value); } catch (e) {} if (lastPlan && runBtn) { runBtn.disabled = true; lastPlan = null; setProgress('Inputs changed — Preview again before moving.'); } };
         jobsInputEl.addEventListener('input', invalidate);
     }
 

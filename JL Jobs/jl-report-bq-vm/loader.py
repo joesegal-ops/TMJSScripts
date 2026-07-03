@@ -40,12 +40,13 @@ SCOPE       = env("JL_SCOPE", "JL.Api")
 CLIENT_ID   = env("JL_CLIENT_ID", required=True)
 CLIENT_SECRET = env("JL_CLIENT_SECRET", required=True)
 
+TENANT_ID   = env("JL_TENANT_ID", required=True)         # required on every JL request
 API_PATH    = env("JL_API_PATH", required=True)          # e.g. /job or /visit  (confirm in apidocs.joblogic.com)
-PAGE_PARAM  = env("JL_PAGE_PARAM", "pageNumber")
-SIZE_PARAM  = env("JL_SIZE_PARAM", "pageSize")
-PAGE_SIZE   = int(env("JL_PAGE_SIZE", "200"))
+PAGE_PARAM  = env("JL_PAGE_PARAM", "PageIndex")          # JL uses PageIndex (1-based)
+SIZE_PARAM  = env("JL_SIZE_PARAM", "PageSize")
+PAGE_SIZE   = min(int(env("JL_PAGE_SIZE", "50")), 50)    # JL hard max is 50
 RECORDS_KEY = env("JL_RECORDS_KEY", "")                  # dot-path to the array, "" if body is the array
-EXTRA_QUERY = env("JL_EXTRA_QUERY", "")
+EXTRA_QUERY = env("JL_EXTRA_QUERY", "")                  # e.g. modifiedSince=... once JL confirms the field
 
 BQ_PROJECT  = env("BQ_PROJECT", "importdata-494110")
 BQ_DATASET  = env("BQ_DATASET", "JobLogic")
@@ -105,7 +106,7 @@ def fetch_all(token: str) -> Iterator[dict]:
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     page, total = 1, 0
     while True:
-        params: dict[str, Any] = {PAGE_PARAM: page, SIZE_PARAM: PAGE_SIZE}
+        params: dict[str, Any] = {PAGE_PARAM: page, SIZE_PARAM: PAGE_SIZE, "tenantId": TENANT_ID}
         for kv in filter(None, EXTRA_QUERY.split("&")):
             k, _, v = kv.partition("=")
             params[k] = v
