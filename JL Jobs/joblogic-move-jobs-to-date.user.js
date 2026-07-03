@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Move PPM Visits to a New Date
 // @namespace    https://go.joblogic.com/
-// @version      3.00
+// @version      3.01
 // @description  On a PPM Contract page, paste "PMxxxx/nnn - Move to WC|MC: date" lines. For each visit on THIS contract it moves BOTH the contract due-date (SavePPMContractVisits) and the planner appointment (Scheduler/UpdateVisit) to the new window — WC = that Mon–Fri week, MC = 1st of month for 28 days. Verifies every change by re-reading (won't falsely report success). Headers/blanks and other-contract lines are ignored. Preview first, then Move.
 // @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
@@ -99,7 +99,7 @@
     }
     // ===== end shared dock =====
 
-    const SCRIPT_VERSION = '3.00';   // keep in sync with @version header
+    const SCRIPT_VERSION = '3.01';   // keep in sync with @version header
     const SCRIPT_ID = 'move-jobs-to-date';
     const SCRIPT_LABEL = '📆 Move PPM Visits to Date';
     const SCRIPT_COLOR = '#0b7285';
@@ -328,6 +328,9 @@
             row.visit = v;
             row.jobId = v.JobId;
             row.currentStart = v.StartDate;
+            // Already at the target window? (start + duration both match). If so the
+            // due-date save is skipped; the planner slot is checked separately at move time.
+            row.alreadyDue = norm(v.StartDate) === norm(row.startStr) && Number(v.EstDuration) === row.durMin;
             row.editable = !!v.EditVisitAllowed;
             row.isTeamVisit = v.AssignType === 1;
             row.engineerName = (v.EngineerName || v.EngineerTeamName || v.SubcontractorName || '').trim();
@@ -363,7 +366,8 @@
             for (const r of plan.rows) {
                 if (!r.ok) { log(`✗ ${r.jobNumber}  —  ${r.reason}`, '#f77'); continue; }
                 movable++;
-                const dueNote = r.editable ? 'due-date: editable' : 'due-date: LOCKED (deployed) — planner only';
+                const dueNote = !r.editable ? 'due-date: LOCKED (deployed) — planner only'
+                    : (r.alreadyDue ? 'due-date: already at target' : 'due-date: editable');
                 log(`✓ ${r.jobNumber}  [${r.status || '?'}, ${r.engineerName || 'no engineer'}]\n     ${r.human}   start ${r.startStr}  dur ${r.durMin}m\n     was ${r.currentStart}  •  ${dueNote}`, r.editable ? '#0fa' : '#fd0');
             }
             lastPlan = plan;
@@ -390,17 +394,19 @@
         running = true; setRunningUI(true);
         try {
             // ---- 1) Contract due-date, batched, then verified by re-reading ----
-            const editable = rows.filter(r => r.editable);
+            // Visits already at the target window are counted as done and not re-saved.
             const dueOk = new Set();
-            if (editable.length) {
-                setProgress(`Saving ${editable.length} contract due-date(s)…`);
+            rows.filter(r => r.editable && r.alreadyDue).forEach(r => dueOk.add(r.jobNumber));
+            const toSave = rows.filter(r => r.editable && !r.alreadyDue);
+            if (toSave.length) {
+                setProgress(`Saving ${toSave.length} contract due-date(s)…`);
                 try {
-                    const submit = editable.map(r => buildSubmitVisit(r.visit, r.startStr, r.durMin));
+                    const submit = toSave.map(r => buildSubmitVisit(r.visit, r.startStr, r.durMin));
                     await savePpmVisits(lastPlan.ppmContractId, lastPlan.siteId, submit);
                     await sleep(1000);
                     const ad = await getContractVisits(lastPlan.guid);
                     const after = new Map((ad.Visits || []).map(v => [norm(v.JobNumber), v]));
-                    for (const r of editable) {
+                    for (const r of toSave) {
                         const v = after.get(norm(r.jobNumber));
                         if (v && norm(v.StartDate) === norm(r.startStr)) dueOk.add(r.jobNumber);
                     }
@@ -420,6 +426,8 @@
                     const { visit, typeOfJob } = await getSchedulerVisit(r.jobId);
                     if (!visit) {
                         schedMsg = 'no planner appointment';
+                    } else if (norm(visit.StartDate) === norm(r.startStr) && norm(visit.EndDate) === norm(r.endStr)) {
+                        schedMsg = 'planner already correct';
                     } else {
                         await moveSchedulerVisit({
                             visitId: visit.Id, jobId: r.jobId, jobNumber: r.jobNumber,
@@ -433,7 +441,8 @@
                 }
 
                 const duePart = !r.editable ? 'due-date LOCKED (planner only)'
-                    : (dueOk.has(r.jobNumber) ? 'due-date moved' : 'due-date NOT applied (verify failed)');
+                    : (r.alreadyDue ? 'due-date already correct'
+                    : (dueOk.has(r.jobNumber) ? 'due-date moved' : 'due-date NOT applied (verify failed)'));
                 const good = (r.editable ? dueOk.has(r.jobNumber) : true) && !/FAILED/.test(schedMsg);
                 if (good) done++;
                 log(`${r.jobNumber}  →  ${r.startStr}\n     ${duePart}  |  ${schedMsg}`, good ? '#0fa' : '#fd0');
