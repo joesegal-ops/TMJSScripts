@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Redeploy Visits (from filtered list)
 // @namespace    https://go.joblogic.com/
-// @version      1.26
+// @version      1.27
 // @description  Scan the filtered Jobs list, navigate to each job, and redeploy eligible visits back to the same engineer so the jobs re-appear in their app. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -104,7 +104,7 @@
 
     const SCRIPT_ID = 'redeploy-visits';
     const SCRIPT_LABEL = '🔁 Redeploy Visits';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'Scans the filtered Jobs list, opens each job, and redeploys eligible visits to the same engineer so the jobs reappear in the engineer app. Apply a filter first, then Start.';
 
     if (window.__jlRedeployLoaded) return;

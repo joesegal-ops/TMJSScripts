@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Delete Zero-Value Draft Invoices
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  On the Invoice list page (Draft Invoices tab), scans ALL pages of draft invoices via the SearchInvoice API and deletes every one with a £0.00 grand total. Respects any filters/search currently applied to the list. Scan first (read-only), then Delete with optional dry run. Collapses to a launcher button in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -104,7 +104,7 @@
 
     const SCRIPT_ID = 'delete-zero-drafts';
     const SCRIPT_LABEL = '🗑️ Delete £0 Draft Invoices';
-    const SCRIPT_COLOR = '#a22c2c';
+    const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Scans every page of the Draft Invoices tab (respecting any filters/search you have applied) and deletes all draft invoices with a £0.00 total. Scan is read-only; nothing is deleted until you click Delete and confirm.';
 
     const DELAY_BETWEEN_DELETES = 300;  // ms politeness delay

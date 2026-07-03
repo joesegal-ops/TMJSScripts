@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Procurement -> Joblogic Supplier PO
 // @namespace    http://tampermonkey.net/
-// @version      1.25
+// @version      1.26
 // @description  Floating button on the Procurement Google Group AND Gmail: per email, prompts for job number and creates a Joblogic Supplier PO with "PO Only Supplier" + delivers to the job. v1.1 adds email metadata parsing + Page 2 Additional Instructions / Items autofill. v1.2 force-rebuilds the FAB on script reload so updates take effect, plus console-logs version + click events. v1.3 fixes Trusted Types CSP error on Google Groups (replaces innerHTML with DOM building). v1.4 adds Lightbulbs Direct-style multi-line item parser ("Qty: N" markers); normalises price to unit cost across all parsers. v1.5 adds in-flight guards (prevents duplicate runs from hashchange/popstate) + step-by-step console logging in the Page 2 / Items flow + waits for modal inputs to mount before filling. v1.6 auto-clicks Save in the items modal after filling. v1.7 polls up to 15s for the Add Item button instead of a fixed 600ms sleep (handles slow Page 2 renders). v1.8 handles Heat-and-Plumb-style "Quantity : N    Price : £X.XX" inline format and "Item in this order" header; tabular fallback no longer mistakes qty/price lines for descriptions. v1.9 adds Claude Haiku 4.5 LLM extraction (auto-fallback when regex finds 0 items, plus a manual Re-extract button) with prompt caching, structured outputs, and a settings dialog for the API key. v1.10 adds a Reset button that re-reads the current conversation so the panel can be reused for another email without closing it. v1.11 verifies each item field after setting (retries up to 3x) and runs a final sweep to re-fill any field that got wiped by a later setter — fixes intermittent empty Description. v1.12 detects VAT-inclusive emails (Subtotal == Total with non-zero Taxes line) and divides regex-extracted item prices to net; LLM prompt also instructed to handle VAT correctly. v1.13 also runs the VAT detector on LLM output (it was returning gross prices despite the prompt) — detector compares items_sum against gross/net to decide adjust-or-skip, so it never double-discounts. v1.14 adds Gmail support — same FAB and Create PO flow when an email is open in mail.google.com (uses h2.hP / .gD[email] / .a3s selectors). Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://groups.google.com/a/up-fm.com/g/procurement*
 // @match        https://mail.google.com/*
@@ -110,7 +110,7 @@
 
     const SCRIPT_ID = 'create-po';
     const SCRIPT_LABEL = '📦 Create PO';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'On a Procurement Google Group or Gmail email, creates a Joblogic Supplier PO (PO Only Supplier) and delivers it to the job. Open an email, click, then enter the job number.';
 
     // ---- shared config ----

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Assign Forms to Jobs
 // @namespace    com.joesegal.joblogic
-// @version      1.0.0
+// @version      1.0.1
 // @description  Floating panel: paste a tab-separated table of [Job Number, Form Name, Shown On] and bulk-assign each form to its job via the CompanyForm API. "Required on Visit" is always set true. Works from any go.joblogic.com page (jobs are resolved by number).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -101,7 +101,7 @@
 
     const SCRIPT_ID = 'bulk-assign-forms';
     const SCRIPT_LABEL = '🗂️ Bulk Assign Forms';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'Paste a tab-separated table — Job Number | Form Name | Shown On (one stage per row, blank = no stage). Each form is assigned to its job with "Required on Visit" set on. Works from any Joblogic page.';
 
     // --- "Shown On" stage -> visit-status TypeId (from the Joblogic form rule component) ---

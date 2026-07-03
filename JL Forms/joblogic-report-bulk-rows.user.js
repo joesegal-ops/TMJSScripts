@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JobLogic Report Designer — Bulk Row Insert
 // @namespace    com.joesegal.joblogic
-// @version      1.0.12
+// @version      1.0.13
 // @description  Paste tab- or comma-separated data (3 columns: Location, Result, Comments) and bulk-insert rows into DataBand1 on Page 1 of the Stimulsoft Report Designer. v1.0.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Form/Designer/*
 // @run-at       document-idle
@@ -104,7 +104,7 @@
 
   const SCRIPT_ID = 'report-bulk-rows';
   const SCRIPT_LABEL = '📋 Report Bulk Rows';
-  const SCRIPT_COLOR = '#072d3d';
+  const SCRIPT_COLOR = '#0b7285';
   const SCRIPT_DESC = 'Bulk-inserts rows into the Stimulsoft Report Designer. Open a report, paste tab or comma separated data with 3 columns (Location, Result, Comments), then insert.';
 
   // --- Column layout (inches, Stimulsoft units) — matches existing row 1 template on Page 1 ---

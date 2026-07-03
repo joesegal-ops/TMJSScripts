@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Move Jobs to a New Date
 // @namespace    https://go.joblogic.com/
-// @version      1.00
+// @version      1.01
 // @description  On the Job list, paste a list of job numbers and a target date. For each job it finds the latest visit, reads that visit's engineer, and creates a new visit on the chosen date for the same engineer (same time of day + duration). Preview first, then Create. Collapses to a launcher button in the shared dock.
 // @match        https://go.joblogic.com/Job*
 // @grant        none
@@ -132,7 +132,7 @@
     const SCRIPT_VERSION = '1.00';   // keep in sync with @version header
     const SCRIPT_ID = 'move-jobs-to-date';
     const SCRIPT_LABEL = '📆 Move Jobs to Date';
-    const SCRIPT_COLOR = '#4c1d95';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'On the Job list, paste job numbers + a target date. For each job it reads the latest visit\'s engineer and creates a new visit on that date for the same engineer. Preview first, then Create.';
 
     if (window.__jlMoveJobsToDateLoaded) return;
