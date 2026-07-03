@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Move & Redeploy Yesterday's Visits
 // @namespace    https://go.joblogic.com/
-// @version      1.06
+// @version      1.07
 // @description  On the Planner, finds every New / Not Sent / Read visit dated yesterday across ALL engineers, moves it to today (same time of day) and redeploys it to the same engineer. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Scheduler*
 // @grant        none
@@ -105,7 +105,7 @@
     const SCRIPT_VERSION = '1.06';   // keep in sync with @version header
     const SCRIPT_ID = 'move-redeploy-visits';
     const SCRIPT_LABEL = '📅 Move+Redeploy Visits';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'On the Planner, finds every New / Not Sent / Read visit dated yesterday across all engineers, moves it to today (same time of day) and redeploys it. Open on the Planner page, Scan to preview, then Run.';
 
     if (window.__jlMoveRedeployLoaded) return;

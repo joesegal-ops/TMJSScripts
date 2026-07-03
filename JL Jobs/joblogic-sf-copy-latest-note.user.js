@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic -> Salesforce - Copy Latest Note (single job)
 // @namespace    http://tampermonkey.net/
-// @version      1.11
+// @version      1.12
 // @description  One-click copy of the latest public note (and same-day images) from the open Joblogic job to the related Salesforce Case Chatter publisher. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*
@@ -110,7 +110,7 @@
 
     const SCRIPT_ID = 'sf-copy-latest-note';
     const SCRIPT_LABEL = '🔗 SF Copy Latest Note';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'One-click copy of the latest public note and same-day photos from the open Joblogic job into the linked Salesforce Case Chatter. Open a job, then click.';
 
     // ========================================================================

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cancel Old Open Visits
 // @namespace    http://tampermonkey.net/
-// @version      2.10
+// @version      2.11
 // @description  Loops through jobs in the list, finds open visits (New, Accepted, Travelling, On Site, Left Site) scheduled more than a week ago, and cancels them Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -104,7 +104,7 @@
 
     const SCRIPT_ID = 'cancel-old-visits';
     const SCRIPT_LABEL = '🗑 Cancel Old Visits';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Loops through the jobs list and cancels open visits (New, Accepted, Travelling, On Site, Left Site) scheduled more than a week ago. Apply a filter first, then Start.';
 
     console.log('[JL-CancelVisits] Script loaded');

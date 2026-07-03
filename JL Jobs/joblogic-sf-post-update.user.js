@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic -> Salesforce - Post Visit Update
 // @namespace    http://tampermonkey.net/
-// @version      2.17
+// @version      2.18
 // @description  Collect latest public visit note + same-day images from Joblogic jobs, post them to matching Salesforce Support Request Chatter feed. v2.5: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @match        https://wecompany.lightning.force.com/*
@@ -110,7 +110,7 @@
 
     const SCRIPT_ID = 'sf-post-update';
     const SCRIPT_LABEL = '🔗 SF Post Update';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'Collects the latest public visit note and same-day photos from jobs and posts them to the matching Salesforce Support Request Chatter. Scan the jobs, then run.';
 
     // ========================================================================

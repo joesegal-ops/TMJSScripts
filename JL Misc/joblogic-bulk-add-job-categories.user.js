@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL Bulk Add Job Categories
 // @namespace    https://up-fm.com
-// @version      1.10
+// @version      1.11
 // @description  Bulk-add Job Categories on the Joblogic Library/Misc page. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Library/Misc*
 // @grant        none
@@ -103,7 +103,7 @@
 
     const SCRIPT_ID = 'add-job-categories';
     const SCRIPT_LABEL = '🏷 Add Job Categories';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'Bulk-adds Job Categories on the Joblogic Library page. Open the Library, paste the category names, then add.';
 
   const VERSION      = '1.0';

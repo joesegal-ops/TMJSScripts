@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Update Filtered Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  On the /Job list page: captures the current search filter, walks every page of results, and bulk-updates Status, Category, Job Type, or Tags (add/remove) on every matching job via the API. Also works on Customer detail pages, where it targets all of that customer's jobs.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -161,7 +161,7 @@
 
     const SCRIPT_ID = 'bulk-update-filtered';
     const SCRIPT_LABEL = '📋 Bulk Update Filtered Jobs';
-    const SCRIPT_COLOR = '#1f4e6b';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'Updates Status, Category, Job Type or Tags on EVERY job matching the current view (all pages). On the Jobs list: apply your filter and click Search first. On a Customer page: targets all of that customer\'s jobs automatically. Pick the field + value, then Start. Dry Run first!';
 
     // --- CONFIG ---

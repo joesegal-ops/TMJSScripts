@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.10
+// @version      1.11
 // @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
-// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Finance/joblogic-project-invoicer.user.js
-// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Finance/joblogic-project-invoicer.user.js
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
 // ==/UserScript==
 
 (function () {
@@ -105,7 +105,7 @@
 
     const SCRIPT_ID = 'project-invoicer';
     const SCRIPT_LABEL = '📧 Project Invoicer';
-    const SCRIPT_COLOR = '#0b6e99';
+    const SCRIPT_COLOR = '#7A4FBF';
     const SCRIPT_DESC = 'Bulk-invoice Jobs to the customer. Paste "JobNumber <tab> PO" rows; the script creates each invoice, sets the Customer Order Number to "PROJ | PO-XXXX - SITEID", approves it, then opens the email composer with the standard recipients. Dry-run by default (stops at each email for you to Send). Copy the results into Google Sheets when done.';
 
     // Fixed recipients for every invoice email.

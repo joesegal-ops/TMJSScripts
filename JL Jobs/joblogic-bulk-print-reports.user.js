@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Print Job Reports (Merged PDF)
 // @namespace    http://tampermonkey.net/
-// @version      1.12
+// @version      1.13
 // @description  On /Job with a filter applied, iterates all jobs across all pages, downloads each Job Report (Share > Download), and saves a single merged PDF. v1.3: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Job*
 // @grant        GM_xmlhttpRequest
@@ -106,7 +106,7 @@
 
     const SCRIPT_ID = 'bulk-print-reports';
     const SCRIPT_LABEL = '🖨 Bulk Print Reports';
-    const SCRIPT_COLOR = '#072d3d';
+    const SCRIPT_COLOR = '#0b7285';
     const SCRIPT_DESC = 'On a filtered Jobs list, downloads every job report across all pages and saves one merged PDF. Apply a filter first, then Start.';
 
     // --- CONFIG ---
