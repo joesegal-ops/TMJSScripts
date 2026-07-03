@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Move PPM Visits to a New Date
 // @namespace    https://go.joblogic.com/
-// @version      4.01
-// @description  On the Jobs list, paste "PMxxxx/nnn - Move to WC|MC: date" lines spanning ANY number of PPM contracts. For each visit it moves BOTH the contract due-date (SavePPMContractVisits) and the planner appointment (Scheduler/UpdateVisit) to the new window — WC = that Mon–Fri week, MC = 1st of month for 28 days. Resolves each contract automatically, verifies every change by re-reading, and skips visits already at the target. Preview first, then Move.
+// @version      5.01
+// @description  On the Jobs list, paste "PMxxxx/nnn - Move to WC|MC: date" lines spanning ANY number of PPM contracts. Not-yet-deployed visits are rescheduled in place (contract due-date); deployed visits get a NEW visit reallocated (Scheduler/AddVisit, same engineer, Not Sent) leaving the original untouched. WC = that Mon–Fri week, MC = 1st of month for 28 days. Resolves each contract automatically, verifies every change, skips ones already at the target. Preview first.
 // @match        https://go.joblogic.com/Job*
 // @grant        none
 // @run-at       document-start
@@ -127,11 +127,11 @@
     }
     // ===== end shared dock =====
 
-    const SCRIPT_VERSION = '4.01';   // keep in sync with @version header
+    const SCRIPT_VERSION = '5.01';   // keep in sync with @version header
     const SCRIPT_ID = 'move-jobs-to-date';
     const SCRIPT_LABEL = '📆 Move PPM Visits to Date';
     const SCRIPT_COLOR = '#0b7285';
-    const SCRIPT_DESC = 'On the Jobs list, paste "PMxxxx/nnn - Move to WC|MC: date" lines across any number of PPM contracts. Moves each visit\'s contract due-date AND planner slot to the new window (WC = Mon–Fri week, MC = 1st + 28 days). Resolves contracts automatically, verifies every change, skips ones already there. Preview first.';
+    const SCRIPT_DESC = 'On the Jobs list, paste "PMxxxx/nnn - Move to WC|MC: date" lines across any number of PPM contracts. Not-yet-deployed visits are rescheduled in place (due-date); deployed visits get a NEW visit reallocated (same engineer, Not Sent), leaving the original. WC = Mon–Fri week, MC = 1st + 28 days. Resolves contracts automatically, verifies, skips ones already there. Preview first.';
 
     const PERSIST_KEY = 'jl-move-ppm-visits-input';
 
@@ -146,11 +146,14 @@
     const GET_VISITS_URL     = (guid)  => `/api/Visit/GetVisits/${guid}`;
     const SAVE_PPM_URL       = '/api/Visit/SavePPMContractVisits';
     const GET_VISITSJSON_URL = (jobId) => `/api/Visit/GetVisitsJson?&jobId=${jobId}&isAxaJob=false&isReadOnly=false&pageIndex=1&pageSize=200`;
-    const UPDATE_VISIT_URL   = '/Scheduler/UpdateVisit';
+    const ADD_VISIT_URL      = '/Scheduler/AddVisit';
     const DELAY_BETWEEN      = 400;      // ms between scheduler writes
     const WORK_START         = '08:00';  // working-day start
     const WORK_END           = '17:00';  // working-day end
     const MC_DAYS            = 28;         // MC visits run this many days from the 1st
+    // Visit statuses that don't count as a real allocation — a visit in one of
+    // these sitting at the target date won't block a fresh reallocation.
+    const DEAD_STATUS        = /reject|abort|abandon|cancel/i;
 
     // =========================================================================
     // HELPERS
@@ -303,34 +306,33 @@
         return j;
     }
 
-    // Scheduler side: find the (latest) planner appointment for a job.
-    async function getSchedulerVisit(jobId) {
+    // Scheduler side: all planner appointments for a job (to duplicate-check).
+    async function getSchedulerVisits(jobId) {
         const r = await fetch(GET_VISITSJSON_URL(jobId), { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
         if (!r.ok) throw new Error('GetVisitsJson HTTP ' + r.status);
         const ad = (await r.json()).AdditionalData || {};
-        let best = null, bestKey = '';
-        for (const v of (ad.Visits || [])) {
-            const m = String(v.StartDate || '').match(/^(\d{2})\/(\d{2})\/(\d{4})(?:[ T](\d{2}):(\d{2}))?/);
-            const key = m ? `${m[3]}${m[2]}${m[1]}${m[4] || '00'}${m[5] || '00'}` : '';
-            if (!best || key >= bestKey) { best = v; bestKey = key; }
-        }
-        return { visit: best, typeOfJob: ad.TypeOfJob };
+        return { visits: ad.Visits || [], typeOfJob: ad.TypeOfJob };
     }
-    // Move (re-date) a planner appointment. Keeps its engineer.
-    async function moveSchedulerVisit({ visitId, jobId, jobNumber, typeOfJob, isTeamVisit, deploy, startStr, endStr }) {
+    // Reallocate: create a NEW visit for the engineer on the target window, leaving
+    // any existing (rejected/old) visit untouched. deploy=false → created Not Sent.
+    async function reallocateVisit({ jobId, jobNumber, typeOfJob, engineerId, deploy, startStr, endStr }) {
         const fd = new FormData();
-        fd.append('id', visitId); fd.append('jobId', jobId); fd.append('jobNumber', jobNumber);
-        fd.append('typeOfJob', typeOfJob); fd.append('isTeamVisit', !!isTeamVisit);
-        fd.append('isCopy', false); fd.append('deploy', !!deploy);
-        fd.append('startDate', startStr); fd.append('endDate', endStr);
-        const r = await fetch(UPDATE_VISIT_URL, {
+        fd.append('jobId', jobId);
+        fd.append('typeOfJob', typeOfJob);
+        fd.append('jobNumber', jobNumber);
+        fd.append('deploy', !!deploy);
+        fd.append('engineerId', engineerId);
+        fd.append('startDate', startStr);
+        fd.append('endDate', endStr);
+        fd.append('isDateAndTimeLocked', false);
+        const r = await fetch(ADD_VISIT_URL, {
             method: 'POST', credentials: 'same-origin',
             headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json', '__RequestVerificationToken': getToken() },
             body: fd
         });
         const j = await r.json().catch(() => null);
-        if (!r.ok) throw new Error('UpdateVisit HTTP ' + r.status);
-        if (!j || j.success !== true) throw new Error((j && j.errors && j.errors.join(', ')) || 'UpdateVisit returned failure');
+        if (!r.ok) throw new Error('AddVisit HTTP ' + r.status);
+        if (!j || j.success !== true) throw new Error((j && j.errors && j.errors.join(', ')) || 'AddVisit returned failure');
         return j;
     }
 
@@ -386,8 +388,9 @@
                 if (!v) { row.reason = `not found on contract ${num}`; cx.rows.push(row); continue; }
                 row.visit = v; row.jobId = v.JobId; row.currentStart = v.StartDate;
                 row.alreadyDue = norm(v.StartDate) === norm(row.startStr) && Number(v.EstDuration) === row.durMin;
-                row.editable = !!v.EditVisitAllowed;
-                row.isTeamVisit = v.AssignType === 1;
+                row.editable = !!v.EditVisitAllowed;   // true = reschedule due-date in place; false = deployed → reallocate
+                row.assignType = v.AssignType;
+                row.engineerId = v.EngineerId;
                 row.engineerName = (v.EngineerName || v.EngineerTeamName || v.SubcontractorName || '').trim();
                 row.status = v.JobStatusDescription;
                 row.ok = true;
@@ -431,9 +434,10 @@
                 log(`── ${c.num} ${c.error ? '(' + c.error + ')' : ''}`, c.error ? '#f77' : '#89b4fa');
                 for (const r of c.rows) {
                     if (!r.ok) { log(`   ✗ ${r.jobNumber}  —  ${r.reason}`, '#f77'); continue; }
-                    const dueNote = !r.editable ? 'due-date: LOCKED (deployed) — planner only'
-                        : (r.alreadyDue ? 'due-date: already at target' : 'due-date: editable');
-                    log(`   ✓ ${r.jobNumber}  [${r.status || '?'}, ${r.engineerName || 'no engineer'}]\n        ${r.human}   start ${r.startStr}  dur ${r.durMin}m\n        was ${r.currentStart}  •  ${dueNote}`, r.editable ? '#0fa' : '#fd0');
+                    const action = !r.editable
+                        ? (r.assignType === 0 && r.engineerId ? 'DEPLOYED → reallocate a NEW visit (Not Sent)' : 'DEPLOYED, not an engineer visit → manual')
+                        : (r.alreadyDue ? 'due-date already at target' : 'move due-date in place');
+                    log(`   ✓ ${r.jobNumber}  [${r.status || '?'}, ${r.engineerName || 'no engineer'}]\n        ${r.human}   start ${r.startStr}  dur ${r.durMin}m\n        was ${r.currentStart}  •  ${action}`, r.editable ? '#0fa' : '#89d0fa');
                 }
             }
             lastPlan = plan;
@@ -455,10 +459,10 @@
         const total = planCounts(lastPlan).ok;
         if (!total) { log('Nothing to move.', '#fa0'); return; }
         const deploy = !!(deployEl && deployEl.checked);
-        if (!confirm(`Move ${total} visit(s) across ${lastPlan.contracts.filter(c => !c.error).length} contract(s)?\n\nUpdates the contract due-date (where editable) AND the planner appointment${deploy ? ', deploying each to its engineer' : ''}. Each change is verified; ones already at the target are skipped.`)) return;
+        if (!confirm(`Process ${total} visit(s) across ${lastPlan.contracts.filter(c => !c.error).length} contract(s)?\n\n• Editable visits: reschedule the contract due-date in place.\n• Deployed visits: reallocate a NEW visit${deploy ? ' and deploy it' : ' (Not Sent)'}, leaving the original untouched.\n\nEach change is verified; anything already at the target is skipped.`)) return;
 
         running = true; setRunningUI(true);
-        let done = 0, lockedTotal = 0, attempted = 0;
+        let done = 0, reallocated = 0, attempted = 0;
         try {
             for (const c of lastPlan.contracts) {
                 if (!running) { log('Stopped by user.', '#fa0'); break; }
@@ -467,7 +471,8 @@
                 log('', '#ccc');
                 log(`── ${c.num}`, '#89b4fa');
 
-                // 1) Contract due-date, batched + verified. Already-there = done, not re-saved.
+                // 1) Editable (not-yet-deployed): reschedule the due-date in place.
+                //    Batched + verified. Already-there = done, not re-saved.
                 const dueOk = new Set();
                 rows.filter(r => r.editable && r.alreadyDue).forEach(r => dueOk.add(r.jobNumber));
                 const toSave = rows.filter(r => r.editable && !r.alreadyDue);
@@ -482,37 +487,50 @@
                     } catch (e) { log(`   contract save failed: ${e.message}`, '#f55'); }
                 }
 
-                // 2) Planner appointment, per visit, skipping ones already correct.
+                // 2) Per visit: editable → report the due-date move; deployed → reallocate
+                //    a NEW visit (leave the original untouched), skipping if one already exists there.
                 for (let i = 0; i < rows.length; i++) {
                     if (!running) { log('Stopped by user.', '#fa0'); break; }
                     const r = rows[i]; attempted++;
-                    if (!r.editable) lockedTotal++;
-                    setProgress(`${c.num}: planner ${i + 1}/${rows.length} — ${r.jobNumber}`);
-                    let schedMsg = '';
-                    try {
-                        const { visit, typeOfJob } = await getSchedulerVisit(r.jobId);
-                        if (!visit) schedMsg = 'no planner appointment';
-                        else if (norm(visit.StartDate) === norm(r.startStr) && norm(visit.EndDate) === norm(r.endStr)) schedMsg = 'planner already correct';
-                        else {
-                            await moveSchedulerVisit({ visitId: visit.Id, jobId: r.jobId, jobNumber: r.jobNumber, typeOfJob: typeOfJob != null ? typeOfJob : 2, isTeamVisit: r.isTeamVisit, deploy, startStr: r.startStr, endStr: r.endStr });
-                            schedMsg = 'planner moved' + (deploy ? ' + deployed' : '');
-                        }
-                    } catch (e) { schedMsg = 'planner FAILED: ' + e.message; }
+                    setProgress(`${c.num}: ${i + 1}/${rows.length} — ${r.jobNumber}`);
 
-                    const duePart = !r.editable ? 'due-date LOCKED (planner only)'
-                        : (r.alreadyDue ? 'due-date already correct'
-                        : (dueOk.has(r.jobNumber) ? 'due-date moved' : 'due-date NOT applied (verify failed)'));
-                    const good = (r.editable ? dueOk.has(r.jobNumber) : true) && !/FAILED/.test(schedMsg);
+                    if (r.editable) {
+                        const part = r.alreadyDue ? 'due-date already correct'
+                            : (dueOk.has(r.jobNumber) ? 'due-date moved' : 'due-date NOT applied (verify failed)');
+                        const good = r.alreadyDue || dueOk.has(r.jobNumber);
+                        if (good) done++;
+                        log(`   ${r.jobNumber}  →  ${r.startStr}    ${part}`, good ? '#0fa' : '#fd0');
+                        continue;
+                    }
+
+                    // Deployed → reallocate a new visit.
+                    let msg = '', good = false;
+                    if (r.assignType !== 0 || !r.engineerId) {
+                        msg = 'deployed & not an engineer visit — reallocate skipped (do manually)';
+                    } else {
+                        try {
+                            // A rejected/aborted/abandoned/cancelled visit at the target does NOT
+                            // count — we still want a fresh, live visit allocated there.
+                            const isLiveAtTarget = v => norm(v.StartDate) === norm(r.startStr) && !DEAD_STATUS.test(v.StatusDescription || '');
+                            const { visits, typeOfJob } = await getSchedulerVisits(r.jobId);
+                            if (visits.some(isLiveAtTarget)) { msg = 'already reallocated (live visit exists at target)'; good = true; }
+                            else {
+                                await reallocateVisit({ jobId: r.jobId, jobNumber: r.jobNumber, typeOfJob: typeOfJob != null ? typeOfJob : 2, engineerId: r.engineerId, deploy, startStr: r.startStr, endStr: r.endStr });
+                                await sleep(700);
+                                if ((await getSchedulerVisits(r.jobId)).visits.some(isLiveAtTarget)) { msg = 'reallocated new visit (Not Sent)' + (deploy ? ' + deployed' : ''); good = true; reallocated++; }
+                                else msg = 'reallocate NOT confirmed (no new live visit found)';
+                            }
+                        } catch (e) { msg = 'reallocate FAILED: ' + e.message; }
+                    }
                     if (good) done++;
-                    log(`   ${r.jobNumber}  →  ${r.startStr}\n        ${duePart}  |  ${schedMsg}`, good ? '#0fa' : '#fd0');
+                    log(`   ${r.jobNumber}  →  ${r.startStr}    ${msg}  [${r.engineerName || 'no engineer'}]`, good ? '#0fa' : '#fd0');
                     await sleep(DELAY_BETWEEN);
                 }
             }
             log('', '#ccc');
             log('========== SUMMARY ==========', '#0fa');
-            log(`${done}/${attempted} fully applied.`, '#0fa');
-            if (lockedTotal) log(`${lockedTotal} had a LOCKED contract due-date (deployed) — only their planner slot moved. Re-date those in the planner if needed.`, '#fd0');
-            setProgress(`Done — ${done}/${attempted} moved.`);
+            log(`${done}/${attempted} done  (${reallocated} new visit(s) reallocated).`, '#0fa');
+            setProgress(`Done — ${done}/${attempted}.`);
             lastPlan = null;
             if (runBtn) runBtn.disabled = true;
         } catch (e) {
@@ -580,7 +598,7 @@
     <textarea class="jobs" placeholder="PM0000495/129 - Move to WC: 24/08/26&#10;PM0000603/189 - Move to WC: 24/08/26&#10;&#10;EICR:&#10;PM0001706/005 - Move to WC: 19/10/26&#10;&#10;Emergency Lighting Drain Test:&#10;PM0000495/037 - Move to MC: 12/26"></textarea>
   </label>
   <div class="row">
-    <label class="chk"><input type="checkbox" class="deploy"><span>Deploy (send to engineer) after moving the planner slot</span></label>
+    <label class="chk"><input type="checkbox" class="deploy"><span>Deploy reallocated visits to the engineer (otherwise created Not Sent)</span></label>
   </div>
   <div class="controls">
     <button class="btn-preview">Preview</button>
@@ -588,12 +606,11 @@
     <button class="btn-stop">Stop</button>
   </div>
   <div class="hint">
-    Run this on the <b>Jobs list</b>. It groups your pasted lines by contract, resolves each one automatically, and for every match moves
-    <b>both</b> the contract <b>due-date</b> and the <b>planner appointment</b> to the new window:
-    <b>WC</b> = start that Monday → Friday (Mon–Fri, ${WORK_START}–${WORK_END}); date <b>DD/MM/YY</b>.
-    <b>MC</b> = start the 1st, run <b>${MC_DAYS} days</b> (${WORK_START}–${WORK_END}); date <b>MM/YY</b>.
-    Already-deployed visits have a <b>locked</b> due-date — only their planner slot can move; these are flagged.
-    Visits already at the target are skipped. Every change is <b>verified by re-reading</b>, so the summary reflects what actually moved.
+    Run this on the <b>Jobs list</b>. It groups your pasted lines by contract, resolves each one automatically, and per visit:
+    <b>not-yet-deployed</b> → reschedule the contract <b>due-date in place</b>;
+    <b>deployed</b> → <b>reallocate a NEW visit</b> for the same engineer (Not Sent), leaving the original visit untouched.
+    Windows: <b>WC</b> = that Monday → Friday (${WORK_START}–${WORK_END}), date <b>DD/MM/YY</b>; <b>MC</b> = the 1st for <b>${MC_DAYS} days</b> (${WORK_START}–${WORK_END}), date <b>MM/YY</b>.
+    Anything already at the target is skipped (no duplicate visits). Every change is <b>verified by re-reading</b>.
   </div>
   <div class="log"></div>
 </div>`;
