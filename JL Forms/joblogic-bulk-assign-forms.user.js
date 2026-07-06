@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Assign Forms to Jobs
 // @namespace    com.joesegal.joblogic
-// @version      1.0.1
-// @description  Floating panel: paste a tab-separated table of [Job Number, Form Name, Shown On] and bulk-assign each form to its job via the CompanyForm API. "Required on Visit" is always set true. Works from any go.joblogic.com page (jobs are resolved by number).
+// @version      1.1.0
+// @description  Floating panel: paste a tab-separated table of [Job Number, Form Name, Shown On] and bulk-assign (or bulk-remove) each form to/from its job via the CompanyForm API. On assign, "Required on Visit" is always set true. Works from any go.joblogic.com page (jobs are resolved by number).
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -199,6 +199,26 @@
         return { ok, message: res.j?.Message || (ok ? 'OK' : ('HTTP ' + res.status)) };
     }
 
+    // Find the form rules already assigned to a job that match a form name (exact, case-insensitive).
+    async function findAssignedForms(jobId, name) {
+        const res = await jlPostForm('/companyform/JobFormsSearch', {
+            jobId: jobId, SearchTerm: name, orderBy: '1', pageIndex: '1', pageSize: '50'
+        });
+        const forms = res.j?.AdditionalData?.Forms || [];
+        const key = name.toLowerCase();
+        return forms.filter(f => (f.FormName || '').toLowerCase() === key);
+    }
+
+    // Remove one assigned form rule. Uses DefaultCompanyFormId when present, else the rule's own Id.
+    async function removeFormRule(jobId, rule) {
+        const fields = { jobId: jobId };
+        if (rule.DefaultCompanyFormId) fields.defaultCompanyFormId = rule.DefaultCompanyFormId;
+        else fields.companyFormId = rule.Id;
+        const res = await jlPostForm('/companyform/RemoveFormRuleById', fields);
+        const ok = res.j?.success === true;
+        return { ok, message: res.j?.Message || (ok ? 'OK' : ('HTTP ' + res.status)) };
+    }
+
     // =======================================================================
     // Parsing: tab-separated  Job Number | Form Name | Shown On
     // =======================================================================
@@ -216,7 +236,7 @@
         return { ids, labels };
     }
 
-    function parseTable(text) {
+    function parseTable(text, withStages) {
         const rows = [];
         text.split(/\r?\n/).forEach((line, i) => {
             if (!line.trim()) return;
@@ -230,7 +250,7 @@
             const row = { lineNo: i + 1, jobNo, formName, shownOnCell };
             if (!jobNo) row.error = 'missing job number';
             else if (!formName) row.error = 'missing form name';
-            else {
+            else if (withStages) {
                 const st = parseStages(shownOnCell);
                 if (st.error) row.error = st.error;
                 else { row.stageIds = st.ids; row.stageLabels = st.labels; }
@@ -265,6 +285,22 @@
         header.append(title, closeBtn);
         panel.append(header);
 
+        let mode = 'assign';   // 'assign' | 'remove'
+        const modeWrap = document.createElement('div');
+        modeWrap.style.cssText = 'display:flex;gap:6px;margin-bottom:8px;';
+        const mkModeBtn = (val, label) => {
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.dataset.mode = val;
+            b.style.cssText = 'flex:1;border:1px solid #333;border-radius:4px;padding:6px;cursor:pointer;font-weight:600;background:#0a0a1a;color:#9fb6c4;';
+            b.addEventListener('click', () => setMode(val));
+            return b;
+        };
+        const assignModeBtn = mkModeBtn('assign', 'Assign');
+        const removeModeBtn = mkModeBtn('remove', 'Remove');
+        modeWrap.append(assignModeBtn, removeModeBtn);
+        panel.append(modeWrap);
+
         const help = document.createElement('div');
         help.style.cssText = 'color:#9fb6c4;font-size:11px;line-height:1.45;margin-bottom:8px;';
         help.innerHTML = 'Paste 3 <b>tab-separated</b> columns (copy straight from a spreadsheet):<br>' +
@@ -295,8 +331,17 @@
         document.body.append(root);
         jlRegisterPanel(root, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
 
+        const ASSIGN_HELP = 'Paste 3 <b>tab-separated</b> columns (copy straight from a spreadsheet):<br>' +
+            '<code style="color:#7fd">Job Number&nbsp;⇥&nbsp;Form Name&nbsp;⇥&nbsp;Shown On</code><br>' +
+            'One stage per row. Stages: ' + SHOW_ON_LABELS.join(', ') + '. ' +
+            'Leave <i>Shown On</i> blank for no stage. <b>Required on Visit</b> is always set on.';
+        const REMOVE_HELP = 'Paste 2 <b>tab-separated</b> columns (copy straight from a spreadsheet):<br>' +
+            '<code style="color:#f9a">Job Number&nbsp;⇥&nbsp;Form Name</code><br>' +
+            'Each form matching the name (exactly, case-insensitive) is <b>removed</b> from its job. ' +
+            'A <i>Shown On</i> column, if present, is ignored.';
+
         const refreshPreview = () => {
-            const rows = parseTable(ta.value);
+            const rows = parseTable(ta.value, mode === 'assign');
             const bad = rows.filter(r => r.error).length;
             preview.textContent = rows.length
                 ? `${rows.length} row(s)` + (bad ? ` — ${bad} with errors (will be skipped)` : ' — all parse OK')
@@ -304,10 +349,33 @@
         };
         ta.addEventListener('input', refreshPreview);
 
+        function setMode(m) {
+            mode = m;
+            [assignModeBtn, removeModeBtn].forEach(b => {
+                const on = b.dataset.mode === m;
+                b.style.background = on ? (m === 'remove' ? '#c0392b' : '#0a8') : '#0a0a1a';
+                b.style.color = on ? '#fff' : '#9fb6c4';
+                b.style.borderColor = on ? (m === 'remove' ? '#c0392b' : '#0a8') : '#333';
+            });
+            if (m === 'remove') {
+                help.innerHTML = REMOVE_HELP;
+                ta.placeholder = 'AT0000001\tEmergency Light Testing Certificate';
+                btn.textContent = 'Remove Forms';
+                btn.style.background = '#c0392b';
+            } else {
+                help.innerHTML = ASSIGN_HELP;
+                ta.placeholder = 'AT0000001\tEmergency Light Testing Certificate\tComplete';
+                btn.textContent = 'Assign Forms';
+                btn.style.background = '#0a8';
+            }
+            refreshPreview();
+        }
+
         btn.addEventListener('click', async () => {
-            const rows = parseTable(ta.value);
+            const removing = mode === 'remove';
+            const rows = parseTable(ta.value, !removing);
             if (!rows.length) { status.textContent = 'Nothing to process — paste some rows first.'; return; }
-            btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = 'Assigning…';
+            btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = removing ? 'Removing…' : 'Assigning…';
             const log = [];
             const write = () => { status.textContent = log.join('\n'); status.scrollTop = status.scrollHeight; };
             let done = 0, ok = 0, fail = 0;
@@ -319,21 +387,36 @@
                 try {
                     const job = await resolveJob(row.jobNo);
                     if (!job || !job.id) { log.push(`✗ ${tag} — job not found`); fail++; write(); continue; }
-                    const form = await resolveForm(row.formName);
-                    if (form.error) { log.push(`✗ ${tag} — ${form.error}`); fail++; write(); continue; }
-                    const res = await assignFormRule(job.id, form.guid, row.stageIds, true);
-                    const stageTxt = row.stageLabels.length ? row.stageLabels.join('+') : 'no stage';
-                    if (res.ok) { log.push(`✓ ${tag} → ${stageTxt}, required`); ok++; }
-                    else { log.push(`✗ ${tag} — ${res.message}`); fail++; }
+                    if (removing) {
+                        const matches = await findAssignedForms(job.id, row.formName);
+                        if (!matches.length) { log.push(`✗ ${tag} — not assigned to this job`); fail++; write(); continue; }
+                        let removed = 0; const errs = [];
+                        for (const rule of matches) {
+                            const res = await removeFormRule(job.id, rule);
+                            if (res.ok) removed++; else errs.push(res.message);
+                        }
+                        if (removed && !errs.length) { log.push(`✓ ${tag} — removed${matches.length > 1 ? ' ×' + removed : ''}`); ok++; }
+                        else if (removed) { log.push(`✓ ${tag} — removed ${removed}/${matches.length} (${errs.join('; ')})`); ok++; }
+                        else { log.push(`✗ ${tag} — ${errs.join('; ')}`); fail++; }
+                    } else {
+                        const form = await resolveForm(row.formName);
+                        if (form.error) { log.push(`✗ ${tag} — ${form.error}`); fail++; write(); continue; }
+                        const res = await assignFormRule(job.id, form.guid, row.stageIds, true);
+                        const stageTxt = row.stageLabels.length ? row.stageLabels.join('+') : 'no stage';
+                        if (res.ok) { log.push(`✓ ${tag} → ${stageTxt}, required`); ok++; }
+                        else { log.push(`✗ ${tag} — ${res.message}`); fail++; }
+                    }
                 } catch (e) {
                     log.push(`✗ ${tag} — ${e.message || e}`); fail++;
                 }
                 write();
             }
-            log.push(`\nDone: ${ok} assigned, ${fail} failed.`);
+            log.push(`\nDone: ${ok} ${removing ? 'removed' : 'assigned'}, ${fail} failed.`);
             write();
-            btn.disabled = false; btn.style.opacity = '1'; btn.textContent = 'Assign Forms';
+            btn.disabled = false; btn.style.opacity = '1'; btn.textContent = removing ? 'Remove Forms' : 'Assign Forms';
         });
+
+        setMode('assign');
     }
 
     // SPA-safe: keep the dock button alive across re-renders.

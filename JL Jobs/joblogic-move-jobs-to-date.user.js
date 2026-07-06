@@ -279,7 +279,9 @@
             SubcontractorId: (at === 3) ? v.SubcontractorId : null,
             JobId: v.JobId, JobCategoryId: v.JobCategoryId, Description: v.Description,
             StartDate: startStr, EstDuration: durMin,
-            FixedPriceValue: v.FixedPriceValue, Appointment: v.Appointment, SendEmailSMS: false,
+            // Appointment MUST be a number — a null here makes SavePPMContractVisits
+            // 500 (and takes the whole batch down). The page coerces it too.
+            FixedPriceValue: v.FixedPriceValue, Appointment: v.Appointment || 0, SendEmailSMS: false,
             IsNew: false, Edited: true, IsDeleted: false, FixedDuration: true,
             Assets: [], Tasks: [], LastUsedServiceOrder: v.LastUsedServiceOrder || null,
             TradeId: v.TradeId, TradeDescription: v.TradeDescription,
@@ -298,8 +300,9 @@
             headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json', '__RequestVerificationToken': getToken() },
             body: fd
         });
-        const j = await r.json().catch(() => null);
-        if (!r.ok) throw new Error('SavePPMContractVisits HTTP ' + r.status);
+        const txt = await r.text();
+        let j = null; try { j = JSON.parse(txt); } catch (e) {}
+        if (!r.ok) throw new Error('SavePPMContractVisits HTTP ' + r.status + (txt ? ' — ' + txt.slice(0, 200) : ''));
         // NB: returns success:true even when it silently ignores a non-editable
         // visit — callers MUST verify by re-reading.
         if (!j || j.success !== true) throw new Error((j && j.errors && j.errors.join(', ')) || 'SavePPMContractVisits returned failure');

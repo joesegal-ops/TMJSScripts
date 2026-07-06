@@ -19,13 +19,13 @@ Cloud Scheduler? No.  ──►  e2-micro VM (static external IP)  ──hourly 
                                   │   └─ transform → load into BigQuery (dataset is US multi-region)
 ```
 
-## Why a VM, not the Cloud Run + NAT template (`../jl-bq-pipeline`)
+## Why a VM, not the Cloud Run + NAT template (`jl-bq-pipeline-superseded/`)
 
 For one **hourly** batch, the Cloud Run template's always-on **Cloud NAT (~£25–30/mo)** plus
 a **VPC connector (2× e2-micro, always on)** is ~£40–50/mo and several extra moving parts.
 A single `e2-micro` VM gives a real static external IP directly, runs the same Python, is far
 easier to debug, and costs **~£8–12/mo** (VM ~£5–7 + reserved IP ~£2–3 when attached). The
-whitelisted IP is the same idea either way. Keep `jl-bq-pipeline` as the fallback only if you
+whitelisted IP is the same idea either way. Keep `jl-bq-pipeline-superseded/` as the fallback only if you
 later need many-times-per-hour or serverless scale.
 
 ## Two phases (the whitelist gates everything)
