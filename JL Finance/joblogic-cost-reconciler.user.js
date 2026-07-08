@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.9
+// @version      2.10
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer. v2.2: Copy results now also emits Job ID, Cost description and Chargeable (No for project/quoted jobs) columns so the companion "Enter checked costs into jobs" writer can consume the filtered export.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.9');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.10');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -470,15 +470,16 @@
         if (!raw.trim()) return { headers: [], rows: [] };
         const firstLine = raw.split('\n')[0];
         const delim = firstLine.includes('\t') ? '\t' : ',';
-        const recs = delim === '\t'
-            ? raw.split('\n').map(l => l.split('\t'))
-            : parseCSV(raw);
+        // Quote-aware for BOTH tab- and comma-separated input: a "…"-quoted field may
+        // contain embedded newlines/tabs/commas (Pleo notes often span several lines),
+        // which a naive split() would shred into bogus extra rows.
+        const recs = parseDelimited(raw, delim);
         const headers = recs[0].map(h => h.trim());
         const rows = recs.slice(1).filter(r => r.some(c => (c || '').trim() !== ''))
             .map(r => { const o = {}; headers.forEach((h, i) => o[h] = (r[i] || '').trim()); o.__cells = r; return o; });
         return { headers, rows };
     }
-    function parseCSV(text) {
+    function parseDelimited(text, delim) {
         const out = []; let row = [], field = '', inQ = false;
         for (let i = 0; i < text.length; i++) {
             const c = text[i];
@@ -486,8 +487,8 @@
                 if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
                 else field += c;
             } else {
-                if (c === '"') inQ = true;
-                else if (c === ',') { row.push(field); field = ''; }
+                if (c === '"' && field === '') inQ = true;   // opening quote only at field start
+                else if (c === delim) { row.push(field); field = ''; }
                 else if (c === '\n') { row.push(field); out.push(row); row = []; field = ''; }
                 else field += c;
             }
@@ -955,7 +956,10 @@
 
     function copyResults() {
         const hl = (url, label) => url ? `=HYPERLINK("${url}","${String(label || '').replace(/"/g, '""')}")` : (label || '');
-        const cell = v => String(v == null ? '' : v).replace(/[\t\n]/g, ' ');
+        // Flatten anything that would break a TSV paste into Google Sheets: tabs/newlines
+        // (row/column splitters) -> space, and double-quotes -> single (a stray " otherwise
+        // makes Sheets swallow following cells and mangles the =HYPERLINK formulas).
+        const cell = v => String(v == null ? '' : v).replace(/[\t\r\n]+/g, ' ').replace(/"/g, "'").trim();
         const headers = ['Receipt', 'Merchant', 'Note', 'Owner', 'Date', 'Net', 'Gross', 'Status',
             'Job Found', 'Job ID', 'Undelivered SPO', 'Related Quote', 'Cost near value', 'Matched / closest line', 'Other info', 'Suggested fix',
             'Cost description', 'Chargeable', 'Line ID', 'Line invoiced'];

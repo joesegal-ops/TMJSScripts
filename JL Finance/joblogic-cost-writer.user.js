@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Enter checked costs into jobs (Cost Reconciler writer)
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Companion to the Cost Reconciler. Paste the reconciler's exported rows (after you've filtered out the ones you don't want to touch, header row included). Two actions per row, decided by the Status column: (1) NO COSTS / NOT IN JOB -> ADD a new Material line (cost = Net, qty 1, 20% VAT, the job's default uplift, Xero/Cost description + date; quoted/project jobs flagged Chargeable=No are added NON-chargeable, sell 0). (2) INCORRECT with a Line ID -> FIX the existing line's unit cost to Net (sell follows the line's own uplift) UNLESS it has been invoiced, in which case it is skipped. Every fix is re-read to confirm it applied. Dry-run first, then Confirm & write. No engineer is set (assign in JobLogic).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -35,7 +35,7 @@
 
     const SCRIPT_ID = 'cost-writer';
     const SCRIPT_LABEL = '📥 Enter checked costs into jobs';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.3');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.5');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Paste the Cost Reconciler export (with header row) AFTER filtering out rows you do not want. NO COSTS / NOT IN JOB rows are ADDED as Material lines (non-chargeable for quoted/project jobs); INCORRECT rows have the existing line\'s cost FIXED to Net (skipped if invoiced). Dry-run, review, then Confirm & write.';
 
@@ -77,15 +77,15 @@
         if (!raw.trim()) return { headers: [], rows: [] };
         const firstLine = raw.split('\n')[0];
         const delim = firstLine.includes('\t') ? '\t' : ',';
-        const recs = delim === '\t'
-            ? raw.split('\n').map(l => l.split('\t'))
-            : parseCSV(raw);
+        // Quote-aware for both tab and comma: cells copied from Google Sheets that contain
+        // newlines/tabs/quotes come back "…"-quoted, so a naive split() would shred them.
+        const recs = parseDelimited(raw, delim);
         const headers = recs[0].map(h => h.trim());
         const rows = recs.slice(1).filter(r => r.some(c => (c || '').trim() !== ''))
             .map(r => { const o = {}; headers.forEach((h, i) => o[h] = (r[i] || '').trim()); return o; });
         return { headers, rows };
     }
-    function parseCSV(text) {
+    function parseDelimited(text, delim) {
         const out = []; let row = [], field = '', inQ = false;
         for (let i = 0; i < text.length; i++) {
             const c = text[i];
@@ -93,8 +93,8 @@
                 if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
                 else field += c;
             } else {
-                if (c === '"') inQ = true;
-                else if (c === ',') { row.push(field); field = ''; }
+                if (c === '"' && field === '') inQ = true;   // opening quote only at field start
+                else if (c === delim) { row.push(field); field = ''; }
                 else if (c === '\n') { row.push(field); out.push(row); row = []; field = ''; }
                 else field += c;
             }
