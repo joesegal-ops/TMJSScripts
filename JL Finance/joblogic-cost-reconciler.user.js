@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.10
+// @version      2.11
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer. v2.2: Copy results now also emits Job ID, Cost description and Chargeable (No for project/quoted jobs) columns so the companion "Enter checked costs into jobs" writer can consume the filtered export.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.10');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.11');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -470,10 +470,26 @@
         if (!raw.trim()) return { headers: [], rows: [] };
         const firstLine = raw.split('\n')[0];
         const delim = firstLine.includes('\t') ? '\t' : ',';
-        // Quote-aware for BOTH tab- and comma-separated input: a "…"-quoted field may
-        // contain embedded newlines/tabs/commas (Pleo notes often span several lines),
-        // which a naive split() would shred into bogus extra rows.
-        const recs = parseDelimited(raw, delim);
+        // Pleo notes often contain line breaks. Depending on how the export is copied those
+        // breaks may or may not be wrapped in quotes, so we can't rely on quote-awareness
+        // alone. Instead, fold physical lines back into logical rows: every Pleo data row
+        // starts with a Date in column 1, so any line whose first cell is NOT a date is a
+        // continuation of the previous row's multi-line cell — join it back with a space.
+        const headerFirst = (firstLine.split(delim)[0] || '').trim().toLowerCase();
+        const dateFirstFormat = headerFirst === 'date' || headerFirst.indexOf('date') === 0;
+        let toParse = raw;
+        if (dateFirstFormat) {
+            const isRowStart = ln => /^\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}(?:\t|,|$)/.test(ln.replace(/^"/, ''));
+            const lines = raw.split('\n');
+            const folded = [];
+            lines.forEach((ln, i) => {
+                if (i === 0 || folded.length === 0 || isRowStart(ln)) folded.push(ln);
+                else folded[folded.length - 1] += ' ' + ln;   // continuation of a multi-line cell
+            });
+            toParse = folded.join('\n');
+        }
+        // Quote-aware field split (handles any remaining "…"-quoted cells cleanly).
+        const recs = parseDelimited(toParse, delim);
         const headers = recs[0].map(h => h.trim());
         const rows = recs.slice(1).filter(r => r.some(c => (c || '').trim() !== ''))
             .map(r => { const o = {}; headers.forEach((h, i) => o[h] = (r[i] || '').trim()); o.__cells = r; return o; });
