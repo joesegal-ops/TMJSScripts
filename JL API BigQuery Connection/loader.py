@@ -57,27 +57,37 @@ RATE_MIN_INTERVAL = float(env("JL_MIN_INTERVAL", "0.65"))  # ~92 req/min, under 
 HTTP_TIMEOUT = int(env("JL_HTTP_TIMEOUT", "60"))
 MAX_RETRIES = int(env("JL_MAX_RETRIES", "5"))
 
-# entity GetAll path : BigQuery table  (exact casing from the swagger spec)
+# Date range for endpoints that require it. Data exists from 31 Jul; widen START if unsure.
+START_DATE = env("JL_START_DATE", "2024-07-31T00:00:00Z")
+END_DATE   = env("JL_END_DATE", dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+# entity GetAll path : BigQuery table  (exact casing from the swagger spec).
+# Default = the entities that return data today. Job/Visit/Invoice list is blocked pending
+# Joblogic enabling list/search access (get-by-id works); add them here once unblocked.
 DEFAULT_ENTITIES = [
-    "Job/getall:jobs",
-    "Visit/GetAll:visits",
     "Customer/GetAll:customers",
     "Site/GetAll:sites",
     "Quote/GetAll:quotes",
-    "Invoice/getall:invoices",
     "Asset/GetAll:assets",
     "Subcontractor/GetAll:subcontractors",
     "Supplier/GetAll:suppliers",
     "Part/GetAll:parts",
     "Staff/GetAll:staff",
-    "Timesheet/GetAll:timesheets",
     "Expense/GetAll:expenses",
-    "purchaseorder/getall:purchase_orders",
     "FormsLogbook/getall:forms_logbook",
-    "ContractPurchaseOrder/GetAll:contract_purchase_orders",
-    "JobAsset/GetAll:job_assets",
+    "purchaseorder/getall:purchase_orders",
 ]
+# BLOCKED (list returns 0, pending Joblogic): Job/getall, Visit/GetAll, Invoice/getall
+# SPECIAL: Timesheet/GetAll needs StartDate+EndDate in <=7-day windows (see chunked path, TODO)
 ENTITIES = [e for e in env("JL_ENTITIES", ",".join(DEFAULT_ENTITIES)).split(",") if e.strip()]
+
+# Per-endpoint required search filters (merged into the request body for that entity).
+PER_ENTITY_BODY = {
+    "purchaseorder/getall": {"DateRaised": START_DATE},
+    "Invoice/getall":       {"StartDate": START_DATE, "EndDate": END_DATE},
+}
+# Run-level override, e.g. JL_EXTRA_BODY='{"StartDate":"...","EndDate":"..."}'
+EXTRA_BODY = json.loads(env("JL_EXTRA_BODY", "{}"))
 
 _last_req = [0.0]
 
@@ -98,8 +108,10 @@ def get_token():
     return r.json()["access_token"]
 
 
-def post_page(url, token, page):
+def post_page(url, token, page, extra_body=None):
     body = {"TenantId": TENANT_ID, "PageIndex": page, "PageSize": PAGE_SIZE}
+    if extra_body:
+        body.update(extra_body)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                "Accept": "application/json"}
     for attempt in range(1, MAX_RETRIES + 1):
@@ -119,10 +131,11 @@ def post_page(url, token, page):
 def fetch_entity(path, token):
     """Page through POST /api/v1/<path>. Returns (rows, error_or_None)."""
     url = f"{API_BASE}/api/v1/{path}"
+    extra = {**PER_ENTITY_BODY.get(path, {}), **EXTRA_BODY}
     rows, page = [], 1
     while True:
         try:
-            body = post_page(url, token, page)
+            body = post_page(url, token, page, extra)
         except Exception as e:
             return rows, f"{type(e).__name__}: {e}"
         items = body.get("Items") if isinstance(body, dict) else None
@@ -133,6 +146,42 @@ def fetch_entity(path, token):
         if not items or len(items) < PAGE_SIZE or (total is not None and len(rows) >= total):
             break
         page += 1
+    return rows, None
+
+
+CHUNKED_WEEKLY = {"Timesheet/GetAll"}  # requires StartDate/EndDate in <=7-day windows
+
+
+def fetch_weekly(path, token):
+    """For endpoints capped at a 7-day window: walk START_DATE..END_DATE week by week."""
+    url = f"{API_BASE}/api/v1/{path}"
+    start = dt.datetime.fromisoformat(START_DATE.replace("Z", "+00:00"))
+    end = dt.datetime.fromisoformat(END_DATE.replace("Z", "+00:00"))
+    step = dt.timedelta(days=7)
+    rows, cur = [], start
+    while cur < end:
+        w_end = min(cur + step - dt.timedelta(seconds=1), end)
+        extra = {"StartDate": cur.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "EndDate": w_end.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        page, wrows = 1, 0
+        while True:
+            try:
+                body = post_page(url, token, page, extra)
+            except Exception as e:
+                return rows, f"{type(e).__name__}: {e} (window {extra['StartDate']})"
+            # Timesheet returns a bare list per week (no Items/paging); others use {Items,TotalCount}
+            if isinstance(body, list):
+                rows.extend(body)
+                break
+            items = body.get("Items") if isinstance(body, dict) else None
+            if items is None:
+                return rows, f"no 'Items' (window {extra['StartDate']})"
+            rows.extend(items); wrows += len(items)
+            total = body.get("TotalCount")
+            if not items or len(items) < PAGE_SIZE or (total is not None and wrows >= total):
+                break
+            page += 1
+        cur += step
     return rows, None
 
 
@@ -164,7 +213,7 @@ def main():
         path, _, table = spec.partition(":")
         path, table = path.strip(), table.strip()
         log.info("== %s -> raw.%s ==", path, table)
-        rows, err = fetch_entity(path, token)
+        rows, err = fetch_weekly(path, token) if path in CHUNKED_WEEKLY else fetch_entity(path, token)
         if err:
             log.error("  %s FAILED after %s rows: %s", path, len(rows), err)
             summary.append((table, len(rows), err))

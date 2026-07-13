@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.11
+// @version      2.12
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer. v2.2: Copy results now also emits Job ID, Cost description and Chargeable (No for project/quoted jobs) columns so the companion "Enter checked costs into jobs" writer can consume the filtered export.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.11');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.12');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -287,10 +287,34 @@
         const html = await r.text();
         const doc = new DOMParser().parseFromString(html, 'text/html');
 
-        // Quote reference(s)
-        const quoteLinks = [...doc.querySelectorAll('a[href*="/Quote/Detail/"]')]
-            .map(a => ({ num: a.textContent.replace(/\s+/g, ' ').trim(), href: a.getAttribute('href') }));
-        const quoteLabel = quoteLinks.length ? quoteLinks.map(q => q.num).join(', ') : 'related quote';
+        // Related quote(s). Newer JobLogic embeds them in a `relatedJobsModel` JS object
+        // (RelatedQuotes.Quotes) and NO LONGER renders <a href="/Quote/Detail/…"> links, so
+        // scraping anchors alone misses every quote. Read the model first, then fall back to
+        // any anchor links (older markup). hasActiveQuote ignores rejected/cancelled quotes —
+        // those don't make the job "quoted" for charge purposes.
+        const quotes = [];
+        const seen = new Set();
+        const addQuote = (num, id, status) => {
+            const key = String(num || id || '').toUpperCase();
+            if (!key || seen.has(key)) return;
+            seen.add(key);
+            quotes.push({
+                num: num || ('quote ' + id), id: id || null, status: status || '',
+                rejected: /reject|cancel|declin|lost/i.test(status || ''),
+                href: id ? (location.origin + '/Quote/Detail/' + id) : null
+            });
+        };
+        const model = extractJsLiteral(html, 'relatedJobsModel');
+        ((model && model.RelatedQuotes && model.RelatedQuotes.Quotes) || [])
+            .forEach(q => addQuote(q.QuoteNumber || q.QuoteStringId, q.Id || q.QuoteId, q.StatusDescription));
+        [...doc.querySelectorAll('a[href*="/Quote/Detail/"]')].forEach(a => {
+            const href = a.getAttribute('href') || '';
+            const idm = href.match(/\/Quote\/Detail\/(\d+)/);
+            addQuote(a.textContent.replace(/\s+/g, ' ').trim(), idm ? idm[1] : null, '');
+        });
+        const quoteLinks = quotes.map(q => ({ num: q.num, href: q.href }));
+        const quoteLabel = quotes.length ? quotes.map(q => q.num).join(', ') : null;
+        const hasActiveQuote = quotes.some(q => !q.rejected);
 
         // Embedded cost table (parsed by header, since column order differs from the Costs tab)
         const lines = [];
@@ -320,7 +344,7 @@
                 });
             });
         }
-        return { quoteLabel: quoteLinks.length ? quoteLabel : null, quoteLinks, lines };
+        return { quoteLabel, quoteLinks, lines, hasActiveQuote };
     }
 
     // ===================================================================
@@ -622,10 +646,10 @@
         // ---- gather everything once (used for matching AND the report columns) ----
         const { lines, parseOk } = await getJobCosts(job.id);
         const jobLines = lines.slice();
-        let quoteLabel = null, quoteUrl = '', rwLines = [];
+        let quoteLabel = null, quoteUrl = '', rwLines = [], hasActiveQuote = false;
         try {
             const rw = await getRelatedWorks(job.id);
-            quoteLabel = rw.quoteLabel; rwLines = rw.lines || [];
+            quoteLabel = rw.quoteLabel; rwLines = rw.lines || []; hasActiveQuote = !!rw.hasActiveQuote;
             const ql = (rw.quoteLinks || []).find(q => q.href);
             if (ql) quoteUrl = ql.href.indexOf('http') === 0 ? ql.href : location.origin + ql.href;
         } catch (e) { /* optional */ }
@@ -643,10 +667,10 @@
             spoUrl: (poLines[0] && poLines[0].poId) ? `${location.origin}/PurchaseOrder/Detail/${poLines[0].poId}` : '',
             quoteText: quoteLabel || 'No', quoteUrl,
             jobStatusText: job.jobStatus || '',
-            // Project / quoted jobs are billed off the quote, so any cost added to them
-            // should be NON-chargeable. Carry the flag on every job row so the writer
-            // honours it whichever status the user chooses to enter.
-            chargeable: (isProject || quoteLabel) ? 'No' : 'Yes'
+            // Project jobs and jobs with an ACTIVE (non-rejected) related quote are billed
+            // off the quote, so any cost added to them should be NON-chargeable. Carry the
+            // flag on every job row so the writer honours it whichever status is chosen.
+            chargeable: (isProject || hasActiveQuote) ? 'No' : 'Yes'
         };
         const valOf = l => (l.unit && l.unit > 0) ? l.unit : l.subtotal;
         const fmtLineObj = l => `"${(l.desc || l.category || 'line').slice(0, 48)}" ${valOf(l) != null ? '£' + valOf(l).toFixed(2) : ''}${(l.source || '').indexOf('quote') === 0 ? ' [' + l.source + ']' : ''}`;
@@ -682,7 +706,7 @@
             let landscape = jobValued.length
                 ? `Job has ${jobValued.length} cost line${jobValued.length === 1 ? '' : 's'} (${jobMats.length} material/expense)`
                 : 'Job has NO costs entered yet';
-            if (quoteLabel) landscape += `; related quote ${quoteLabel} has ${quoteValued.length} line${quoteValued.length === 1 ? '' : 's'}`;
+            if (quoteLabel) landscape += `; related quote${quoteLabel.indexOf(',') >= 0 ? 's' : ''} ${quoteLabel}${quoteValued.length ? ` (${quoteValued.length} line${quoteValued.length === 1 ? '' : 's'})` : ''}`;
             else landscape += '; no related quote';
             if (poLines.length) landscape += `; ${poLines.length} undelivered PO line${poLines.length === 1 ? '' : 's'}`;
 
@@ -700,7 +724,8 @@
                     suggest: `Review — may already be on the job as ${fmtLineObj(plausible.line)}. Confirm before adding.` };
             }
             let action;
-            if (isProject || quoteLabel) action = `Project/quoted job${quoteLabel ? ' (quote ' + quoteLabel + ')' : ''} — likely covered/forecasted in the quote. If it must be added, use a NON-CHARGEABLE materials line.`;
+            if (isProject || hasActiveQuote) action = `Project/quoted job${quoteLabel ? ' (quote ' + quoteLabel + ')' : ''} — likely covered/forecasted in the quote. Add it as a NON-CHARGEABLE materials line (£${m.net.toFixed(2)} net).`;
+            else if (quoteLabel) action = `Add it as a materials line (£${m.net.toFixed(2)} net). NOTE: related quote ${quoteLabel} is rejected/cancelled, so the cost is chargeable.`;
             else action = `Not on the job — add it as a materials line (£${m.net.toFixed(2)} net).`;
             // Labour / Travel / Mileage are not material/expense costs — a job whose
             // only lines are those has no costs to reconcile against, so treat it as

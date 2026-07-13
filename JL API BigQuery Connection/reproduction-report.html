@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Joblogic API — list/search returns 0 for Jobs/Visits/Invoices</title>
+<style>
+  :root { color-scheme: light; }
+  body { font: 15px/1.5 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+         color: #1c2330; background: #f5f7fa; margin: 0; padding: 32px; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .meta { color: #55627a; font-size: 13px; margin-bottom: 20px; }
+  .meta code { background: #e7ecf3; padding: 1px 5px; border-radius: 4px; }
+  .lead { background: #fff; border: 1px solid #dbe2ec; border-left: 4px solid #d9822b;
+          padding: 14px 16px; border-radius: 8px; margin-bottom: 24px; }
+  .card { background: #fff; border: 1px solid #dbe2ec; border-radius: 10px; padding: 0 16px 14px;
+          margin-bottom: 16px; overflow: hidden; }
+  .hd { display: flex; align-items: center; gap: 10px; padding: 12px 0 8px; }
+  .badge { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 20px; white-space: nowrap; }
+  .ok  { background: #e3f6ea; color: #1a7f45; }
+  .bad { background: #fde6e6; color: #b5271f; }
+  .title { font-weight: 600; }
+  .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7a8699; margin: 8px 0 3px; }
+  pre { margin: 0; background: #0f1526; color: #d7e0f2; border-radius: 7px; padding: 11px 13px;
+        font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+  .resp0 { border: 1px solid #f2b8b4; }
+  .k { color: #8ab4ff; } .g { color: #7fdca4; } .r { color: #ff9a92; }
+  footer { color: #55627a; font-size: 13px; margin-top: 8px; }
+  @media print { body { background: #fff; padding: 0; } .card, .lead { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Joblogic API — list/search returns 0 for Jobs / Visits / Invoices</h1>
+  <div class="meta">
+    Tenant <code>38a05a51-8e8d-4073-9fbb-9863fd935329</code> ·
+    Source IP (whitelisted) <code>8.228.52.239</code> ·
+    Captured 2026-07-04 · Auth: <code>POST identityservice.joblogic.com/connect/token</code>
+    (client_credentials, scope JL.Api) → 200, Bearer token. Every call below sends that token
+    with <code>Content-Type: application/json</code>.
+  </div>
+
+  <div class="lead">
+    <b>Issue:</b> <code>Job/getall</code>, <code>Invoice/getall</code> and <code>Visit/GetAll</code>
+    (without a JobId) return <b>TotalCount&nbsp;0</b> for every input — yet the same records are
+    fully readable individually (<code>Job/GetById</code>, <code>Visit/GetAll</code> <i>with</i> a
+    JobId), and the identical list pattern returns data for other resources
+    (<code>Customer</code> 43, <code>Quote</code> 3041). Looks like list/search access isn’t
+    enabled for these resources on our API client.
+  </div>
+
+  <!-- template cards -->
+  <div class="card">
+    <div class="hd"><span class="badge ok">WORKS</span><span class="title">Customer / GetAll — control</span></div>
+    <div class="lbl">Request — POST /api/v1/Customer/GetAll</div>
+    <pre>{ "TenantId": "38a05a51-…", "PageIndex": 1, "PageSize": 5 }</pre>
+    <div class="lbl">Response</div>
+    <pre>{ "<span class="k">TotalCount</span>": <span class="g">43</span>, "Items_count": 5,
+  "first_item_sample": { "Id": 6059289, "Name": "Arebyte Gallery", "Active": true } }</pre>
+  </div>
+
+  <div class="card">
+    <div class="hd"><span class="badge ok">WORKS</span><span class="title">Quote / GetAll — control</span></div>
+    <div class="lbl">Request — POST /api/v1/Quote/GetAll</div>
+    <pre>{ "TenantId": "38a05a51-…", "PageIndex": 1, "PageSize": 5 }</pre>
+    <div class="lbl">Response</div>
+    <pre>{ "<span class="k">TotalCount</span>": <span class="g">3041</span>, "Items_count": 5,
+  "first_item_sample": { "QuoteNumber": "UP03209", "CustomerName": "WeWork Ltd" } }</pre>
+  </div>
+
+  <div class="card">
+    <div class="hd"><span class="badge bad">RETURNS 0</span><span class="title">Job / getall — no filter</span></div>
+    <div class="lbl">Request — POST /api/v1/Job/getall</div>
+    <pre>{ "TenantId": "38a05a51-…", "PageIndex": 1, "PageSize": 5 }</pre>
+    <div class="lbl">Response</div>
+    <pre class="resp0">{ "<span class="r">TotalCount</span>": <span class="r">0</span>, "PageIndex": 1, "Items_count": 0 }</pre>
+  </div>
+
+  <div class="card">
+    <div class="hd"><span class="badge bad">RETURNS 0</span><span class="title">Job / getall — full date window (covers known job’s DateLogged 2026-06-02)</span></div>
+    <div class="lbl">Request — POST /api/v1/Job/getall</div>
+    <pre>{ "TenantId": "38a05a51-…", "PageIndex": 1, "PageSize": 5,
+  "StartDate": "2024-07-31T00:00:00Z", "EndDate": "2026-07-04T23:59:59Z" }</pre>
+    <div class="lbl">Response</div>
+    <pre class="resp0">{ "<span class="r">TotalCount</span>": <span class="r">0</span>, "PageIndex": 1, "Items_count": 0 }</pre>
+  </div>
+
+  <div class="card">
+    <div class="hd"><span class="badge bad">RETURNS 0</span><span class="title">Job / getall — SearchTerm = exact known job number</span></div>
+    <div class="lbl">Request — POST /api/v1/Job/getall</div>
+    <pre>{ "TenantId": "38a05a51-…", "PageIndex": 1, "PageSize": 5, "SearchTerm": "PROJ0001624" }</pre>
+    <div class="lbl">Response</div>
+    <pre class="resp0">{ "<span class="r">TotalCount</span>": <span class="r">0</span>, "PageIndex": 1, "Items_count": 0 }</pre>
+  </div>
+
+  <div class="card">
+    <div class="hd"><span class="badge ok">WORKS</span><span class="title">Job / GetById — the SAME job is readable</span></div>
+    <div class="lbl">Request — GET /api/v1/Job/GetById?id=31855808&amp;tenantId=38a05a51-…</div>
+    <pre>(no body)</pre>
+    <div class="lbl">Response</div>
+    <pre>{ "IntId": 31855808, "<span class="g">JobNumber": "PROJ0001624"</span>, "Status": "Allocated",
+  "JobType": "Project", "DateLogged": "2026-06-02T14:03:00", "DateComplete": "2026-06-07T12:24:00" }</pre>
+  </div>
+
+  <div class="card">
+    <div class="hd"><span class="badge ok">WORKS</span><span class="title">Visit / GetAll WITH JobId — that job’s visits are readable</span></div>
+    <div class="lbl">Request — POST /api/v1/Visit/GetAll</div>
+    <pre>{ "TenantId": "38a05a51-…", "PageIndex": 1, "PageSize": 5, "JobId": "31855808" }</pre>
+    <div class="lbl">Response</div>
+    <pre>{ "<span class="g">TotalCount</span>": <span class="g">3</span>, "Items_count": 3,
+  "first_item_sample": { "JobNumber": "PROJ0001624", "EngineerStringId": "E000069" } }</pre>
+  </div>
+
+  <div class="card">
+    <div class="hd"><span class="badge bad">RETURNS 0</span><span class="title">Visit / GetAll — without a JobId</span></div>
+    <div class="lbl">Request — POST /api/v1/Visit/GetAll</div>
+    <pre>{ "TenantId": "38a05a51-…", "PageIndex": 1, "PageSize": 5 }</pre>
+    <div class="lbl">Response</div>
+    <pre class="resp0">{ "<span class="r">TotalCount</span>": <span class="r">0</span>, "PageIndex": 1, "Items_count": 0 }</pre>
+  </div>
+
+  <div class="card">
+    <div class="hd"><span class="badge bad">RETURNS 0</span><span class="title">Invoice / getall — full date window</span></div>
+    <div class="lbl">Request — POST /api/v1/Invoice/getall</div>
+    <pre>{ "TenantId": "38a05a51-…", "PageIndex": 1, "PageSize": 5,
+  "StartDate": "2024-07-31T00:00:00Z", "EndDate": "2026-07-04T23:59:59Z" }</pre>
+    <div class="lbl">Response</div>
+    <pre class="resp0">{ "<span class="r">TotalCount</span>": <span class="r">0</span>, "PageIndex": 1, "Items_count": 0 }</pre>
+  </div>
+
+  <footer>
+    Ruled out on Job/getall: no filter; StartDate/EndDate at every window size (1 day → 2 years);
+    SearchTerm = exact job number; StatusIds; CustomerId; SiteId; IncludeInactive — all TotalCount 0.
+    PageSize valid (5–50); token valid; other endpoints return data on the same token &amp; IP.
+  </footer>
+</div>
+</body>
+</html>
+</content>

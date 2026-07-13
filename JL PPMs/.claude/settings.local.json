@@ -37,7 +37,10 @@
       "Bash(bq --location=US --project_id=vmimporteddata mk --dataset --description \"Raw Joblogic API entities, loaded as-is\" vmimporteddata:raw)",
       "Bash(bq --location=US --project_id=vmimporteddata mk --dataset --description \"Modelled/cleaned tables built from raw\" vmimporteddata:models)",
       "Bash(gcloud compute ssh jl-loader --zone=europe-west2-a --tunnel-through-iap --project=vmimporteddata '--command= *)",
-      "Bash(gcloud compute *)"
+      "Bash(gcloud compute *)",
+      "Bash([ ! -x \"$CHROME\" ])",
+      "Read(//Applications/**)",
+      "Bash(mdls -name kMDItemNumberOfPages '/Users/joesegal/Documents/Claude Code/JL API BigQuery Connection/reproduction-report.pdf')"
     ]
   }
 }
