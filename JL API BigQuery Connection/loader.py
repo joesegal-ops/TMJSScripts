@@ -65,6 +65,8 @@ END_DATE   = env("JL_END_DATE", dt.datetime.now(dt.timezone.utc).strftime("%Y-%m
 # Default = the entities that return data today. Job/Visit/Invoice list is blocked pending
 # Joblogic enabling list/search access (get-by-id works); add them here once unblocked.
 DEFAULT_ENTITIES = [
+    "Job/getall:jobs",
+    "Invoice/getall:invoices",
     "Customer/GetAll:customers",
     "Site/GetAll:sites",
     "Quote/GetAll:quotes",
@@ -77,14 +79,23 @@ DEFAULT_ENTITIES = [
     "FormsLogbook/getall:forms_logbook",
     "purchaseorder/getall:purchase_orders",
 ]
-# BLOCKED (list returns 0, pending Joblogic): Job/getall, Visit/GetAll, Invoice/getall
-# SPECIAL: Timesheet/GetAll needs StartDate+EndDate in <=7-day windows (see chunked path, TODO)
+# Visit/GetAll is per-job (needs a job auto-id) -> handled by load_visits.py, not this list.
+# Timesheet/GetAll needs StartDate+EndDate in <=7-day windows (CHUNKED_WEEKLY, run explicitly).
 ENTITIES = [e for e in env("JL_ENTITIES", ",".join(DEFAULT_ENTITIES)).split(",") if e.strip()]
 
 # Per-endpoint required search filters (merged into the request body for that entity).
+# Job & Invoice need Include* flags or they return 0 (flags default to false).
 PER_ENTITY_BODY = {
     "purchaseorder/getall": {"DateRaised": START_DATE},
-    "Invoice/getall":       {"StartDate": START_DATE, "EndDate": END_DATE},
+    "Job/getall": {
+        "IncludeReactiveJobs": True, "IncludePPMJobs": True, "IncludeInactive": True,
+        "OnlyIncludePrimaryJobTrade": True, "IncludeTags": True, "IncludeContacts": True,
+        "IncludeNotes": True, "OrderBy": 0,
+    },
+    "Invoice/getall": {
+        "IncludeStandardInvoices": True, "IncludePPMInvoices": True, "IncludeCGroupInvoices": True,
+        "IncludeSORInvoices": True, "IncludeRelatedJobInvoices": True, "OrderBy": 0,
+    },
 }
 # Run-level override, e.g. JL_EXTRA_BODY='{"StartDate":"...","EndDate":"..."}'
 EXTRA_BODY = json.loads(env("JL_EXTRA_BODY", "{}"))
