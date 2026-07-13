@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.12
+// @version      2.13
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer. v2.2: Copy results now also emits Job ID, Cost description and Chargeable (No for project/quoted jobs) columns so the companion "Enter checked costs into jobs" writer can consume the filtered export.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.12');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.13');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -730,7 +730,10 @@
             // Labour / Travel / Mileage are not material/expense costs — a job whose
             // only lines are those has no costs to reconcile against, so treat it as
             // NO COSTS (a fresh material line to add), not NOT IN JOB.
-            const noMatchStatus = (jobMats.length || quoteValued.length || poLines.length) ? 'NOT IN JOB' : 'NO COSTS';
+            // NO COSTS only when there is genuinely NOTHING: no material/expense cost lines,
+            // no related quote, and no undelivered PO. A job with a related quote is NOT
+            // "no costs" — it's a quoted job the cost isn't on yet, so NOT IN JOB.
+            const noMatchStatus = (jobMats.length || quoteLabel || poLines.length) ? 'NOT IN JOB' : 'NO COSTS';
             return { ...base, ...cols, status: noMatchStatus, costNear: 'No', costLine: top.length ? fmtLineObj(top[0].line) + ' (not a match)' : '',
                 other: landscape + (cancelled ? `  \u26a0 ${job.jobStatus}` : ''),
                 detail: `Job ${job.jobNumber} found (${job.via}). ${landscape}. No cost line near £${m.net.toFixed(2)} net.${candText}${statusNote}` + (parseOk ? '' : ' [could not read cost model]'),
