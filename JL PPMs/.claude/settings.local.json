@@ -42,7 +42,11 @@
       "Read(//Applications/**)",
       "Bash(mdls -name kMDItemNumberOfPages '/Users/joesegal/Documents/Claude Code/JL API BigQuery Connection/reproduction-report.pdf')",
       "Bash(grep -vi \"numpy\\\\|tunnel\\\\|please see\\\\|troubleshoot\\\\|Recommendation\\\\|^$\")",
-      "Bash(grep -viE \"tunnel|please see|WARNING|^$\")"
+      "Bash(grep -viE \"tunnel|please see|WARNING|^$\")",
+      "Bash(bq rm *)",
+      "Bash(bq --location=EU mk -d --description \"Raw Joblogic API entities \\(EU\\)\" vmimporteddata:raw)",
+      "Bash(bq --location=EU mk -d --description \"Modelled tables built from raw \\(EU\\)\" vmimporteddata:models)",
+      "Bash(bq show *)"
     ]
   }
 }

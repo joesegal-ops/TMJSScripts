@@ -78,6 +78,7 @@ DEFAULT_ENTITIES = [
     "Expense/GetAll:expenses",
     "FormsLogbook/getall:forms_logbook",
     "purchaseorder/getall:purchase_orders",
+    "SubcontractorPurchaseOrder/GetAll:subcontractor_purchase_orders",
 ]
 # Visit/GetAll is per-job (needs a job auto-id) -> handled by load_visits.py, not this list.
 # Timesheet/GetAll needs StartDate+EndDate in <=7-day windows (CHUNKED_WEEKLY, run explicitly).
@@ -87,6 +88,7 @@ ENTITIES = [e for e in env("JL_ENTITIES", ",".join(DEFAULT_ENTITIES)).split(",")
 # Job & Invoice need Include* flags or they return 0 (flags default to false).
 PER_ENTITY_BODY = {
     "purchaseorder/getall": {"DateRaised": START_DATE},
+    "SubcontractorPurchaseOrder/GetAll": {"StartDateRaised": START_DATE, "EndDateRaised": END_DATE},
     "Job/getall": {
         "IncludeReactiveJobs": True, "IncludePPMJobs": True, "IncludeInactive": True,
         "OnlyIncludePrimaryJobTrade": True, "IncludeTags": True, "IncludeContacts": True,
