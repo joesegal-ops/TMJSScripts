@@ -40,7 +40,9 @@
       "Bash(gcloud compute *)",
       "Bash([ ! -x \"$CHROME\" ])",
       "Read(//Applications/**)",
-      "Bash(mdls -name kMDItemNumberOfPages '/Users/joesegal/Documents/Claude Code/JL API BigQuery Connection/reproduction-report.pdf')"
+      "Bash(mdls -name kMDItemNumberOfPages '/Users/joesegal/Documents/Claude Code/JL API BigQuery Connection/reproduction-report.pdf')",
+      "Bash(grep -vi \"numpy\\\\|tunnel\\\\|please see\\\\|troubleshoot\\\\|Recommendation\\\\|^$\")",
+      "Bash(grep -viE \"tunnel|please see|WARNING|^$\")"
     ]
   }
 }

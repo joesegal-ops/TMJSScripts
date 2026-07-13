@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Cost Reconciler (Pleo expenses vs Job Logic costs)
 // @namespace    http://tampermonkey.net/
-// @version      2.13
+// @version      2.14
 // @description  Paste a Pleo/CSV expense export. For each row the script finds the job (by Job ref / Salesforce ref / Quote UP-number), reads the Costs page (and parent/related Quote + delivered PO costs), and checks whether the receipt's NET value is already in the job. Flags rows as Already in job / Incorrect / Possible / On undelivered PO / Not in job / No costs / etc. Stage 1 is read-only analysis; Stage 2 can bulk-add the NO-COSTS rows to their jobs as chargeable material lines (Net, qty 1, 20% VAT, Xero description + date; engineer left blank). v2.0: adds Stage 2 writer. v2.2: Copy results now also emits Job ID, Cost description and Chargeable (No for project/quoted jobs) columns so the companion "Enter checked costs into jobs" writer can consume the filtered export.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -30,7 +30,7 @@
     // This script's identity in the shared dock (keep unique per script).
     const SCRIPT_ID = 'cost-reconciler';
     const SCRIPT_LABEL = '💷 Check costs are in Jobs correctly';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.13');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '2.14');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Checks whether Pleo receipts are entered correctly on their jobs. Paste the Pleo export including the header row and click Check costs. Each row is flagged Already in job, Incorrect (with the reason), or Not found. Read-only.';
     let running = false;
@@ -575,12 +575,36 @@
             receipt: col(row, ['Receipt', 'Expense ID', 'Document Number'])
         };
     }
-    // "30-05-2026" -> "30/05/2026" (JobLogic DateIncurred format)
+    // Normalise a sheet date to JobLogic's DD/MM/YYYY. The tricky part is the order:
+    // Pleo exports are US M/D/YY ("6/26/26" = 26 June) but other sources are D/M/Y. Getting
+    // it wrong yields an invalid month (e.g. 26) and JobLogic silently rejects the cost line.
+    // Per value: whichever field is >12 must be the day; when neither is (ambiguous), use the
+    // order detected across the whole batch (inputDateMDY, defaulting to M/D/Y for Pleo).
     function normalizeDate(s) {
-        const m = String(s || '').match(/(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
+        const m = String(s || '').match(/(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})/);
         if (!m) return '';
-        const d = m[1].padStart(2, '0'), mo = m[2].padStart(2, '0'), y = m[3].length === 2 ? '20' + m[3] : m[3];
-        return `${d}/${mo}/${y}`;
+        const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+        const y = m[3].length === 2 ? '20' + m[3] : m[3];
+        let day, mo;
+        if (a > 12) { day = a; mo = b; }              // first field can only be a day -> D/M/Y
+        else if (b > 12) { mo = a; day = b; }         // second field can only be a day -> M/D/Y
+        else if (inputDateMDY) { mo = a; day = b; }   // ambiguous -> batch order (M/D/Y default)
+        else { day = a; mo = b; }
+        if (mo < 1 || mo > 12) return '';             // still invalid -> leave blank, never emit month>12
+        return `${String(day).padStart(2, '0')}/${String(mo).padStart(2, '0')}/${y}`;
+    }
+    // Detected once per run from the batch: true = source dates are M/D/Y (Pleo/US).
+    let inputDateMDY = true;
+    function detectDateOrder(rows) {
+        let mdy = 0, dmy = 0;
+        for (const r of rows) {
+            const m = String(col(r, ['Date']) || '').match(/(\d{1,2})[-/.](\d{1,2})[-/.]/);
+            if (!m) continue;
+            const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+            if (a > 12 && b <= 12) dmy++;
+            else if (b > 12 && a <= 12) mdy++;
+        }
+        return mdy >= dmy;   // tie / none decisive -> M/D/Y (Pleo default)
     }
 
     // ===================================================================
@@ -797,10 +821,11 @@
         const parsed = parseSheet(pasteArea.value);
         if (!parsed.rows.length) { alert('Paste your sheet rows (with the header row) first.'); return; }
         rows = parsed.rows; results = [];
+        inputDateMDY = detectDateOrder(rows);   // decide M/D/Y vs D/M/Y once for the whole batch
         running = true;
         runBtn.style.display = 'none'; stopBtn.style.display = 'inline-block'; copyBtn.style.display = 'none';
         logArea.innerHTML = ''; resultsBox.innerHTML = '';
-        log(`Parsed ${parsed.headers.length} columns, ${rows.length} rows.`, '#0af');
+        log(`Parsed ${parsed.headers.length} columns, ${rows.length} rows. Dates read as ${inputDateMDY ? 'M/D/Y (US/Pleo)' : 'D/M/Y'}.`, '#0af');
 
         const stats = { ok: 0, incorrect: 0, unclear: 0, possible: 0, po: 0, notin: 0, nocosts: 0, notfound: 0, noref: 0, ignore: 0, noval: 0, err: 0 };
         for (let i = 0; i < rows.length; i++) {

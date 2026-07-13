@@ -1,0 +1,20 @@
+CRON_TZ=Europe/London
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+# --- Joblogic -> BigQuery scheduled loads ---
+# Jobs: incremental upsert hourly (business hours, Mon-Fri) + full refresh nightly (correctness net)
+0 7-19 * * 1-5 root /opt/jl-loader/run_incremental.sh jobs >> /opt/jl-loader/loader.log 2>&1
+0 2 * * *      root /opt/jl-loader/run_tier.sh "Job/getall:jobs" >> /opt/jl-loader/loader.log 2>&1
+# Transactional: incremental upsert every 3h (quotes, invoices, forms); purchase orders full (cheap)
+20 */3 * * * root /opt/jl-loader/run_incremental.sh quotes        >> /opt/jl-loader/loader.log 2>&1
+25 */3 * * * root /opt/jl-loader/run_incremental.sh invoices      >> /opt/jl-loader/loader.log 2>&1
+30 */3 * * * root /opt/jl-loader/run_incremental.sh forms_logbook >> /opt/jl-loader/loader.log 2>&1
+35 */3 * * * root /opt/jl-loader/run_tier.sh "purchaseorder/getall:purchase_orders" >> /opt/jl-loader/loader.log 2>&1
+# Nightly full nets for cheap transactional tables (catch edits the date windows miss)
+40 2 * * * root /opt/jl-loader/run_tier.sh "Quote/GetAll:quotes,FormsLogbook/getall:forms_logbook" >> /opt/jl-loader/loader.log 2>&1
+# Weekly invoices full backfill (chunked monthly to avoid the 403 quota) - Sunday 01:00
+0 1 * * 0 root /opt/jl-loader/run_incremental.sh invoices backfill >> /opt/jl-loader/loader.log 2>&1
+# Reference/dimension data - daily 03:00
+0 3 * * * root /opt/jl-loader/run_tier.sh "Customer/GetAll:customers,Site/GetAll:sites,Staff/GetAll:staff,Supplier/GetAll:suppliers,Subcontractor/GetAll:subcontractors,Asset/GetAll:assets,Part/GetAll:parts,Expense/GetAll:expenses" >> /opt/jl-loader/loader.log 2>&1
+# Timesheets - daily 04:00 (full history, weekly-chunked)
+0 4 * * * root /opt/jl-loader/run_tier.sh "Timesheet/GetAll:timesheets" >> /opt/jl-loader/loader.log 2>&1
