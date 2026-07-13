@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Enter checked costs into jobs (Cost Reconciler writer)
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Companion to the Cost Reconciler. Paste the reconciler's exported rows (after you've filtered out the ones you don't want to touch, header row included). Two actions per row, decided by the Status column: (1) NO COSTS / NOT IN JOB -> ADD a new Material line (cost = Net, qty 1, 20% VAT, the job's default uplift, Xero/Cost description + date; quoted/project jobs flagged Chargeable=No are added NON-chargeable, sell 0). (2) INCORRECT with a Line ID -> FIX the existing line's unit cost to Net (sell follows the line's own uplift) UNLESS it has been invoiced, in which case it is skipped. Every fix is re-read to confirm it applied. Dry-run first, then Confirm & write. No engineer is set (assign in JobLogic).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -35,7 +35,7 @@
 
     const SCRIPT_ID = 'cost-writer';
     const SCRIPT_LABEL = '📥 Enter checked costs into jobs';
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.5');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.6');
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Paste the Cost Reconciler export (with header row) AFTER filtering out rows you do not want. NO COSTS / NOT IN JOB rows are ADDED as Material lines (non-chargeable for quoted/project jobs); INCORRECT rows have the existing line\'s cost FIXED to Net (skipped if invoiced). Dry-run, review, then Confirm & write.';
 
@@ -52,12 +52,20 @@
         return isNaN(n) ? null : Math.abs(n);
     }
     const norm = (s) => String(s == null ? '' : s).toLowerCase().replace(/\s+/g, ' ').trim();
-    // "30-05-2026" / "30/05/26" -> "30/05/2026" (JobLogic DateIncurred date part)
+    // Normalise to JobLogic's DD/MM/YYYY. Input is normally the reconciler's DD/MM/YYYY
+    // output, but be defensive: if a field is >12 it can only be the day (so reorder), and
+    // never emit an invalid month (>12) — that is exactly what silently breaks AddMaterialCosts.
     function normalizeDate(s) {
-        const m = String(s || '').match(/(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
+        const m = String(s || '').match(/(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})/);
         if (!m) return '';
-        const d = m[1].padStart(2, '0'), mo = m[2].padStart(2, '0'), y = m[3].length === 2 ? '20' + m[3] : m[3];
-        return `${d}/${mo}/${y}`;
+        const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+        const y = m[3].length === 2 ? '20' + m[3] : m[3];
+        let day, mo;
+        if (a > 12) { day = a; mo = b; }
+        else if (b > 12) { mo = a; day = b; }
+        else { day = a; mo = b; }        // ambiguous -> D/M/Y (reconciler already emits D/M/Y)
+        if (mo < 1 || mo > 12) return '';
+        return `${String(day).padStart(2, '0')}/${String(mo).padStart(2, '0')}/${y}`;
     }
     function todayDMY() {
         const d = new Date();
