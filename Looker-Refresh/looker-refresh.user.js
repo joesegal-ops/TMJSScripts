@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Looker Studio Auto-Refresh
 // @namespace    https://up-fm.com/
-// @version      1.2.0
+// @version      1.3.0
 // @description  Automatically clicks the "Refresh data" button on Looker Studio / Data Studio reports on a configurable interval.
 // @author       Joe Segal
 // @match        https://datastudio.google.com/*
@@ -47,20 +47,33 @@
     }
 
     function fireClick(el) {
-        // Full gesture — Material/Angular components frequently ignore a bare .click().
+        // Native .click() is enough for this real <button> and — crucially — avoids
+        // constructing a MouseEvent. Under TamperMonkey's sandbox `window` is not a
+        // genuine Window, so `new MouseEvent(type, {view: window})` throws and would
+        // silently abort the whole refresh. So prefer .click(); only fall back to
+        // synthetic events (WITHOUT view) if .click() is somehow unavailable.
+        try {
+            el.click();
+            return;
+        } catch (e) { /* fall through */ }
         for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-            el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true }));
         }
     }
 
     function refreshNow() {
-        const target = findRefreshTarget();
-        if (target) {
-            fireClick(target);
-            status('Refreshed ✓');
-            return true;
+        try {
+            const target = findRefreshTarget();
+            if (target) {
+                fireClick(target);
+                status('Refreshed ✓');
+                return true;
+            }
+            status('Button not found ✗');
+        } catch (e) {
+            status('Error: ' + (e && e.message ? e.message : e));
+            console.error('[Looker Auto-Refresh]', e);
         }
-        status('Button not found ✗');
         return false;
     }
 
