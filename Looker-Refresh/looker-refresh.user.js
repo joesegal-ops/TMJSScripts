@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Looker Studio Auto-Refresh
 // @namespace    https://up-fm.com/
-// @version      1.0.0
+// @version      1.1.0
 // @description  Automatically clicks the "Refresh data" button on Looker Studio / Data Studio reports on a configurable interval.
 // @author       Joe Segal
 // @match        https://datastudio.google.com/*
@@ -16,7 +16,6 @@
 
     // ---- Config -----------------------------------------------------------
     const DEFAULT_INTERVAL_MIN = 5;          // minutes between refreshes
-    const CLICK_SETTLE_MS      = 800;         // wait after opening a menu before looking for the item
 
     // Persisted state (survives reloads)
     let enabled     = GM_getValue('lkr_enabled', false);
@@ -25,41 +24,23 @@
     let timer = null;
 
     // ---- Refresh button finder --------------------------------------------
-    // Looker Studio renders the toolbar with Material components; the exact
-    // markup shifts between edit/view mode and releases, so we search broadly
-    // by aria-label / title / visible text rather than a brittle fixed selector.
+    // Looker Studio renders a <refresh-button> containing a Material icon button
+    // with aria-label="Refresh data". IMPORTANT: this button is deliberately kept
+    // display:none ("hidden-refresh-button") in BOTH edit and view mode — Looker
+    // drives it programmatically. Dispatching a click straight at it still fires
+    // the handler and triggers a data refresh (verified live), so we must NOT gate
+    // on visibility. We just match the aria-label and click it.
     const REFRESH_RE = /refresh (the )?data/i;
 
-    function isVisible(el) {
-        if (!el) return false;
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) return false;
-        const s = getComputedStyle(el);
-        return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
-    }
-
-    // Return the first clickable element whose label/title/text matches REFRESH_RE.
-    function findRefreshTarget(requireVisible = true) {
-        const candidates = document.querySelectorAll(
-            'button, [role="button"], [role="menuitem"], [aria-label], [title], md-menu-item, .mat-mdc-menu-item'
-        );
-        for (const el of candidates) {
-            const label = (el.getAttribute('aria-label') || '') + ' ' +
-                          (el.getAttribute('title') || '') + ' ' +
-                          (el.textContent || '');
-            if (REFRESH_RE.test(label)) {
-                if (!requireVisible || isVisible(el)) return el;
-            }
-        }
-        return null;
-    }
-
-    // The "More options" / overflow menu that sometimes hides Refresh in view mode.
-    function findOverflowMenuButton() {
-        const candidates = document.querySelectorAll('button, [role="button"], [aria-label], [title]');
-        for (const el of candidates) {
+    function findRefreshTarget() {
+        // Fast path: the exact control.
+        const exact = document.querySelector('button[aria-label="Refresh data"]');
+        if (exact) return exact;
+        // Fallback: any button/role=button whose aria-label/title matches, ignoring
+        // visibility (the button is normally hidden).
+        for (const el of document.querySelectorAll('button, [role="button"]')) {
             const label = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '');
-            if (/more options|more_vert|overflow/i.test(label) && isVisible(el)) return el;
+            if (REFRESH_RE.test(label)) return el;
         }
         return null;
     }
@@ -71,30 +52,13 @@
         }
     }
 
-    async function refreshNow() {
-        // 1) Try a directly-visible refresh control.
-        let target = findRefreshTarget(true);
+    function refreshNow() {
+        const target = findRefreshTarget();
         if (target) {
             fireClick(target);
             status('Refreshed ✓');
             return true;
         }
-
-        // 2) Fall back to opening the overflow menu, then clicking Refresh inside it.
-        const menuBtn = findOverflowMenuButton();
-        if (menuBtn) {
-            fireClick(menuBtn);
-            await new Promise(r => setTimeout(r, CLICK_SETTLE_MS));
-            target = findRefreshTarget(true);
-            if (target) {
-                fireClick(target);
-                status('Refreshed ✓');
-                return true;
-            }
-            // Close the menu again so we don't leave it hanging open.
-            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-        }
-
         status('Button not found ✗');
         return false;
     }
