@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Looker Studio Auto-Refresh
 // @namespace    https://up-fm.com/
-// @version      1.1.0
+// @version      1.2.0
 // @description  Automatically clicks the "Refresh data" button on Looker Studio / Data Studio reports on a configurable interval.
 // @author       Joe Segal
 // @match        https://datastudio.google.com/*
@@ -15,6 +15,7 @@
     'use strict';
 
     // ---- Config -----------------------------------------------------------
+    const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '?';
     const DEFAULT_INTERVAL_MIN = 5;          // minutes between refreshes
 
     // Persisted state (survives reloads)
@@ -93,7 +94,7 @@
 
         panel.innerHTML = `
             <div style="font-weight:600;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
-                <span>Looker Auto-Refresh</span>
+                <span>Looker Auto-Refresh <span style="opacity:.5;font-weight:400">v${VERSION}</span></span>
                 <span id="lkr-close" style="cursor:pointer;opacity:.6">–</span>
             </div>
             <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
