@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JL - Bulk Create PPM Contracts (WeWork 26/27)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.2.0
-// @description  Bulk-creates PPM Contracts in Joblogic from an embedded table (site, order no., plan ref, annual value). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract. Preview (dry-run) before creating. v1.2: collapses to a launcher button in the shared dock (drag to reorder).
+// @version      1.3.0
+// @description  Bulk-creates PPM Contracts in Joblogic from a table pasted from Google Sheets (Total for 26/27, Customer Order Number, Site, Plan Reference). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract. Preview (dry-run) before creating. v1.3: paste a TSV instead of hardcoded rows.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
 // @run-at       document-idle
@@ -11,13 +11,16 @@
 
 /*
  * WHAT THIS DOES
- *  - For each row below it looks up the Site by name (via /Site/GetSites), picks the
- *    WeWork Ltd match, reads that site's Billing address, and creates a PPM Contract:
+ *  - You paste the table from Google Sheets (tab-separated). For each row it looks up
+ *    the Site by name (via /Site/GetSites), picks the WeWork Ltd match, reads that
+ *    site's Billing address, and creates a PPM Contract:
  *      Billing type   : Invoice (monthly)          Invoice type : In Advance
  *      Contract value : "Total for 26/27" (ex VAT)  Frequency    : Monthly
  *      Period         : 01/08/2026 - 31/07/2027
- *      Order number   : from the table              Plan Ref     : from the table
+ *      Order number   : from the paste              Plan Ref     : from the paste
  *      Invoice address: Site (Billing) address      Selling rate : Non-Chargeable (JL default)
+ *  - Columns are matched by header name (order doesn't matter). Needed headers:
+ *      "Total for 26/27", "Customer Order Number", "Site", "Plan Reference".
  *  - The payload is the exact object Joblogic's own create form produces
  *    (validated against its Vuex getParamsFromStore) — built here in plain JS so the
  *    script works on any PPMContract page (list or Create).
@@ -25,8 +28,8 @@
  * HOW TO USE
  *  1. Open the PPM Contracts list (or any PPMContract page).
  *  2. Open "Create PPM Contracts" from the Advanced Controls dock (top-right).
- *  3. Click Preview first — resolves all 32 sites, shows matched id / billing address /
- *     value, and flags problems. NOTHING is created during preview.
+ *  3. Paste the sheet (include the header row), then click Preview — resolves each site,
+ *     shows matched id / billing address / value, and flags problems. Nothing is created.
  *  4. Review, then Create all and confirm. Re-running creates DUPLICATES — run once.
  */
 
@@ -122,7 +125,7 @@
   const SCRIPT_ID = 'ppm-create-contracts-from-table';
   const SCRIPT_LABEL = '🏢 Create PPM Contracts';
   const SCRIPT_COLOR = '#1b8a4b';
-  const SCRIPT_DESC = 'Bulk-creates the 32 WeWork 26/27 PPM contracts. Each is an Invoice / Monthly (in advance) contract, 01/08/2026–31/07/2027, value = "Total for 26/27" (ex-VAT), invoiced to the Site (Billing) address, selling rate Non-Chargeable, no job category. Sites + billing addresses are looked up live. Click Preview first (no changes are made); then Create all and confirm. Running Create twice makes DUPLICATES.';
+  const SCRIPT_DESC = 'Paste the WeWork PPM table from Google Sheets (include the header row). Each row becomes an Invoice / Monthly (in advance) contract, 01/08/2026–31/07/2027, value = "Total for 26/27" (ex-VAT), invoiced to the Site (Billing) address, selling rate Non-Chargeable, no job category. Columns are matched by header name (Total for 26/27, Customer Order Number, Site, Plan Reference). Sites + billing addresses are looked up live. Click Preview first (no changes are made); then Create all and confirm. Running Create twice makes DUPLICATES.';
 
   // ----------------------------------------------------------------------------
   // CONFIG
@@ -145,51 +148,63 @@
   };
 
   // ----------------------------------------------------------------------------
-  // DATA  (Total for 26/27 = ex-VAT annual value)
+  // TSV PARSING  (paste straight from Google Sheets / Excel)
+  //   Needed columns (matched by header name, any order):
+  //     "Total for 26/27" (ex-VAT annual value), "Customer Order Number",
+  //     "Site", "Plan Reference".
+  //   If a "Plan Reference" cell is blank it defaults to "<Site>" + RENEWAL.
   // ----------------------------------------------------------------------------
   const RENEWAL = ' - Aug 27 Renewal - Master Contract';
-  function R(total, code, site) {
-    return {
-      total: String(total),
-      order: 'PPM | SCON-00021244 - ' + code,
-      site: site,
-      plan: site + RENEWAL
-    };
+
+  // "£133,697.57" -> 133697.57  (null if not a number)
+  function parseMoney(s) {
+    const n = parseFloat(String(s == null ? '' : s).replace(/[^0-9.\-]/g, ''));
+    return isNaN(n) ? null : n;
   }
-  const ROWS = [
-    R(133697.57,  '1MARKS', "1 Mark Square LON19"),
-    R(105813.44,  '1STKAT', "1 St Katharine's Way LON28"),
-    R(91931.82,   '1WATER', "1 Waterhouse Square LON43"),
-    R(166912.63,  '10DEVO', "10 Devonshire Square LON40"),
-    R(75084.74,   '10FENC', "10 Fenchurch Avenue LON54"),
-    R(1213271.56, '10YORK', "10 York Road LON20"),
-    R(99010.23,   '120MOO', "120 Moorgate LON32"),
-    R(192102.30,  '123BUC', "123 Buckingham Palace Road LON44"),
-    R(155576.44,  '145CIT', "145 City Road LON13"),
-    R(49727.04,   '16GREA', "16 Great Chapel Street LON12"),
-    R(81784.02,   '17STHE', "17 St Helen's Place WE-GB-10735"),
-    R(81088.06,   '184SHE', "184 Shepherd's Bush Road LON37"),
-    R(295719.25,  '2EASTB', "2 Eastbourne Terrace LON09"),
-    R(92922.11,   '2MINST', "2 Minster Court LON53"),
-    R(48147.24,   '26HATT', "26 Hatton Garden LON45"),
-    R(140314.57,  '3WATER', "3 Waterhouse Square LON11"),
-    R(601560.08,  '30CHUR', "30 Churchill Place WE-GB-63302"),
-    R(76076.47,   '33QUEE', "33 Queen Street LON15"),
-    R(262385.70,  '5MERCH', "5 Merchant Square LON49"),
-    R(81057.03,   '5060ST', "50-60 Station Road CBG01"),
-    R(92060.40,   '77LEAD', "77 Leadenhall Street LON50"),
-    R(305857.18,  '8DEVON', "8 Devonshire Square LON41"),
-    R(109904.75,  '80GEOR', "80 George Street EDI01"),
-    R(127885.37,  'ALDWYC', "Aldwych House LON25"),
-    R(304719.19,  'AVIATI', "Aviation House LON23"),
-    R(115360.66,  'DALTON', "Dalton Place MAN03"),
-    R(54802.38,   'KINGSP', "Kings Place LON33"),
-    R(19936.43,   'MEDIUS', "Medius House LON02"),
-    R(278329.34,  'MOORPL', "Moor Place LON06"),
-    R(167224.17,  'NORTHW', "North West House LON17"),
-    R(67314.10,   'STPETE', "St Peter's Square MAN02"),
-    R(136358.47,  'THEMON', "The Monument LON31")
-  ];
+
+  // Returns { rows:[{site,total,order,plan}], errors:[...], mapNote:'' }
+  function parseTsv(text) {
+    const lines = String(text || '').split(/\r?\n/).filter(l => l.trim() !== '');
+    if (!lines.length) return { rows: [], errors: ['Nothing pasted.'] };
+
+    const errors = [];
+    // Default column positions (matches the original sheet layout).
+    let col = { total: 0, order: 4, site: 5, plan: 6 };
+    let start = 0;
+    let mapNote = 'using default column positions (Total=1, Order=5, Site=6, Plan=7)';
+
+    const head = lines[0].split('\t').map(c => c.trim());
+    const looksHeader = head.some(c => /total for|customer order|plan reference|^site$/i.test(c));
+    if (looksHeader) {
+      const totIdx = head.findIndex(c => /^total for/i.test(c) && !/inc\s*vat/i.test(c));
+      const ordIdx = head.findIndex(c => /customer order/i.test(c));
+      const sitIdx = head.findIndex(c => /^site$/i.test(c));
+      const plnIdx = head.findIndex(c => /plan reference/i.test(c));
+      const missing = [];
+      if (totIdx < 0) missing.push('Total for 26/27'); else col.total = totIdx;
+      if (ordIdx < 0) missing.push('Customer Order Number'); else col.order = ordIdx;
+      if (sitIdx < 0) missing.push('Site'); else col.site = sitIdx;
+      if (plnIdx < 0) missing.push('Plan Reference'); else col.plan = plnIdx;
+      if (missing.length) errors.push('Header row is missing column(s): ' + missing.join(', ') + '. Falling back to default positions for those.');
+      mapNote = 'matched columns by header';
+      start = 1;
+    }
+
+    const rows = [];
+    for (let i = start; i < lines.length; i++) {
+      const c = lines[i].split('\t');
+      const site = (c[col.site] || '').trim();
+      const totalRaw = (c[col.total] || '').trim();
+      const total = parseMoney(totalRaw);
+      const order = (c[col.order] || '').trim();
+      const plan = (c[col.plan] || '').trim();
+      if (!site && total == null) continue; // blank line
+      if (!site) { errors.push('Row ' + (i + 1) + ': no Site — skipped'); continue; }
+      if (total == null) { errors.push('Row ' + (i + 1) + ' (' + site + '): value "' + totalRaw + '" is not a number — skipped'); continue; }
+      rows.push({ site, total: total.toFixed(2), order, plan: plan || (site + RENEWAL) });
+    }
+    return { rows, errors, mapNote };
+  }
 
   // ----------------------------------------------------------------------------
   // JOBLOGIC PLUMBING
@@ -391,19 +406,22 @@
     p.id = SCRIPT_ID + '-panel';
     p.style.cssText = 'position:fixed;top:70px;right:8px;z-index:99999;width:460px;max-height:84vh;overflow:auto;background:#fff;border:1px solid #c9d4da;border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,.25);font-family:"Open Sans",sans-serif;font-size:12px;color:#243b46;padding:12px;';
     p.innerHTML = `
-      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🏢 Create PPM Contracts <span style="font-weight:400;color:#888;">v1.2 · ${ROWS.length} sites</span></div>
+      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🏢 Create PPM Contracts <span style="font-weight:400;color:#888;">v1.3</span></div>
       <div style="background:#f4f6f9;border:1px solid #e2e7ee;border-radius:4px;padding:8px;margin-bottom:8px;line-height:1.55;">
         <b>Period</b> ${CFG.startDate} → ${CFG.endDate} &nbsp;·&nbsp; <b>Invoice</b> / Monthly (in advance)<br>
         <b>Value</b> Total for 26/27 (ex-VAT) &nbsp;·&nbsp; <b>Address</b> Site (Billing)<br>
         <b>Selling rate</b> ${esc(CFG.sellingRateDesc)} &nbsp;·&nbsp; <b>Job category</b> none
       </div>
+      <label style="display:block;margin-bottom:8px;">Paste the table from Google Sheets (tab-separated, include the header row):<br>
+        <textarea id="cc-table" spellcheck="false" placeholder="Total for 26/27&#9;Total Inc VAT&#9;Monthly for 26/27&#9;Monthly Inc VAT&#9;Customer Order Number&#9;Site&#9;Plan Reference&#10;£133,697.57&#9;…&#9;PPM | SCON-00021244 - 1MARKS&#9;1 Mark Square LON19&#9;1 Mark Square LON19 - Aug 27 Renewal - Master Contract" style="width:100%;height:130px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre;box-sizing:border-box;"></textarea>
+      </label>
       <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
         <button id="cc-preview" class="jl-button-green" style="padding:5px 14px;">Preview</button>
-        <button id="cc-create" class="jl-button-green" style="padding:5px 14px;">Create all ${ROWS.length}</button>
+        <button id="cc-create" class="jl-button-green" style="padding:5px 14px;">Create all</button>
         <button id="cc-copy" style="padding:5px 12px;margin-left:auto;background:#eef1f5;color:#243b46;border:1px solid #c9d4da;border-radius:4px;cursor:pointer;">Copy log</button>
       </div>
       <div id="cc-status" style="margin-bottom:6px;font-weight:600;"></div>
-      <div id="cc-out" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;max-height:44vh;overflow:auto;background:#fbfcfe;border:1px solid #e2e7ee;border-radius:4px;padding:8px;white-space:pre-wrap;">Click Preview first — nothing is created.</div>`;
+      <div id="cc-out" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;max-height:40vh;overflow:auto;background:#fbfcfe;border:1px solid #e2e7ee;border-radius:4px;padding:8px;white-space:pre-wrap;">Paste the sheet above, then click Preview — nothing is created.</div>`;
     document.body.appendChild(p);
     return p;
   }
@@ -434,11 +452,19 @@
 
     async function run(dryRun) {
       if (running) return;
+
+      const parsed = parseTsv($('table').value);
+      outEl.textContent = '';
+      parsed.errors.forEach(e => log('! ' + e, 'warn'));
+      const ROWS = parsed.rows;
+      if (!ROWS.length) { status('No usable rows — paste the table (with headers) first.', 'err'); return; }
+      log('Parsed ' + ROWS.length + ' row(s) — ' + parsed.mapNote + '.');
+
       if (!getToken()) log('! Anti-forgery token not found on page — POST may be rejected. Try reloading.', 'warn');
 
       if (!dryRun) {
         const yes = window.confirm(
-          'Create ' + ROWS.length + ' PPM contracts for WeWork?\n\n' +
+          'Create ' + ROWS.length + ' PPM contract(s) for WeWork?\n\n' +
           'Period ' + CFG.startDate + ' → ' + CFG.endDate + ', monthly invoicing, value = Total for 26/27.\n\n' +
           'Running this more than once will create DUPLICATES. Continue?'
         );
@@ -447,7 +473,6 @@
 
       running = true; prevBtn.disabled = true; goBtn.disabled = true;
       prevBtn.style.opacity = goBtn.style.opacity = '.5';
-      outEl.textContent = '';
       log(dryRun ? '── PREVIEW (dry run, nothing is created) ──' : '── CREATING CONTRACTS ──');
 
       let done = 0, failed = 0;
