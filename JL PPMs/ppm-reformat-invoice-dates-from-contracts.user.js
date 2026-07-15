@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - PPM Invoice Date & Order No Reformatter
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
-// @description  Paste a list of PPM Contract numbers + one order-number reference. For every DRAFT invoice on each contract, sets Date to Raise = 15th of the month before the line service month, Payment Due = 15th of the service month, and overwrites the Customer Order Number as "PPM - {MON} | {ref} - {SITE}". Preview (dry-run) before applying. Collapses into the shared JL dock.
+// @version      1.2.0
+// @description  Paste a list of PPM Contract numbers + one order-number reference. For every DRAFT invoice on each contract, sets Date to Raise = 15th of the month before the line service month, Payment Due = 30 days after the Date to Raise, and overwrites the Customer Order Number as "PPM - {MMMYY} | {ref} - {SITE}". Preview (dry-run) before applying. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -102,7 +102,7 @@
     const SCRIPT_ID = 'ppm-invoice-reformat';
     const SCRIPT_LABEL = '🗓️ PPM Invoice Dates';
     const SCRIPT_COLOR = '#8a5cf6';
-    const SCRIPT_DESC = 'Paste PPM Contract numbers + one order-number reference. For each contract\'s DRAFT invoices it sets Date to Raise = 15th of the month before the line service month, Payment Due = 15th of the service month, and overwrites the Customer Order Number as "PPM - {MON} | {ref} - {SITE}". Always Preview first.';
+    const SCRIPT_DESC = 'Paste PPM Contract numbers + one order-number reference. For each contract\'s DRAFT invoices it sets Date to Raise = 15th of the month before the line service month, Payment Due = 30 days after the Date to Raise, and overwrites the Customer Order Number as "PPM - {MMMYY} | {ref} - {SITE}". Always Preview first.';
 
     // Throttle to stay under the Joblogic WAF rate limit.
     const DELAY_BETWEEN_INVOICES = 450;
@@ -126,15 +126,20 @@
     // Everything is anchored to the invoice line's SERVICE MONTH M ({mo,y}),
     // read from the line description e.g. "Invoice (01/07/2026 - 31/07/2026)".
     // Date to Raise -> 15th of the month BEFORE M.
-    function raiseToPrevMonth15(m) {
+    function raiseDate(m) {
         let mo = m.mo - 1, y = m.y;
         if (mo < 1) { mo = 12; y--; }
-        return fmtDMY(15, mo, y);
+        return { d: 15, mo, y };
     }
-    // Payment Due -> 15th of M.
-    const dueToSameMonth15 = (m) => fmtDMY(15, m.mo, m.y);
-
-    const monthAbbr = (m) => MONTHS[m.mo - 1];
+    // Payment Due -> 30 days after the Date to Raise.
+    function addDays(dmy, n) {
+        const dt = new Date(Date.UTC(dmy.y, dmy.mo - 1, dmy.d));
+        dt.setUTCDate(dt.getUTCDate() + n);
+        return { d: dt.getUTCDate(), mo: dt.getUTCMonth() + 1, y: dt.getUTCFullYear() };
+    }
+    const dmyStr = (dmy) => fmtDMY(dmy.d, dmy.mo, dmy.y);
+    // Order-number month token, e.g. "JUL26" = month + 2-digit year of the service month.
+    const monthYY = (m) => MONTHS[m.mo - 1] + String(m.y).slice(-2);
 
     // Pull the service month from the invoice line description on the detail page.
     function parseServiceMonth(html) {
@@ -143,8 +148,8 @@
         return { mo: +m[2], y: +m[3], label: 'Invoice (' + m[1] + '/' + m[2] + '/' + m[3] + ' - ' + m[4] + '/' + m[5] + '/' + m[6] + ')' };
     }
 
-    // Build the Customer Order Number: "PPM - {MON} | {ref} - {siteCode}"
-    //   MON      = service month (= month of payment), e.g. JUL
+    // Build the Customer Order Number: "PPM - {MMMYY} | {ref} - {siteCode}"
+    //   MMMYY    = service month + 2-digit year (= month of payment), e.g. JUL26
     //   ref      = user-entered reference for the whole run, e.g. SCON-00021244
     //   siteCode = first 6 non-blank chars of the Site Name, upper-cased
     //              ("1 Mark Square LON19" -> "1MARKS")
@@ -261,11 +266,13 @@
             warnings.push('could not read the invoice line service period ("Invoice (dd/mm/yyyy - dd/mm/yyyy)") — skipped for safety');
             return { changes: {}, warnings, changed: false, skip: true };
         }
-        const mon = monthAbbr(sm);
+        const mon = monthYY(sm);
         if (!siteCode(siteName)) warnings.push('Site Name is blank — order number site code will be empty');
+        const raise = raiseDate(sm);
+        const due = addDays(raise, 30);
         const out = {
-            InvoiceDate: { old: cur.InvoiceDate || '', new: raiseToPrevMonth15(sm) },
-            PaymentDueDate: { old: cur.PaymentDueDate || '', new: dueToSameMonth15(sm) },
+            InvoiceDate: { old: cur.InvoiceDate || '', new: dmyStr(raise) },
+            PaymentDueDate: { old: cur.PaymentDueDate || '', new: dmyStr(due) },
             OrderNumber: { old: cur.OrderNumber || '', new: buildOrderNumber(mon, ref, siteName), mon }
         };
         const changed = Object.values(out).some(v => v.old !== v.new);
@@ -329,9 +336,9 @@
         rules.innerHTML = 'For every <b>DRAFT</b> invoice, anchored to its line service month M ' +
             '(e.g. "Invoice (01/07/2026 - 31/07/2026)" → July):<br>' +
             '• <b>Date to Raise</b> → 15th of the month <i>before</i> M (July → 15/06)<br>' +
-            '• <b>Payment Due</b> → 15th of M (July → 15/07)<br>' +
-            '• <b>Customer Order No</b> → overwritten as <b>PPM - {MON} | {ref} - {SITE}</b><br>' +
-            '&nbsp;&nbsp;&nbsp;e.g. "PPM - JUL | SCON-00021244 - 1MARKS" ({SITE} = first 6 non-blank chars of Site Name)<br>' +
+            '• <b>Payment Due</b> → 30 days after the Date to Raise (15/06 → 15/07)<br>' +
+            '• <b>Customer Order No</b> → overwritten as <b>PPM - {MMMYY} | {ref} - {SITE}</b><br>' +
+            '&nbsp;&nbsp;&nbsp;e.g. "PPM - JUL26 | SCON-00021244 - 1MARKS" ({SITE} = first 6 non-blank chars of Site Name)<br>' +
             '<span style="color:#8fd;">Safe to re-run — results are stable.</span>';
 
         const lbl = document.createElement('div');
@@ -438,7 +445,7 @@
         logArea.innerHTML = '';
         log(dryRun ? '=== PREVIEW (dry run) — no changes will be made ===' : '=== APPLYING CHANGES ===', dryRun ? '#ff0' : '#f66');
         log(terms.length + ' contract(s): ' + terms.join(', '), '#0af');
-        log('Order-number reference: "' + ref + '"  →  PPM - {MON} | ' + ref + ' - {SITE}', '#0af');
+        log('Order-number reference: "' + ref + '"  →  PPM - {MMMYY} | ' + ref + ' - {SITE}', '#0af');
         log('');
 
         const stats = { contracts: 0, invoices: 0, changed: 0, applied: 0, skipped: 0, errors: 0 };
