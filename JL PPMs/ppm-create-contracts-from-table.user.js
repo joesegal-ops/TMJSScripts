@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JL - Bulk Create PPM Contracts (WeWork 26/27)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.1.0
-// @description  Bulk-creates PPM Contracts in Joblogic from an embedded table (site, order no., plan ref, annual value). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract. Preview (dry-run) before creating. Runs on the PPM Contracts list page or the Create page.
+// @version      1.2.0
+// @description  Bulk-creates PPM Contracts in Joblogic from an embedded table (site, order no., plan ref, annual value). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract. Preview (dry-run) before creating. v1.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
 // @run-at       document-idle
@@ -20,19 +20,109 @@
  *      Invoice address: Site (Billing) address      Selling rate : Non-Chargeable (JL default)
  *  - The payload is the exact object Joblogic's own create form produces
  *    (validated against its Vuex getParamsFromStore) — built here in plain JS so the
- *    script no longer needs the Create page's store and works on any PPMContract page.
+ *    script works on any PPMContract page (list or Create).
  *
  * HOW TO USE
- *  1. Open https://go.joblogic.com/PPMContract  (the PPM Contracts list — or the Create page).
- *  2. A panel appears bottom-right. Click "Preview" first — it resolves all 32 sites,
- *     shows the matched site id, billing address and value, and flags any problems.
- *     NOTHING is created during preview.
- *  3. Review, then click "Create all" and confirm. Progress + created contract links
- *     are logged. Re-running creates DUPLICATES, so only run once.
+ *  1. Open the PPM Contracts list (or any PPMContract page).
+ *  2. Open "Create PPM Contracts" from the Advanced Controls dock (top-right).
+ *  3. Click Preview first — resolves all 32 sites, shows matched id / billing address /
+ *     value, and flags problems. NOTHING is created during preview.
+ *  4. Review, then Create all and confirm. Re-running creates DUPLICATES — run once.
  */
 
 (function () {
   'use strict';
+
+  // ===== Shared JL userscript launcher dock (identical in every script) =====
+  const JL_DOCK_ID = 'jl-userscript-dock', JL_ORDER_KEY = 'jl-userscript-dock-order', JL_MIN_KEY = 'jl-userscript-dock-min', JL_TOP_KEY = 'jl-userscript-dock-top';
+  const JL_BTN_CSS = 'color:#fff;padding:7px 13px;border-radius:4px;border:1px solid transparent;cursor:grab;font-family:"Open Sans",sans-serif;font-size:14px;box-shadow:0 1px 3px rgba(0,0,0,.25);white-space:nowrap;';
+  const jlDockList = () => document.getElementById('jl-userscript-dock-list');
+  function jlReadOrder() { try { return JSON.parse(localStorage.getItem(JL_ORDER_KEY)) || []; } catch (e) { return []; } }
+  function jlSaveOrder() { const l = jlDockList(); if (!l) return; localStorage.setItem(JL_ORDER_KEY, JSON.stringify([...l.children].map(b => b.dataset.scriptId).filter(Boolean))); }
+  function jlApplyOrder() { const l = jlDockList(); if (!l) return; [...l.children].sort((a, b) => { const o = jlReadOrder(); let ia = o.indexOf(a.dataset.scriptId), ib = o.indexOf(b.dataset.scriptId); if (ia < 0) ia = 1e9; if (ib < 0) ib = 1e9; return ia - ib; }).forEach(b => l.appendChild(b)); }
+  function jlAfter(l, y) { let c = { o: -Infinity, el: null }; for (const el of l.querySelectorAll('button:not(.jl-dragging)')) { const r = el.getBoundingClientRect(); const off = y - (r.top + r.height / 2); if (off < 0 && off > c.o) c = { o: off, el }; } return c.el; }
+  function jlSetDockMin(min) { const l = jlDockList(), t = document.getElementById('jl-userscript-dock-toggle'); if (l) l.style.display = min ? 'none' : 'flex'; if (t) t.textContent = (min ? '▸' : '▾') + ' Advanced Controls'; try { localStorage.setItem(JL_MIN_KEY, min ? '1' : '0'); } catch (e) {} }
+  function jlGetDock() {
+    if (!document.getElementById('jl-dock-style')) { const st = document.createElement('style'); st.id = 'jl-dock-style'; st.textContent = '#jl-userscript-dock button:hover{filter:brightness(1.18);}'; (document.head || document.documentElement).appendChild(st); }
+    let d = document.getElementById(JL_DOCK_ID);
+    if (!d) { d = document.createElement('div'); d.id = JL_DOCK_ID; document.body.appendChild(d); }
+    d.style.cssText = 'position:fixed;top:80px;right:8px;z-index:100000;display:flex;flex-direction:column;gap:8px;align-items:flex-end;';
+    const savedTop = localStorage.getItem(JL_TOP_KEY); if (savedTop !== null) d.style.top = savedTop + 'px';
+    let t = document.getElementById('jl-userscript-dock-toggle');
+    if (!t) {
+      t = document.createElement('button');
+      t.id = 'jl-userscript-dock-toggle';
+      t.title = 'Drag to move up/down • click to expand/collapse';
+      t.style.cssText = JL_BTN_CSS + 'background:#072d3d;border-color:#072d3d;touch-action:none;';
+      let drag = null;
+      t.addEventListener('pointerdown', e => { drag = { y: e.clientY, top: d.getBoundingClientRect().top, moved: false }; try { t.setPointerCapture(e.pointerId); } catch (x) {} t.style.cursor = 'grabbing'; e.preventDefault(); });
+      t.addEventListener('pointermove', e => { if (!drag) return; const dy = e.clientY - drag.y; if (Math.abs(dy) > 4) drag.moved = true; if (drag.moved) { const top = Math.max(4, Math.min(window.innerHeight - 40, drag.top + dy)); d.style.top = top + 'px'; } });
+      const endDrag = e => { if (!drag) return; const moved = drag.moved; drag = null; t.style.cursor = 'grab'; try { t.releasePointerCapture(e.pointerId); } catch (x) {} if (moved) { try { localStorage.setItem(JL_TOP_KEY, parseInt(d.style.top, 10)); } catch (x) {} } else { jlSetDockMin(jlDockList().style.display !== 'none'); } };
+      t.addEventListener('pointerup', endDrag);
+      t.addEventListener('pointercancel', endDrag);
+      d.appendChild(t);
+    }
+    let l = document.getElementById('jl-userscript-dock-list');
+    if (!l) {
+      l = document.createElement('div');
+      l.id = 'jl-userscript-dock-list';
+      l.style.cssText = 'display:flex;flex-direction:column;gap:8px;align-items:flex-end;';
+      l.addEventListener('dragover', e => { e.preventDefault(); const dr = l.querySelector('.jl-dragging'); if (!dr) return; const a = jlAfter(l, e.clientY); if (a == null) l.appendChild(dr); else l.insertBefore(dr, a); });
+      l.addEventListener('drop', e => { e.preventDefault(); jlSaveOrder(); });
+      d.appendChild(l);
+    }
+    [...d.children].forEach(c => { if (c.id && c.id.indexOf('jl-launch-') === 0) l.appendChild(c); });
+    jlApplyOrder();
+    jlSetDockMin(localStorage.getItem(JL_MIN_KEY) !== '0');
+    return d;
+  }
+  function jlDockButton(id, label, color, onClick, desc) {
+    jlGetDock();
+    const l = jlDockList();
+    let b = document.getElementById('jl-launch-' + id);
+    if (b) return b;
+    const bg = color || '#072d3d';
+    b = document.createElement('button');
+    b.id = 'jl-launch-' + id;
+    b.dataset.scriptId = id;
+    b.textContent = label;
+    b.title = (desc ? desc + '\n\n' : '') + '(click to open • drag to reorder)';
+    b.draggable = true;
+    b.style.cssText = JL_BTN_CSS + 'background:' + bg + ';border-color:' + bg + ';';
+    b.addEventListener('click', () => { if (b.dataset.justDragged) { delete b.dataset.justDragged; return; } onClick(); });
+    b.addEventListener('dragstart', () => { b.classList.add('jl-dragging'); b.style.opacity = '0.4'; });
+    b.addEventListener('dragend', () => { b.classList.remove('jl-dragging'); b.style.opacity = '1'; b.dataset.justDragged = '1'; setTimeout(() => { delete b.dataset.justDragged; }, 60); jlSaveOrder(); });
+    l.appendChild(b);
+    jlApplyOrder();
+    return b;
+  }
+  function jlHelpBanner(text) {
+    const b = document.createElement('div');
+    b.className = 'jl-help-banner';
+    b.style.cssText = 'background:#0e3a4f;color:#e3edf2;font-family:"Open Sans",sans-serif;font-size:11px;line-height:1.45;padding:8px 10px;border-radius:4px;margin:0 0 8px 0;border-left:3px solid #ff7919;';
+    b.textContent = text;
+    return b;
+  }
+  function jlRegisterPanel(panelEl, id, label, color, desc) {
+    const shown = (panelEl.style.display && panelEl.style.display !== 'none') ? panelEl.style.display : 'block';
+    panelEl.style.display = 'none';
+    const btn = jlDockButton(id, label, color, () => {
+      const opening = panelEl.style.display === 'none';
+      panelEl.style.display = opening ? shown : 'none';
+      if (opening && desc) {
+        const box = getComputedStyle(panelEl).position === 'fixed' ? panelEl : (panelEl.firstElementChild || panelEl);
+        if (box && !box.querySelector(':scope > .jl-help-banner')) box.insertBefore(jlHelpBanner(desc), box.firstChild);
+      }
+      btn.style.boxShadow = opening ? '0 0 0 2px #fff, 0 1px 3px rgba(0,0,0,.25)' : '0 1px 3px rgba(0,0,0,.25)';
+    }, desc);
+    return btn;
+  }
+  // ===== end shared dock =====
+
+  const SCRIPT_ID = 'ppm-create-contracts-from-table';
+  const SCRIPT_LABEL = '🏢 Create PPM Contracts';
+  const SCRIPT_COLOR = '#1b8a4b';
+  const SCRIPT_DESC = 'Bulk-creates the 32 WeWork 26/27 PPM contracts. Each is an Invoice / Monthly (in advance) contract, 01/08/2026–31/07/2027, value = "Total for 26/27" (ex-VAT), invoiced to the Site (Billing) address, selling rate Non-Chargeable, no job category. Sites + billing addresses are looked up live. Click Preview first (no changes are made); then Create all and confirm. Running Create twice makes DUPLICATES.';
 
   // ----------------------------------------------------------------------------
   // CONFIG
@@ -171,7 +261,6 @@
     const wanted = name.trim().toLowerCase();
     let exact = res.data.filter(s => (s.Name || '').trim().toLowerCase() === wanted);
     if (exact.length === 0) throw new Error('No site named exactly "' + name + '" (got ' + res.data.length + ' fuzzy result(s))');
-    // prefer the expected customer
     let pref = exact.filter(s => s.CustomerId === CFG.expectedCustomerId);
     if (pref.length === 0) pref = exact.filter(s => (s.CustomerName || '').toLowerCase().indexOf('wework') !== -1);
     const chosen = pref.length ? pref : exact;
@@ -286,75 +375,60 @@
     const raw = await r.text();
     let d = null;
     try { d = JSON.parse(raw); } catch (e) {}
-    if (d && d.success) return { ok: true, id: d.AdditionalData, resp: d, params: params };
-    return { ok: false, status: r.status, resp: d, raw: raw.slice(0, 300), params: params };
+    if (d && d.success) return { ok: true, id: d.AdditionalData, resp: d };
+    return { ok: false, status: r.status, resp: d, raw: raw.slice(0, 300) };
   }
 
   // ----------------------------------------------------------------------------
-  // UI
+  // UI  (house style: Open Sans panel top-right, collapses into the shared dock)
   // ----------------------------------------------------------------------------
-  let running = false;
   const money = n => '£' + Number(n).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const esc = s => String(s == null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  let running = false;
 
-  function buildUI() {
-    const wrap = document.createElement('div');
-    wrap.id = 'ppm-bulk-panel';
-    wrap.innerHTML = `
-      <style>
-        #ppm-bulk-panel{position:fixed;right:16px;bottom:16px;z-index:999999;width:480px;max-height:70vh;
-          display:flex;flex-direction:column;background:#fff;border:1px solid #c8ced6;border-radius:10px;
-          box-shadow:0 8px 28px rgba(0,0,0,.22);font:12px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#1f2733;}
-        #ppm-bulk-panel h3{margin:0;padding:10px 12px;font-size:13px;background:#0d3b66;color:#fff;border-radius:10px 10px 0 0;
-          display:flex;justify-content:space-between;align-items:center;}
-        #ppm-bulk-panel .pb-body{padding:10px 12px;overflow:auto;}
-        #ppm-bulk-panel .pb-cfg{background:#f4f6f9;border:1px solid #e2e7ee;border-radius:6px;padding:8px;margin-bottom:8px;color:#3a4658;}
-        #ppm-bulk-panel .pb-cfg b{color:#0d3b66;}
-        #ppm-bulk-panel .pb-btns{display:flex;gap:8px;margin-bottom:8px;}
-        #ppm-bulk-panel button{cursor:pointer;border:0;border-radius:6px;padding:8px 12px;font-weight:600;font-size:12px;}
-        #ppm-bulk-panel .pb-prev{background:#e7eefc;color:#1b4fbf;}
-        #ppm-bulk-panel .pb-go{background:#1b8a4b;color:#fff;}
-        #ppm-bulk-panel button:disabled{opacity:.5;cursor:not-allowed;}
-        #ppm-bulk-panel .pb-min{background:transparent;color:#fff;font-size:16px;padding:0 6px;}
-        #ppm-bulk-panel .pb-log{white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;
-          background:#0b1220;color:#d7e2f0;border-radius:6px;padding:8px;max-height:32vh;overflow:auto;}
-        #ppm-bulk-panel .pb-log .ok{color:#57d982;}
-        #ppm-bulk-panel .pb-log .err{color:#ff8080;}
-        #ppm-bulk-panel .pb-log .warn{color:#ffd166;}
-        #ppm-bulk-panel a{color:#7db4ff;}
-        #ppm-bulk-panel.min .pb-body{display:none;}
-      </style>
-      <h3><span>PPM Bulk Create — ${ROWS.length} WeWork contracts</span>
-        <button class="pb-min" title="minimise">–</button></h3>
-      <div class="pb-body">
-        <div class="pb-cfg">
-          <div><b>Period:</b> ${CFG.startDate} → ${CFG.endDate} &nbsp; <b>Billing:</b> Invoice / Monthly (in advance)</div>
-          <div><b>Value:</b> "Total for 26/27" (ex-VAT) &nbsp; <b>Address:</b> Site (Billing)</div>
-          <div><b>Selling rate:</b> ${CFG.sellingRateDesc} &nbsp; <b>Job category:</b> (none)</div>
-        </div>
-        <div class="pb-btns">
-          <button class="pb-prev">🔍 Preview (no changes)</button>
-          <button class="pb-go">⚙️ Create all ${ROWS.length}</button>
-          <button class="pb-copy" style="background:#e2e7ee;color:#3a4658;margin-left:auto;">Copy log</button>
-        </div>
-        <div class="pb-log">Ready. Click Preview first.\n</div>
-      </div>`;
-    document.body.appendChild(wrap);
+  function buildPanel() {
+    const p = document.createElement('div');
+    p.id = SCRIPT_ID + '-panel';
+    p.style.cssText = 'position:fixed;top:70px;right:8px;z-index:99999;width:460px;max-height:84vh;overflow:auto;background:#fff;border:1px solid #c9d4da;border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,.25);font-family:"Open Sans",sans-serif;font-size:12px;color:#243b46;padding:12px;';
+    p.innerHTML = `
+      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🏢 Create PPM Contracts <span style="font-weight:400;color:#888;">v1.2 · ${ROWS.length} sites</span></div>
+      <div style="background:#f4f6f9;border:1px solid #e2e7ee;border-radius:4px;padding:8px;margin-bottom:8px;line-height:1.55;">
+        <b>Period</b> ${CFG.startDate} → ${CFG.endDate} &nbsp;·&nbsp; <b>Invoice</b> / Monthly (in advance)<br>
+        <b>Value</b> Total for 26/27 (ex-VAT) &nbsp;·&nbsp; <b>Address</b> Site (Billing)<br>
+        <b>Selling rate</b> ${esc(CFG.sellingRateDesc)} &nbsp;·&nbsp; <b>Job category</b> none
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
+        <button id="cc-preview" class="jl-button-green" style="padding:5px 14px;">Preview</button>
+        <button id="cc-create" class="jl-button-green" style="padding:5px 14px;">Create all ${ROWS.length}</button>
+        <button id="cc-copy" style="padding:5px 12px;margin-left:auto;background:#eef1f5;color:#243b46;border:1px solid #c9d4da;border-radius:4px;cursor:pointer;">Copy log</button>
+      </div>
+      <div id="cc-status" style="margin-bottom:6px;font-weight:600;"></div>
+      <div id="cc-out" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;max-height:44vh;overflow:auto;background:#fbfcfe;border:1px solid #e2e7ee;border-radius:4px;padding:8px;white-space:pre-wrap;">Click Preview first — nothing is created.</div>`;
+    document.body.appendChild(p);
+    return p;
+  }
 
-    const logEl = wrap.querySelector('.pb-log');
-    const prevBtn = wrap.querySelector('.pb-prev');
-    const goBtn = wrap.querySelector('.pb-go');
-    wrap.querySelector('.pb-min').onclick = () => wrap.classList.toggle('min');
-    wrap.querySelector('.pb-copy').onclick = () => { navigator.clipboard.writeText(logEl.textContent); };
+  function init() {
+    const panel = buildPanel();
+    jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
 
+    const $ = id => panel.querySelector('#cc-' + id);
+    const outEl = $('out');
+    const statusEl = $('status');
+    const prevBtn = $('preview'), goBtn = $('create');
+
+    const COL = { ok: '#1b7a3a', err: '#b71c1c', warn: '#9a6b00' };
+    const status = (msg, cls) => { statusEl.textContent = msg; statusEl.style.color = cls ? COL[cls] : '#243b46'; };
     const log = (msg, cls) => {
       const span = document.createElement('span');
-      if (cls) span.className = cls;
+      if (cls) span.style.color = COL[cls];
       span.textContent = msg + '\n';
-      logEl.appendChild(span);
-      logEl.scrollTop = logEl.scrollHeight;
+      outEl.appendChild(span);
+      outEl.scrollTop = outEl.scrollHeight;
     };
-    const logHtml = (html) => { logEl.insertAdjacentHTML('beforeend', html); logEl.scrollTop = logEl.scrollHeight; };
+    const logHtml = (html) => { outEl.insertAdjacentHTML('beforeend', html); outEl.scrollTop = outEl.scrollHeight; };
 
+    $('copy').onclick = () => { navigator.clipboard.writeText(outEl.textContent); };
     prevBtn.onclick = () => run(true);
     goBtn.onclick = () => run(false);
 
@@ -368,17 +442,19 @@
           'Period ' + CFG.startDate + ' → ' + CFG.endDate + ', monthly invoicing, value = Total for 26/27.\n\n' +
           'Running this more than once will create DUPLICATES. Continue?'
         );
-        if (!yes) { log('Cancelled.', 'warn'); return; }
+        if (!yes) { status('Cancelled.', 'warn'); return; }
       }
 
       running = true; prevBtn.disabled = true; goBtn.disabled = true;
-      logEl.textContent = '';
-      log((dryRun ? '── PREVIEW (dry run, nothing is created) ──' : '── CREATING CONTRACTS ──'));
+      prevBtn.style.opacity = goBtn.style.opacity = '.5';
+      outEl.textContent = '';
+      log(dryRun ? '── PREVIEW (dry run, nothing is created) ──' : '── CREATING CONTRACTS ──');
 
       let done = 0, failed = 0;
       for (let idx = 0; idx < ROWS.length; idx++) {
         const row = ROWS[idx];
         const tag = (idx + 1) + '/' + ROWS.length + '  ' + row.site;
+        status((dryRun ? 'Checking ' : 'Creating ') + (idx + 1) + ' of ' + ROWS.length + '…');
         try {
           const site = await resolveSite(row.site);
           const billing = billingAddressOf(site);
@@ -399,8 +475,9 @@
             if (res.ok) {
               done++;
               const url = res.id ? ('/PPMContract/Detail/' + res.id) : null;
-              logHtml('<span class="ok">✓ ' + esc(tag) + ' — created' + custWarn.replace('⚠', '&#9888;') + '</span>' +
-                (url ? ' <a href="' + url + '" target="_blank">open</a>' : '') + '\n');
+              logHtml('<span style="color:' + COL.ok + '">✓ ' + esc(tag) + ' — created</span>' +
+                (url ? ' <a href="' + url + '" target="_blank" style="color:#1b6fb3;">open</a>' : '') +
+                (custWarn ? '<span style="color:' + COL.warn + '">' + esc(custWarn) + '</span>' : '') + '\n');
             } else {
               failed++;
               log('✗ ' + tag + ' — FAILED (HTTP ' + (res.status || '?') + ') ' +
@@ -414,12 +491,12 @@
         }
       }
 
+      status('Done: ' + done + ' ok, ' + failed + ' problem(s).', failed ? 'warn' : 'ok');
       log('── DONE: ' + done + ' ok, ' + failed + ' problem(s) ──', failed ? 'warn' : 'ok');
       if (dryRun && !failed) log('Preview looks clean. Click "Create all" to proceed.', 'ok');
       running = false; prevBtn.disabled = false; goBtn.disabled = false;
+      prevBtn.style.opacity = goBtn.style.opacity = '1';
     }
-
-    function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
   }
 
   // ----------------------------------------------------------------------------
@@ -428,9 +505,9 @@
   let tries = 0;
   const boot = setInterval(() => {
     tries++;
-    if ((document.body && document.querySelector('input[name="__RequestVerificationToken"]')) || tries > 80) {
+    if (document.body || tries > 80) {
       clearInterval(boot);
-      if (document.body && !document.getElementById('ppm-bulk-panel')) buildUI();
+      if (document.body && !document.getElementById(SCRIPT_ID + '-panel')) init();
     }
   }, 250);
 })();
