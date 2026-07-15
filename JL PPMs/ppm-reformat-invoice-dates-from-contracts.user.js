@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - PPM Invoice Date & Order No Reformatter
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.2.1
 // @description  Paste a list of PPM Contract numbers + one order-number reference. For every DRAFT invoice on each contract, sets Date to Raise = 15th of the month before the line service month, Payment Due = 30 days after the Date to Raise, and overwrites the Customer Order Number as "PPM - {MMMYY} | {ref} - {SITE}". Preview (dry-run) before applying. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -99,6 +99,7 @@
     }
     // ===== end shared dock =====
 
+    const VERSION = '1.2.1';
     const SCRIPT_ID = 'ppm-invoice-reformat';
     const SCRIPT_LABEL = '🗓️ PPM Invoice Dates';
     const SCRIPT_COLOR = '#8a5cf6';
@@ -324,7 +325,7 @@
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
         const title = document.createElement('strong');
         title.style.fontSize = '14px';
-        title.textContent = 'PPM Invoice Date & Order No Reformatter';
+        title.innerHTML = 'PPM Invoice Date &amp; Order No Reformatter <span style="font-weight:400;color:#8a8ab5;font-size:11px;">v' + VERSION + '</span>';
         const closeBtn = document.createElement('button');
         closeBtn.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
         closeBtn.textContent = '✕';
