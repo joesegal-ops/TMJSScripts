@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - PPM Invoice Date & Order No Reformatter
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  Paste a list of PPM Contract numbers. For every DRAFT invoice on each contract, sets Date to Raise = 15th of the previous month, Payment Due = 15th of that field's own month, and inserts the Payment-Due month (e.g. "PPM - OCT | …") into the Customer Order Number. Preview (dry-run) before applying. Collapses into the shared JL dock.
+// @version      1.1.0
+// @description  Paste a list of PPM Contract numbers + one order-number reference. For every DRAFT invoice on each contract, sets Date to Raise = 15th of the month before the line service month, Payment Due = 15th of the service month, and overwrites the Customer Order Number as "PPM - {MON} | {ref} - {SITE}". Preview (dry-run) before applying. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -102,7 +102,7 @@
     const SCRIPT_ID = 'ppm-invoice-reformat';
     const SCRIPT_LABEL = '🗓️ PPM Invoice Dates';
     const SCRIPT_COLOR = '#8a5cf6';
-    const SCRIPT_DESC = 'Paste PPM Contract numbers. For each contract\'s DRAFT invoices it sets Date to Raise = 15th of the previous month, Payment Due = 15th of that field\'s own month, and tags the Customer Order Number with the Payment-Due month (PPM - OCT | …). Always Preview first.';
+    const SCRIPT_DESC = 'Paste PPM Contract numbers + one order-number reference. For each contract\'s DRAFT invoices it sets Date to Raise = 15th of the month before the line service month, Payment Due = 15th of the service month, and overwrites the Customer Order Number as "PPM - {MON} | {ref} - {SITE}". Always Preview first.';
 
     // Throttle to stay under the Joblogic WAF rate limit.
     const DELAY_BETWEEN_INVOICES = 450;
@@ -112,7 +112,7 @@
     const GUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
     // --- STATE ---
-    let panel, logArea, contractInput, previewBtn, runBtn, stopBtn, progressText;
+    let panel, logArea, contractInput, refInput, previewBtn, runBtn, stopBtn, progressText;
     let running = false;
     let plan = null; // last computed preview plan (array of {contract, invoices:[...]})
 
@@ -143,16 +143,16 @@
         return { mo: +m[2], y: +m[3], label: 'Invoice (' + m[1] + '/' + m[2] + '/' + m[3] + ' - ' + m[4] + '/' + m[5] + '/' + m[6] + ')' };
     }
 
-    // Insert / refresh the month token right after the leading word "PPM".
-    //   "PPM | SCON-00021244 - 1MARKS"     -> "PPM - OCT | SCON-00021244 - 1MARKS"
-    //   "PPM - SEP | SCON…" (re-run)       -> "PPM - OCT | SCON…"  (idempotent)
-    // Empty / non-"PPM" order numbers are left untouched.
-    function transformOrderNumber(orderNo, mon) {
-        const s = (orderNo == null ? '' : String(orderNo)).trim();
-        if (!s) return s;
-        const m = /^(PPM)\b(\s*-\s*[A-Za-z]{3,9})?(.*)$/.exec(s);
-        if (!m) return s;
-        return 'PPM - ' + mon + m[3];
+    // Build the Customer Order Number: "PPM - {MON} | {ref} - {siteCode}"
+    //   MON      = service month (= month of payment), e.g. JUL
+    //   ref      = user-entered reference for the whole run, e.g. SCON-00021244
+    //   siteCode = first 6 non-blank chars of the Site Name, upper-cased
+    //              ("1 Mark Square LON19" -> "1MARKS")
+    function siteCode(siteName) {
+        return String(siteName || '').replace(/\s+/g, '').slice(0, 6).toUpperCase();
+    }
+    function buildOrderNumber(mon, ref, siteName) {
+        return 'PPM - ' + mon + ' | ' + ref + ' - ' + siteCode(siteName);
     }
 
     // =======================================================================
@@ -253,7 +253,7 @@
     }
 
     // Compute the change set from a fetched detail. Returns { changes, warnings, changed, skip }.
-    function computeChanges(detail) {
+    function computeChanges(detail, ref, siteName) {
         const warnings = [];
         const cur = detail.cur;
         const sm = detail.serviceMonth;
@@ -262,10 +262,11 @@
             return { changes: {}, warnings, changed: false, skip: true };
         }
         const mon = monthAbbr(sm);
+        if (!siteCode(siteName)) warnings.push('Site Name is blank — order number site code will be empty');
         const out = {
             InvoiceDate: { old: cur.InvoiceDate || '', new: raiseToPrevMonth15(sm) },
             PaymentDueDate: { old: cur.PaymentDueDate || '', new: dueToSameMonth15(sm) },
-            OrderNumber: { old: cur.OrderNumber || '', new: transformOrderNumber(cur.OrderNumber || '', mon), mon }
+            OrderNumber: { old: cur.OrderNumber || '', new: buildOrderNumber(mon, ref, siteName), mon }
         };
         const changed = Object.values(out).some(v => v.old !== v.new);
         return { changes: out, warnings, changed, skip: false, serviceLabel: sm.label };
@@ -329,7 +330,8 @@
             '(e.g. "Invoice (01/07/2026 - 31/07/2026)" → July):<br>' +
             '• <b>Date to Raise</b> → 15th of the month <i>before</i> M (July → 15/06)<br>' +
             '• <b>Payment Due</b> → 15th of M (July → 15/07)<br>' +
-            '• <b>Customer Order No</b> → month M after "PPM" ("PPM | …" → "PPM - JUL | …"). Empty / non-PPM order numbers are left alone.<br>' +
+            '• <b>Customer Order No</b> → overwritten as <b>PPM - {MON} | {ref} - {SITE}</b><br>' +
+            '&nbsp;&nbsp;&nbsp;e.g. "PPM - JUL | SCON-00021244 - 1MARKS" ({SITE} = first 6 non-blank chars of Site Name)<br>' +
             '<span style="color:#8fd;">Safe to re-run — results are stable.</span>';
 
         const lbl = document.createElement('div');
@@ -340,6 +342,14 @@
         contractInput.rows = 5;
         contractInput.placeholder = 'PM0001725\nPM0001726\n…';
         contractInput.style.cssText = 'width:100%;box-sizing:border-box;background:#0a0a1a;color:#eee;border:1px solid #555;border-radius:4px;padding:8px;font-family:monospace;font-size:12px;resize:vertical;margin-bottom:8px;';
+
+        const refLbl = document.createElement('div');
+        refLbl.style.cssText = 'color:#aaa;margin-bottom:4px;';
+        refLbl.textContent = 'Order-number reference (the "SCON-00021244" part — used for every invoice this run):';
+        refInput = document.createElement('input');
+        refInput.type = 'text';
+        refInput.placeholder = 'SCON-00021244';
+        refInput.style.cssText = 'width:100%;box-sizing:border-box;background:#0a0a1a;color:#eee;border:1px solid #555;border-radius:4px;padding:8px;font-family:monospace;font-size:12px;margin-bottom:8px;';
 
         const controls = document.createElement('div');
         controls.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;';
@@ -371,6 +381,8 @@
         c.appendChild(rules);
         c.appendChild(lbl);
         c.appendChild(contractInput);
+        c.appendChild(refLbl);
+        c.appendChild(refInput);
         c.appendChild(controls);
         c.appendChild(progressDiv);
         c.appendChild(logArea);
@@ -416,6 +428,8 @@
         if (running) return;
         const terms = parseContracts(contractInput.value);
         if (!terms.length) { alert('Paste at least one PPM contract number.'); return; }
+        const ref = refInput.value.trim();
+        if (!ref) { alert('Enter the order-number reference (the "SCON-00021244" part) first.'); refInput.focus(); return; }
 
         running = true;
         previewBtn.disabled = runBtn.disabled = true;
@@ -424,6 +438,7 @@
         logArea.innerHTML = '';
         log(dryRun ? '=== PREVIEW (dry run) — no changes will be made ===' : '=== APPLYING CHANGES ===', dryRun ? '#ff0' : '#f66');
         log(terms.length + ' contract(s): ' + terms.join(', '), '#0af');
+        log('Order-number reference: "' + ref + '"  →  PPM - {MON} | ' + ref + ' - {SITE}', '#0af');
         log('');
 
         const stats = { contracts: 0, invoices: 0, changed: 0, applied: 0, skipped: 0, errors: 0 };
@@ -464,7 +479,7 @@
                 try { detail = await fetchDetail(row.UniqueId); }
                 catch (e) { log('    ✗ ' + tag + ' — could not read invoice: ' + e.message, '#f55'); stats.errors++; await sleep(DELAY_BETWEEN_INVOICES); continue; }
 
-                const { changes, warnings, changed, skip, serviceLabel } = computeChanges(detail);
+                const { changes, warnings, changed, skip, serviceLabel } = computeChanges(detail, ref, row.SiteName);
                 warnings.forEach(w => log('      ! ' + tag + ': ' + w, '#fb0'));
                 if (skip) { stats.errors++; continue; }
 
