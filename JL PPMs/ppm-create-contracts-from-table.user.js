@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         JL - Bulk Create PPM Contracts (WeWork 26/27)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.0.0
-// @description  Bulk-creates PPM Contracts in Joblogic from an embedded table (site, order no., plan ref, annual value). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract using the page's own Vuex getParamsFromStore. Preview (dry-run) before creating.
-// @match        https://go.joblogic.com/PPMContract/Create*
+// @version      1.1.0
+// @description  Bulk-creates PPM Contracts in Joblogic from an embedded table (site, order no., plan ref, annual value). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract. Preview (dry-run) before creating. Runs on the PPM Contracts list page or the Create page.
+// @match        https://go.joblogic.com/PPMContract
+// @match        https://go.joblogic.com/PPMContract/*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -17,11 +18,12 @@
  *      Period         : 01/08/2026 - 31/07/2027
  *      Order number   : from the table              Plan Ref     : from the table
  *      Invoice address: Site (Billing) address      Selling rate : Non-Chargeable (JL default)
- *  - It builds the exact payload by driving Joblogic's own Vuex store getter
- *    (getParamsFromStore) so every hidden/default field matches the real form.
+ *  - The payload is the exact object Joblogic's own create form produces
+ *    (validated against its Vuex getParamsFromStore) — built here in plain JS so the
+ *    script no longer needs the Create page's store and works on any PPMContract page.
  *
  * HOW TO USE
- *  1. Open https://go.joblogic.com/PPMContract/Create  (any PPM create page).
+ *  1. Open https://go.joblogic.com/PPMContract  (the PPM Contracts list — or the Create page).
  *  2. A panel appears bottom-right. Click "Preview" first — it resolves all 32 sites,
  *     shows the matched site id, billing address and value, and flags any problems.
  *     NOTHING is created during preview.
@@ -107,18 +109,10 @@
     return el ? el.value : null;
   }
 
-  function findStore() {
-    const els = document.querySelectorAll('*');
-    for (let i = 0; i < els.length; i++) {
-      const v = els[i].__vue__;
-      if (v && v.$store && v.$store.getters && 'getParamsFromStore' in v.$store.getters) return v.$store;
-    }
-    // fallback: any store
-    for (let i = 0; i < els.length; i++) {
-      const v = els[i].__vue__;
-      if (v && v.$store) return v.$store;
-    }
-    return null;
+  function todayDMY() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    return p(d.getDate()) + '/' + p(d.getMonth() + 1) + '/' + d.getFullYear();
   }
 
   function isObj(v) {
@@ -212,38 +206,73 @@
     };
   }
 
-  // Build the CreatePPMContract params by driving the live Vuex getter.
-  // NB: replaceState + getter read happen synchronously (no await) so Vue's
-  // async watchers can't mutate our state before we read the params.
-  function buildParams(store, pristine, row, site, billing) {
-    const st = JSON.parse(JSON.stringify(pristine));
-    st.typePPM = 2;                    // Contract
-    st.typeBilling = CFG.billingType;  // Invoice
-    st.typeInvoice = CFG.invoiceType;  // In Advance
-    st.invoiceFrequency = CFG.invoiceFrequency; // Monthly
-    st.selectedAddressType = CFG.selectedAddressType; // Site (Billing)
-    st.startDate = CFG.startDate;
-    st.endDate = CFG.endDate;
-    st.invoiceDate = CFG.invoiceFirstDate;
-    st.planReference = row.plan;
-    st.customerOrderNumber = row.order;
-    st.invoiceContractValue = row.total;
-    st.description = '';
-    st.customer = { data: [], model: { Id: site.CustomerId }, warnings: null };
-    st.site = { data: [], model: { Id: site.Id }, siteId: site.Id, warnings: null };
-    st.sellingRate = { data: [], model: { Id: CFG.sellingRateId, Description: CFG.sellingRateDesc } };
-    st.jobCategory = { data: [], model: null };
-    st.invoiceAddress.siteBilling = {
-      Name: billing.Name, Address1: billing.Address1, Address2: billing.Address2,
-      Address3: billing.Address3, Address4: billing.Address4, Postcode: billing.Postcode,
-      Address: billing.Address
+  // Build the exact CreatePPMContract params object (matches Joblogic's
+  // getParamsFromStore output — validated field-for-field).
+  function buildParams(row, site, billing) {
+    return {
+      CustomerContractId: null,
+      SelectedAddressType: CFG.selectedAddressType,
+      PlanReference: row.plan,
+      JobCategoryId: null,
+      DepotId: null,
+      Description: '',
+      StartDate: CFG.startDate,
+      EndDate: CFG.endDate,
+      PPMSellingRateId: CFG.sellingRateId,
+      BillingType: CFG.billingType,
+      SelectedInvoiceType: CFG.invoiceType,
+      InvoiceContractValue: row.total,
+      NoBillingContractValue: 0,
+      InvoiceFrequency: CFG.invoiceFrequency,
+      WeekNumber: null,
+      InvoiceFirstDate: CFG.invoiceFirstDate,
+      VisitFirstDate: null,
+      VisitFrequency: 1,
+      VisitDescription: null,
+      VisitDefaultValue: 0,
+      Name: billing.Name,
+      Address1: billing.Address1,
+      Address2: billing.Address2,
+      Address3: billing.Address3,
+      Address4: billing.Address4,
+      Postcode: billing.Postcode,
+      DefaultEngineerId: null,
+      DefaultEngineerTeamId: null,
+      DefaultSubcontractorId: null,
+      Labour: '0.00', Material: '0.00', Overtime: '0.00', Expenses: '0.00',
+      Travel: '0.00', CallOut: '0.00', Mileage: '0.00', Subcontractor: '0.00',
+      TagIds: [],
+      InvoiceHeaderDetails: {
+        AccountNumber: '', OrderNumber: '', InvoiceHeaderId: '', InvoiceHeaderDescription: '',
+        InvoiceHeader: '', Notes: '', Terms: '', EmailTo: '', EmailSubject: '', EmailBody: ''
+      },
+      IsPPMScheduleImport: false,
+      AccountManagerId: null,
+      AccountManager: null,
+      CustomerOrderNumber: row.order,
+      GenerateTrade: false,
+      GenerateAssetDescription: false,
+      GenerateFrequency: false,
+      ExcludeWeekends: false,
+      QuoteRequestId: null,
+      IncludeQuoteRequestAssets: false,
+      IncludeQuoteRequestNotes: false,
+      IncludeQuoteRequestAttachments: false,
+      SiteIds: [],
+      ExchangeRateDate: todayDMY(),
+      ConversionRate: null,
+      ToCurrencyCode: '',
+      IsEnabledMultipleCurrencies: false,
+      ToCurrencyName: '',
+      BaseCurrencyCode: 'GBP',
+      BaseCurrencyName: 'Pound Sterling',
+      PPMCustomerId: site.CustomerId,
+      PPMSiteId: site.Id
     };
-    store.replaceState(st);
-    return store.getters.getParamsFromStore; // synchronous read
   }
 
-  async function createContract(store, pristine, row, site, billing) {
-    const params = buildParams(store, pristine, row, site, billing);
+  async function createContract(row, site, billing) {
+    const params = buildParams(row, site, billing);
     let fd = objectToFormData(params);
     fd = fixDataType(fd);
     const token = getToken();
@@ -331,12 +360,7 @@
 
     async function run(dryRun) {
       if (running) return;
-      const store = findStore();
-      if (!store || !('getParamsFromStore' in store.getters)) {
-        log('✗ Vuex store not found. Make sure you are on the PPM Create page and it has finished loading, then reload.', 'err');
-        return;
-      }
-      if (!getToken()) log('! Anti-forgery token not found on page — POST may be rejected.', 'warn');
+      if (!getToken()) log('! Anti-forgery token not found on page — POST may be rejected. Try reloading.', 'warn');
 
       if (!dryRun) {
         const yes = window.confirm(
@@ -348,7 +372,6 @@
       }
 
       running = true; prevBtn.disabled = true; goBtn.disabled = true;
-      const pristine = JSON.parse(JSON.stringify(store.state));
       logEl.textContent = '';
       log((dryRun ? '── PREVIEW (dry run, nothing is created) ──' : '── CREATING CONTRACTS ──'));
 
@@ -372,11 +395,11 @@
             log('    bill →[' + billing.source + '] ' + (addr || '(EMPTY!)'), addr ? null : 'err');
             if (!addr) failed++; else done++;
           } else {
-            const res = await createContract(store, pristine, row, site, billing);
+            const res = await createContract(row, site, billing);
             if (res.ok) {
               done++;
               const url = res.id ? ('/PPMContract/Detail/' + res.id) : null;
-              logHtml('<span class="ok">✓ ' + esc(tag) + ' — created' + custWarn.replace('⚠','&#9888;') + '</span>' +
+              logHtml('<span class="ok">✓ ' + esc(tag) + ' — created' + custWarn.replace('⚠', '&#9888;') + '</span>' +
                 (url ? ' <a href="' + url + '" target="_blank">open</a>' : '') + '\n');
             } else {
               failed++;
@@ -391,9 +414,6 @@
         }
       }
 
-      // restore original store state so the visible form isn't left half-filled
-      try { store.replaceState(pristine); } catch (e) {}
-
       log('── DONE: ' + done + ' ok, ' + failed + ' problem(s) ──', failed ? 'warn' : 'ok');
       if (dryRun && !failed) log('Preview looks clean. Click "Create all" to proceed.', 'ok');
       running = false; prevBtn.disabled = false; goBtn.disabled = false;
@@ -403,14 +423,14 @@
   }
 
   // ----------------------------------------------------------------------------
-  // BOOT — wait for the Vue store to be ready
+  // BOOT
   // ----------------------------------------------------------------------------
   let tries = 0;
   const boot = setInterval(() => {
     tries++;
-    if (findStore() || tries > 80) {
+    if ((document.body && document.querySelector('input[name="__RequestVerificationToken"]')) || tries > 80) {
       clearInterval(boot);
-      if (!document.getElementById('ppm-bulk-panel')) buildUI();
+      if (document.body && !document.getElementById('ppm-bulk-panel')) buildUI();
     }
   }, 250);
 })();
