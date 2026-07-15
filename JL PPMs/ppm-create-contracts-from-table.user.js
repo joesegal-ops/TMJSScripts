@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JL - Bulk Create PPM Contracts (WeWork 26/27)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.3.0
-// @description  Bulk-creates PPM Contracts in Joblogic from a table pasted from Google Sheets (Total for 26/27, Customer Order Number, Site, Plan Reference). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract. Preview (dry-run) before creating. v1.3: paste a TSV instead of hardcoded rows.
+// @version      1.4.0
+// @description  Bulk-creates PPM Contracts in Joblogic from a table pasted from Google Sheets (Total for 26/27, Customer Order Number, Site, Plan Reference). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract. Preview (dry-run) before creating. v1.4: skips plan references that already exist (safe to re-run), throttles + retries around the WAF 403 rate-limit.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
 // @run-at       document-idle
@@ -125,7 +125,7 @@
   const SCRIPT_ID = 'ppm-create-contracts-from-table';
   const SCRIPT_LABEL = '🏢 Create PPM Contracts';
   const SCRIPT_COLOR = '#1b8a4b';
-  const SCRIPT_DESC = 'Paste the WeWork PPM table from Google Sheets (include the header row). Each row becomes an Invoice / Monthly (in advance) contract, 01/08/2026–31/07/2027, value = "Total for 26/27" (ex-VAT), invoiced to the Site (Billing) address, selling rate Non-Chargeable, no job category. Columns are matched by header name (Total for 26/27, Customer Order Number, Site, Plan Reference). Sites + billing addresses are looked up live. Click Preview first (no changes are made); then Create all and confirm. Running Create twice makes DUPLICATES.';
+  const SCRIPT_DESC = 'Paste the WeWork PPM table from Google Sheets (include the header row). Each row becomes an Invoice / Monthly (in advance) contract, 01/08/2026–31/07/2027, value = "Total for 26/27" (ex-VAT), invoiced to the Site (Billing) address, selling rate Non-Chargeable, no job category. Columns are matched by header name (Total for 26/27, Customer Order Number, Site, Plan Reference). Sites + billing addresses are looked up live. Click Preview first (no changes are made); then Create all and confirm. Safe to re-run — any plan reference that already exists is skipped, not duplicated.';
 
   // ----------------------------------------------------------------------------
   // CONFIG
@@ -144,7 +144,10 @@
     expectedCustomerName: 'WeWork Ltd',
     createUrl: '/api/PPMContract/CreatePPMContract',
     siteSearchUrl: '/Site/GetSites',
-    postDelayMs: 400         // pause between creations
+    contractSearchUrl: '/api/PPMContract/SearchPPMContract',
+    postDelayMs: 1500,       // pause between creations (WAF throttles rapid bursts)
+    maxRetries: 3,           // retries after a WAF 403 / network blip
+    backoffMs: [15000, 30000, 45000] // wait before each retry
   };
 
   // ----------------------------------------------------------------------------
@@ -391,7 +394,62 @@
     let d = null;
     try { d = JSON.parse(raw); } catch (e) {}
     if (d && d.success) return { ok: true, id: d.AdditionalData, resp: d };
-    return { ok: false, status: r.status, resp: d, raw: raw.slice(0, 300) };
+    // A WAF 403 (HTML page, not Joblogic JSON) means "throttled" — the create may
+    // still have succeeded server-side, so callers re-check by searching.
+    const throttled = r.status === 403 || (!d && /^\s*<(?:!doctype|html)/i.test(raw));
+    return { ok: false, status: r.status, throttled: throttled, resp: d, raw: raw.slice(0, 200) };
+  }
+
+  // --- Duplicate guard via /api/PPMContract/SearchPPMContract (form-encoded) ---
+  const normRef = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+  async function searchContracts(term) {
+    const token = getToken();
+    const r = await fetch(CFG.contractSearchUrl, {
+      method: 'POST',
+      credentials: 'include',
+      headers: Object.assign({ 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, token ? { '__RequestVerificationToken': token } : {}),
+      body: new URLSearchParams({ SearchTerm: term, PageNumber: 1, PageSize: 500 }).toString()
+    });
+    const d = await r.json().catch(() => null);
+    const list = (d && d.AdditionalData && d.AdditionalData.PPMContracts) || [];
+    return list.map(c => c.PlanReference);
+  }
+
+  // Longest common trailing string across the rows' plan references.
+  function commonSuffix(arr) {
+    if (!arr.length) return '';
+    let suf = arr[0];
+    for (let i = 1; i < arr.length; i++) {
+      const s = arr[i];
+      let n = Math.min(suf.length, s.length);
+      while (n > 0 && suf.slice(-n) !== s.slice(-n)) n--;
+      suf = suf.slice(-n);
+      if (!suf) break;
+    }
+    return suf.trim();
+  }
+
+  // Build a Set of normalised plan references that already exist on the server.
+  // One bulk search on the shared suffix if there is a good one; else per-row.
+  async function fetchExistingRefs(rows, log) {
+    const set = new Set();
+    const suffix = commonSuffix(rows.map(r => r.plan));
+    try {
+      if (suffix.length >= 10) {
+        (await searchContracts(suffix)).forEach(ref => set.add(normRef(ref)));
+        log('Checked existing contracts matching "…' + suffix + '": ' + set.size + ' found.');
+      } else {
+        for (const row of rows) {
+          (await searchContracts(row.plan)).forEach(ref => set.add(normRef(ref)));
+          await new Promise(r => setTimeout(r, 150));
+        }
+        log('Checked existing contracts per-row: ' + set.size + ' found.');
+      }
+    } catch (e) {
+      log('! Could not pre-check existing contracts (' + (e.message || e) + '). Proceeding — a re-created plan reference would duplicate.', 'warn');
+    }
+    return set;
   }
 
   // ----------------------------------------------------------------------------
@@ -450,6 +508,8 @@
     prevBtn.onclick = () => run(true);
     goBtn.onclick = () => run(false);
 
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
     async function run(dryRun) {
       if (running) return;
 
@@ -459,27 +519,36 @@
       const ROWS = parsed.rows;
       if (!ROWS.length) { status('No usable rows — paste the table (with headers) first.', 'err'); return; }
       log('Parsed ' + ROWS.length + ' row(s) — ' + parsed.mapNote + '.');
-
-      if (!getToken()) log('! Anti-forgery token not found on page — POST may be rejected. Try reloading.', 'warn');
-
-      if (!dryRun) {
-        const yes = window.confirm(
-          'Create ' + ROWS.length + ' PPM contract(s) for WeWork?\n\n' +
-          'Period ' + CFG.startDate + ' → ' + CFG.endDate + ', monthly invoicing, value = Total for 26/27.\n\n' +
-          'Running this more than once will create DUPLICATES. Continue?'
-        );
-        if (!yes) { status('Cancelled.', 'warn'); return; }
-      }
+      if (!getToken()) log('! Anti-forgery token not found on page — requests may be rejected. Try reloading.', 'warn');
 
       running = true; prevBtn.disabled = true; goBtn.disabled = true;
       prevBtn.style.opacity = goBtn.style.opacity = '.5';
+
+      // Which plan references already exist? (Skip those — never duplicate.)
+      status('Checking which contracts already exist…');
+      const existing = await fetchExistingRefs(ROWS, log);
+      const toDo = ROWS.filter(r => !existing.has(normRef(r.plan)));
+      const already = ROWS.length - toDo.length;
+      if (already) log(already + ' of ' + ROWS.length + ' already exist and will be skipped.', 'warn');
+      log(toDo.length + ' to ' + (dryRun ? 'create (preview)' : 'create') + '.');
+
+      if (!dryRun) {
+        if (!toDo.length) { status('Nothing to create — all already exist.', 'ok'); running = false; prevBtn.disabled = goBtn.disabled = false; prevBtn.style.opacity = goBtn.style.opacity = '1'; return; }
+        const yes = window.confirm(
+          'Create ' + toDo.length + ' new PPM contract(s) for WeWork?\n' +
+          (already ? '(' + already + ' already exist and will be skipped.)\n' : '') + '\n' +
+          'Period ' + CFG.startDate + ' → ' + CFG.endDate + ', monthly invoicing, value = Total for 26/27.'
+        );
+        if (!yes) { status('Cancelled.', 'warn'); running = false; prevBtn.disabled = goBtn.disabled = false; prevBtn.style.opacity = goBtn.style.opacity = '1'; return; }
+      }
+
       log(dryRun ? '── PREVIEW (dry run, nothing is created) ──' : '── CREATING CONTRACTS ──');
 
-      let done = 0, failed = 0;
-      for (let idx = 0; idx < ROWS.length; idx++) {
-        const row = ROWS[idx];
-        const tag = (idx + 1) + '/' + ROWS.length + '  ' + row.site;
-        status((dryRun ? 'Checking ' : 'Creating ') + (idx + 1) + ' of ' + ROWS.length + '…');
+      let done = 0, failed = 0, skipped = already;
+      for (let idx = 0; idx < toDo.length; idx++) {
+        const row = toDo[idx];
+        const tag = (idx + 1) + '/' + toDo.length + '  ' + row.site;
+        status((dryRun ? 'Checking ' : 'Creating ') + (idx + 1) + ' of ' + toDo.length + '…');
         try {
           const site = await resolveSite(row.site);
           const billing = billingAddressOf(site);
@@ -495,29 +564,51 @@
             log('    value: ' + money(row.total) + ' (annual, ex-VAT) → monthly ' + money(Number(row.total) / 12));
             log('    bill →[' + billing.source + '] ' + (addr || '(EMPTY!)'), addr ? null : 'err');
             if (!addr) failed++; else done++;
-          } else {
+            continue;
+          }
+
+          // Create with throttle + back-off. A WAF 403 may hide a real success,
+          // so after backing off we re-check by searching for the plan reference.
+          let created = false;
+          for (let attempt = 0; attempt <= CFG.maxRetries && !created; attempt++) {
             const res = await createContract(row, site, billing);
             if (res.ok) {
-              done++;
+              created = true;
               const url = res.id ? ('/PPMContract/Detail/' + res.id) : null;
               logHtml('<span style="color:' + COL.ok + '">✓ ' + esc(tag) + ' — created</span>' +
                 (url ? ' <a href="' + url + '" target="_blank" style="color:#1b6fb3;">open</a>' : '') +
                 (custWarn ? '<span style="color:' + COL.warn + '">' + esc(custWarn) + '</span>' : '') + '\n');
-            } else {
-              failed++;
-              log('✗ ' + tag + ' — FAILED (HTTP ' + (res.status || '?') + ') ' +
-                (res.resp ? JSON.stringify(res.resp).slice(0, 200) : res.raw), 'err');
+              break;
             }
-            await new Promise(r => setTimeout(r, CFG.postDelayMs));
+            // did it actually land despite the error? (WAF 403 after a real save)
+            const exists = (await searchContracts(row.plan)).some(ref => normRef(ref) === normRef(row.plan));
+            if (exists) {
+              created = true;
+              log('✓ ' + tag + ' — created (server confirmed after HTTP ' + res.status + ')', 'ok');
+              break;
+            }
+            if (attempt < CFG.maxRetries && (res.throttled || !res.resp)) {
+              const wait = CFG.backoffMs[Math.min(attempt, CFG.backoffMs.length - 1)];
+              log('… ' + tag + ' — HTTP ' + res.status + ' (rate-limited); retrying in ' + Math.round(wait / 1000) + 's', 'warn');
+              await sleep(wait);
+            } else {
+              log('✗ ' + tag + ' — FAILED (HTTP ' + (res.status || '?') + ') ' +
+                (res.resp ? JSON.stringify(res.resp).slice(0, 160) : res.raw), 'err');
+              break;
+            }
           }
+          if (created) { done++; existing.add(normRef(row.plan)); }
+          else failed++;
+          await sleep(CFG.postDelayMs);
         } catch (e) {
           failed++;
           log('✗ ' + tag + ' — ' + (e && e.message ? e.message : e), 'err');
         }
       }
 
-      status('Done: ' + done + ' ok, ' + failed + ' problem(s).', failed ? 'warn' : 'ok');
-      log('── DONE: ' + done + ' ok, ' + failed + ' problem(s) ──', failed ? 'warn' : 'ok');
+      const tail = skipped ? (', ' + skipped + ' skipped (already existed)') : '';
+      status('Done: ' + done + ' ' + (dryRun ? 'to create' : 'created') + ', ' + failed + ' problem(s)' + tail + '.', failed ? 'warn' : 'ok');
+      log('── DONE: ' + done + ' ' + (dryRun ? 'to create' : 'created') + ', ' + failed + ' problem(s)' + tail + ' ──', failed ? 'warn' : 'ok');
       if (dryRun && !failed) log('Preview looks clean. Click "Create all" to proceed.', 'ok');
       running = false; prevBtn.disabled = false; goBtn.disabled = false;
       prevBtn.style.opacity = goBtn.style.opacity = '1';

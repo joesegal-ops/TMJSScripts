@@ -48,7 +48,10 @@
       "Bash(bq --location=EU mk -d --description \"Modelled tables built from raw \\(EU\\)\" vmimporteddata:models)",
       "Bash(bq show *)",
       "Bash(cd \"/Users/joesegal/Documents/Claude Code/JL PPMs\" && ls -la && echo \"---PARENT---\" && ls -la ..)",
-      "Bash(rm -f /tmp/parsetest.js)"
+      "Bash(rm -f /tmp/parsetest.js)",
+      "Bash(grep -rl \"EditDetail\\\\|OrderNumber\\\\|PaymentDueDate\\\\|DateRaised\" \"/Users/joesegal/Documents/Claude Code/\" --include=\"*.js\" 2>/dev/null)",
+      "mcp__Control_Chrome__get_current_tab",
+      "Bash(osascript -l JavaScript -e 'ObjC.import\\(\"Foundation\"\\); var s=$.NSString.stringWithContentsOfFileEncodingError\\(\"/Users/joesegal/Documents/Claude Code/JL PPMs/ppm-create-contracts-from-table.user.js\",$.NSUTF8StringEncoding,null\\).js; try{new Function\\(s\\);\"SYNTAX OK\"}catch\\(e\\){\"ERR: \"+e.message}')"
     ]
   }
 }
