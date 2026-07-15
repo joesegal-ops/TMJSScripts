@@ -47,7 +47,8 @@
       "Bash(bq --location=EU mk -d --description \"Raw Joblogic API entities \\(EU\\)\" vmimporteddata:raw)",
       "Bash(bq --location=EU mk -d --description \"Modelled tables built from raw \\(EU\\)\" vmimporteddata:models)",
       "Bash(bq show *)",
-      "Bash(cd \"/Users/joesegal/Documents/Claude Code/JL PPMs\" && ls -la && echo \"---PARENT---\" && ls -la ..)"
+      "Bash(cd \"/Users/joesegal/Documents/Claude Code/JL PPMs\" && ls -la && echo \"---PARENT---\" && ls -la ..)",
+      "Bash(rm -f /tmp/parsetest.js)"
     ]
   }
 }
