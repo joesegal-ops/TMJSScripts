@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.12
+// @version      1.13
 // @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
@@ -112,8 +112,6 @@
     // Fixed recipients for every invoice email.
     const RECIPIENTS = [
         'europepayments@wework.com',
-        '13428874@mypaperless.co.uk',
-        'accounts@up-fm.com',
         'accounts.receivable@up-fm.com',
     ];
 
@@ -286,10 +284,16 @@
         if (!r.ok) throw new Error('SearchInvoice HTTP ' + r.status);
         const j = await r.json();
         const invs = ((j.AdditionalData || {}).Invoices) || [];
-        const inv = invs.find(x => String(x.Id) === String(invoiceId)) || invs[0];
-        if (!inv) return null;
-        const n = Number(inv.TotalExcludingVatDecimal);
-        return isNaN(n) ? null : n;
+        if (!invs.length) return null;
+        // Normal path: the invoice we just created has lines → use its net.
+        const exact = invs.find(x => String(x.Id) === String(invoiceId));
+        const exactNet = exact ? Number(exact.TotalExcludingVatDecimal) : NaN;
+        if (!isNaN(exactNet) && exactNet > 0) return exactNet;
+        // Empty/already-invoiced job: our new invoice is £0 → take the largest net among
+        // this job's invoices, i.e. the real (prior) invoice.
+        const best = invs.reduce((m, x) => { const v = Number(x.TotalExcludingVatDecimal) || 0; return v > m ? v : m; }, 0);
+        if (best > 0) return best;
+        return isNaN(exactNet) ? null : exactNet;
     }
 
     // =======================================================================
@@ -342,7 +346,7 @@
         const job = s.jobs[i]; if (!job) return;
         if (!s.pushMonday) { job.mondayStatus = 'off'; }
         else if (job.mondayStatus === 'done') { /* already pushed — resume-safe */ return; }
-        else if (job.prepStatus !== 'approved') { job.mondayStatus = 'skipped (not approved)'; }
+        else if (job.prepStatus !== 'approved' && job.prepStatus !== 'already-invoiced') { job.mondayStatus = 'skipped (not approved)'; }
         else {
             try {
                 const po = formatPO(job.po);
@@ -419,9 +423,18 @@
             try { job.net = await fetchInvoiceNet(job.jobId, job.invoiceId); if (job.net != null) log(`    net (ex VAT) £${job.net}`, '#8fd'); }
             catch (e) { log(`    (net total lookup failed: ${e.message})`, '#fd0'); }
         } catch (e) {
-            job.prepStatus = 'error';
-            job.error = e.message;
-            log(`    ✗ ${job.jobNumber}: ${e.message}`, '#f55');
+            if (/no lines/i.test(e.message)) {
+                // "No lines to add" = the job was already invoiced earlier. Skip the email
+                // (nothing to send) but still flip Monday, pulling the net from the real invoice.
+                job.prepStatus = 'already-invoiced';
+                job.emailStatus = 'skipped';
+                try { job.net = await fetchInvoiceNet(job.jobId, job.invoiceId); } catch (x) {}
+                log(`    ⓘ already invoiced (no new lines) — skipping email, still updating Monday${job.net != null ? ` (net £${job.net})` : ''}`, '#fd0');
+            } else {
+                job.prepStatus = 'error';
+                job.error = e.message;
+                log(`    ✗ ${job.jobNumber}: ${e.message}`, '#f55');
+            }
         }
         // Persist onto the LATEST state (preserves the running flag if Stop was pressed
         // mid-job) so a Stop can't be clobbered back to true.
@@ -588,7 +601,7 @@
             let job = s.jobs[s.idx];
 
             // 1. Ensure this job is created + approved (headless, runs on any JL page).
-            if (job.prepStatus !== 'approved' && job.prepStatus !== 'error') {
+            if (job.prepStatus !== 'approved' && job.prepStatus !== 'error' && job.prepStatus !== 'already-invoiced') {
                 const st = await prepOne(s.idx);
                 if (st === 'stopped') { setProgress(`Stopped at job ${loadState().idx + 1}.`); return; }
                 s = loadState();
@@ -597,9 +610,9 @@
             }
 
             // 2. If we can't/shouldn't email this job, move to the next one.
-            if (job.prepStatus === 'error' || s.skipEmail || job.emailStatus === 'sent') {
-                // Skip-email mode still counts as "invoiced" → push to Monday (guarded).
-                if (s.skipEmail && job.prepStatus === 'approved') await pushJobToMonday(s.idx);
+            if (job.prepStatus === 'error' || job.prepStatus === 'already-invoiced' || s.skipEmail || job.emailStatus === 'sent') {
+                // Already-invoiced jobs, and skip-email mode, still update Monday (guarded).
+                if (job.prepStatus === 'already-invoiced' || (s.skipEmail && job.prepStatus === 'approved')) await pushJobToMonday(s.idx);
                 const cur = loadState(); cur.idx += 1; saveState(cur);
                 continue;
             }
@@ -651,8 +664,9 @@
         showNextButton(false);
         const sent = s.jobs.filter(j => j.emailStatus === 'sent').length;
         const appr = s.jobs.filter(j => j.prepStatus === 'approved').length;
+        const already = s.jobs.filter(j => j.prepStatus === 'already-invoiced').length;
         const errs = s.jobs.filter(j => j.prepStatus === 'error' || j.emailStatus === 'error').length;
-        setProgress(`Done. ${appr} approved, ${sent} emailed, ${errs} error(s). Copy the results into Google Sheets.`);
+        setProgress(`Done. ${appr} approved, ${sent} emailed${already ? `, ${already} already-invoiced (Monday only)` : ''}, ${errs} error(s). Copy the results into Google Sheets.`);
         log('===== FINISHED =====', '#0af');
         setRunningUI(false);
     }
@@ -736,6 +750,7 @@
         const lines = [TSV_HEADERS.join('\t')];
         s.jobs.forEach(j => {
             const status = j.prepStatus === 'error' ? 'ERROR (prep)'
+                : j.prepStatus === 'already-invoiced' ? 'Already invoiced (Monday only)'
                 : j.emailStatus === 'sent' ? 'Sent'
                 : j.emailStatus === 'composed' ? 'Composed (not sent)'
                 : j.emailStatus === 'error' ? 'ERROR (email)'
