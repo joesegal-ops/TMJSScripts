@@ -16,15 +16,35 @@ SELECT Id AS customer_id, UniqueId AS customer_uid, Name AS customer_name, Activ
        EmailAddress AS email, Telephone AS telephone, Address AS address, Postcode AS postcode, _ingested_at
 FROM `vmimporteddata.raw.customers`;
 
+-- Quote tracking. job_type/job_category come from raw.quote_types (Quote/GetById; the list endpoint
+-- returns them null) resolved to names via the static code maps. date_rejected comes from the status
+-- CDC (raw.quote_status_events) since the API exposes no rejection timestamp on standard quotes.
 CREATE OR REPLACE VIEW `vmimporteddata.models.quote_tracking` AS
-SELECT QuoteNumber AS quote_number, Title AS title, Description AS description, JobType AS job_type,
-       QuoteStatusDescription AS status, OwnerName AS owner, DATE(DateLogged) AS date_logged,
-       ApprovedDatetime AS approved_datetime, CustomerName AS customer,
-       CustomerCustomReference AS customer_reference, SiteName AS site, SitePostcode AS site_postcode,
-       Contact AS contact, EmailAddress AS email, QuoteValueExcludingVat AS value_excl_vat,
-       QuoteValue AS value_incl_vat, SAFE_CAST(ChanceOfSale AS FLOAT64) AS chance_of_sale,
-       IsCancelled AS is_cancelled, IsRejected AS is_rejected, IsUpgraded AS is_upgraded, _ingested_at
-FROM `vmimporteddata.raw.quotes`;
+WITH rejected AS (
+  SELECT quote_id, MIN(observed_at) AS date_rejected
+  FROM `vmimporteddata.raw.quote_status_events`
+  WHERE new_status = "Rejected"
+  GROUP BY quote_id
+)
+SELECT
+  q.QuoteNumber AS quote_number, q.Title AS title, q.Description AS description,
+  COALESCE(jtm.description, qt.job_type_code) AS job_type,
+  qt.job_type_code AS job_type_code,
+  COALESCE(jcm.description, qt.job_category_code) AS job_category,
+  qt.job_category_code AS job_category_code,
+  q.QuoteStatusDescription AS status, q.OwnerName AS owner, DATE(q.DateLogged) AS date_logged,
+  q.ApprovedDatetime AS approved_datetime,
+  DATE(rj.date_rejected) AS date_rejected,
+  q.CustomerName AS customer, q.CustomerCustomReference AS customer_reference,
+  q.SiteName AS site, q.SitePostcode AS site_postcode, q.Contact AS contact, q.EmailAddress AS email,
+  q.QuoteValueExcludingVat AS value_excl_vat, q.QuoteValue AS value_incl_vat,
+  SAFE_CAST(q.ChanceOfSale AS FLOAT64) AS chance_of_sale,
+  q.IsCancelled AS is_cancelled, q.IsRejected AS is_rejected, q.IsUpgraded AS is_upgraded, q._ingested_at
+FROM `vmimporteddata.raw.quotes` q
+LEFT JOIN `vmimporteddata.raw.quote_types` qt ON qt.quote_id = q.Id
+LEFT JOIN `vmimporteddata.raw.quote_jobtype_map` jtm ON jtm.code = qt.job_type_code
+LEFT JOIN `vmimporteddata.raw.job_category_map`  jcm ON jcm.code = qt.job_category_code
+LEFT JOIN rejected rj ON rj.quote_id = q.Id;
 
 CREATE OR REPLACE VIEW `vmimporteddata.models.purchase_orders` AS
 SELECT Id AS po_id, PONumber AS po_number, Status AS status_id, DateRaised AS date_raised,
@@ -91,8 +111,43 @@ FROM `vmimporteddata.raw.jobs` j
 LEFT JOIN UNNEST(j.VisitsStatus) AS v
 LEFT JOIN `vmimporteddata.raw.staff` st ON LOWER(st.EmailAddress) = LOWER(v.EngineerEmail);
 
--- Enriched job+visit (adds Job_Type, Is_Open, Is_Job_Completing_Visit; notes need a cross-sync - see notes).
+-- Granular notes: one row per note (deduped by note UniqueId). _EntityType Job|Visit; Job notes are
+-- system/admin notes on the job, Visit notes are the engineer notes captured against a specific visit.
+-- Enriched with JobNumber/Customer/Site from raw.jobs for standalone reporting.
+CREATE OR REPLACE VIEW `vmimporteddata.models.notes` AS
+SELECT
+  n.UniqueId       AS note_uid,
+  n._EntityType    AS entity_type,
+  n._JobId         AS job_id,
+  n._VisitId       AS visit_id,
+  n.NoteText       AS note_text,
+  n.Author         AS author,
+  n.DateAdded      AS date_added,
+  n.NoteVisibility AS visibility,
+  j.JobNumber      AS job_number,
+  j.CustomerName   AS customer,
+  j.SiteName       AS site,
+  n._ingested_at
+FROM `vmimporteddata.raw.notes` n
+LEFT JOIN `vmimporteddata.raw.jobs` j ON j.Id = n._JobId
+QUALIFY ROW_NUMBER() OVER (PARTITION BY n.UniqueId ORDER BY n.DateAdded) = 1;
+
+-- Enriched job+visit (adds Job_Type, Is_Open, Is_Job_Completing_Visit). Notes wired in from models.notes:
+-- Job_Notes = STRING_AGG of Job-entity notes per job; Engineer_Notes = Visit-entity notes for THIS
+-- specific visit (per Visit_Id) — granular, NOT the whole job's visit notes concatenated. Blank notes dropped.
 CREATE OR REPLACE VIEW `vmimporteddata.models.job_and_visit_details_enriched` AS
+WITH job_notes AS (
+  SELECT job_id, STRING_AGG(note_text, "\n" ORDER BY date_added) AS Job_Notes
+  FROM `vmimporteddata.models.notes`
+  WHERE entity_type = "Job" AND note_text IS NOT NULL AND TRIM(note_text) != ""
+  GROUP BY job_id
+),
+visit_notes AS (
+  SELECT visit_id, STRING_AGG(note_text, "\n" ORDER BY date_added) AS Engineer_Notes
+  FROM `vmimporteddata.models.notes`
+  WHERE entity_type = "Visit" AND note_text IS NOT NULL AND TRIM(note_text) != ""
+  GROUP BY visit_id
+)
 SELECT
   jvd.*,
   CASE WHEN jvd.Visit_Status = "Complete"
@@ -100,10 +155,82 @@ SELECT
        THEN TRUE ELSE FALSE END              AS Is_Job_Completing_Visit,
   j.TypeDescription                          AS Job_Type,
   (j.DateComplete IS NULL)                   AS Is_Open,
-  CAST(NULL AS STRING)                       AS Job_Notes,
-  CAST(NULL AS STRING)                       AS Engineer_Notes
+  jn.Job_Notes                               AS Job_Notes,
+  vn.Engineer_Notes                          AS Engineer_Notes
 FROM `vmimporteddata.models.job_and_visit_details` jvd
-LEFT JOIN `vmimporteddata.raw.jobs` j ON j.Id = jvd.Job_Auto_Id;
+LEFT JOIN `vmimporteddata.raw.jobs` j ON j.Id = jvd.Job_Auto_Id
+LEFT JOIN job_notes  jn ON jn.job_id   = jvd.Job_Auto_Id
+LEFT JOIN visit_notes vn ON vn.visit_id = jvd.Visit_Id;
+
+-- All-in-Job (job grain, one row per job) — reproduces the old importdata All_in_Job_clean columns.
+-- PARTIAL BUILD (2026-07-20): job fields + Visit_Notes (aggregated per job from models.notes) populated.
+-- The 5 money columns (TotalJobCost/Sell, TotalQuoteCost/Sell, PurchaseOrderAdjustment) and the 2
+-- Service columns are typed NULL placeholders pending the FULL pass: TotalJobCost/Sell need the JobCost
+-- API endpoint backfilled into raw; quote figures need UNNEST(quotes.Lines) cost roll-up joined via
+-- quotes.ParentJobAutoId; PO adjustment needs UNNEST(purchase_orders.Lines) per JobId.
+CREATE OR REPLACE VIEW `vmimporteddata.models.all_in_job` AS
+WITH visit_notes AS (
+  SELECT job_id, STRING_AGG(note_text, "\n" ORDER BY date_added) AS Visit_Notes
+  FROM `vmimporteddata.models.notes`
+  WHERE entity_type = "Visit" AND note_text IS NOT NULL AND TRIM(note_text) != ""
+  GROUP BY job_id
+)
+SELECT
+  j.JobNumber                 AS ID,
+  j.SiteName                  AS Site,
+  j.Area                      AS Area,
+  j.SitePostcode              AS Post_Code,
+  CAST(j.Telephone AS STRING) AS Telephone,
+  j.Contact                   AS Contact,
+  j.Description               AS Description,
+  j.CustomerName              AS Customer,
+  j.OrderNumber               AS Order_Number,
+  j.JobStatusDescription      AS Job_Status,
+  j.DateLogged                AS Date_Logged,
+  j.AppointmentDate           AS Estimated_Appointment,
+  j.DateComplete              AS DateComplete,
+  j.TypeDescription           AS Job_Type,
+  j.CategoryDescription       AS Job_Category,
+  IF(j.DateComplete IS NULL, "OPEN", "CLOSE") AS Open_Closed_Job,
+  (j.DateComplete IS NULL)    AS Is_Open,
+  j.CustomerCustomReference   AS Custom_Reference,
+  j.ReportedFaultCode         AS Reported_Fault_Code,
+  j.ReportedSubFaultCode      AS Reported_Sub_Fault_Code,
+  j.ActualFaultCode           AS Actual_Fault_Code,
+  j.ActualSubFaultCode        AS Actual_Sub_Fault_Code,
+  CAST(NULL AS NUMERIC)       AS TotalJobCost,             -- FULL PASS: needs JobCost endpoint
+  CAST(NULL AS NUMERIC)       AS TotalJobSell,             -- FULL PASS: needs JobCost endpoint
+  CAST(NULL AS NUMERIC)       AS TotalQuoteCost,           -- FULL PASS: needs quote line-item costs
+  CAST(NULL AS NUMERIC)       AS TotalQuoteSell,           -- FULL PASS: quote roll-up per job
+  CAST(NULL AS NUMERIC)       AS PurchaseOrderAdjustment,  -- FULL PASS: PO line-item roll-up
+  j.PriorityDescription       AS Priority,
+  vn.Visit_Notes              AS Visit_Notes,
+  j.Tags                      AS Job_Tags,
+  CAST(NULL AS BOOL)          AS Service_Job,              -- FULL PASS: PPM service flag
+  CAST(NULL AS STRING)        AS Service_Description,      -- FULL PASS: PPM service
+  j.Id                        AS Job_Auto_Id,
+  j._ingested_at
+FROM `vmimporteddata.raw.jobs` j
+LEFT JOIN visit_notes vn ON vn.job_id = j.Id;
+
+-- Avg visits per job (faithful port of old importdata Avg_Visits_Per_Job). Sources = models.job_and_visit_details
+-- (visits) + models.all_in_job (Job_Type, Date_Logged). Excludes cancelled visits; per-job grain.
+CREATE OR REPLACE VIEW `vmimporteddata.models.avg_visits_per_job` AS
+WITH visits_per_job AS (
+  SELECT
+    v.ID,
+    j.Job_Type,
+    DATE_TRUNC(MIN(DATE(j.Date_Logged)), MONTH) AS Month,
+    COUNT(*) AS Visit_Count
+  FROM `vmimporteddata.models.job_and_visit_details` v
+  LEFT JOIN `vmimporteddata.models.all_in_job` j ON v.ID = j.ID
+  WHERE v.Visit_Status != "Cancelled"
+  GROUP BY 1,2
+)
+SELECT ID, Job_Type, Month, AVG(Visit_Count) AS Avg_Visits_Per_Job, COUNT(*) AS Job_Count
+FROM visits_per_job
+GROUP BY 1,2,3
+ORDER BY 3;
 
 CREATE OR REPLACE VIEW `vmimporteddata.models.completed_visits_by_engineer` AS
 SELECT Engineer AS engineer, DATE(VisitEndDateTime) AS date, COUNT(*) AS visits_completed

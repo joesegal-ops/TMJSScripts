@@ -1,0 +1,73 @@
+-- Static EU lookup maps for quote job-type/category codes (Quote/GetById returns codes only).
+-- One-time derivation (job type from the quote export; category T-codes from legacy report);
+-- these are self-contained EU tables with no ongoing dependency on the old US project.
+
+CREATE OR REPLACE TABLE `vmimporteddata.raw.quote_jobtype_map` AS
+SELECT * FROM UNNEST([
+  STRUCT("D" AS code, "Reactive" AS description),
+  STRUCT("E" AS code, "Project" AS description),
+  STRUCT("M" AS code, "Maintenance" AS description),
+  STRUCT("R" AS code, "Repair" AS description)
+]);
+
+CREATE OR REPLACE TABLE `vmimporteddata.raw.job_category_map` AS
+SELECT * FROM UNNEST([
+  STRUCT("T14" AS code, "Add Ons Store" AS description),
+  STRUCT("T15" AS code, "Appliances" AS description),
+  STRUCT("T16" AS code, "Bathroom Accessory" AS description),
+  STRUCT("T17" AS code, "Carpentry/Handyman" AS description),
+  STRUCT("T18" AS code, "Cleaning" AS description),
+  STRUCT("T19" AS code, "Decommission" AS description),
+  STRUCT("T20" AS code, "Doors" AS description),
+  STRUCT("T21" AS code, "Electrical" AS description),
+  STRUCT("T22" AS code, "Elevator/Lift" AS description),
+  STRUCT("T23" AS code, "Fire, Life, Safety" AS description),
+  STRUCT("T24" AS code, "Flooring" AS description),
+  STRUCT("T25" AS code, "Furniture/Accessories" AS description),
+  STRUCT("T26" AS code, "General" AS description),
+  STRUCT("T27" AS code, "Glass" AS description),
+  STRUCT("T28" AS code, "Heating and Cooling (HVAC)" AS description),
+  STRUCT("T29" AS code, "Lighting" AS description),
+  STRUCT("T30" AS code, "Member Labor Request" AS description),
+  STRUCT("T31" AS code, "Painting and Wall Repair" AS description),
+  STRUCT("T32" AS code, "Pest Control" AS description),
+  STRUCT("T33" AS code, "Phone Booth" AS description),
+  STRUCT("T34" AS code, "Plants" AS description),
+  STRUCT("T35" AS code, "Plumbing" AS description),
+  STRUCT("T36" AS code, "Signage" AS description),
+  STRUCT("T37" AS code, "PPM" AS description),
+  STRUCT("T38" AS code, "Ventilation" AS description),
+  STRUCT("T39" AS code, "Andel Leak Alarms" AS description),
+  STRUCT("T41" AS code, "Furniture" AS description),
+  STRUCT("T42" AS code, "Other" AS description),
+  STRUCT("T43" AS code, "Restrooms" AS description),
+  STRUCT("T44" AS code, "Survey" AS description),
+  STRUCT("T45" AS code, "Glass & Windows" AS description),
+  STRUCT("T46" AS code, "Add On - subject to charge" AS description),
+  STRUCT("T47" AS code, "Specialist Repairs" AS description),
+  STRUCT("T48" AS code, "Logistics (Removals, Relocations, Disposals etc.)" AS description),
+  STRUCT("T49" AS code, "Facilities & Amenity Information" AS description),
+  STRUCT("T50" AS code, "Install" AS description),
+  STRUCT("T51" AS code, "Equipment" AS description),
+  STRUCT("T52" AS code, "Reset or Move" AS description),
+  STRUCT("T53" AS code, "Trash" AS description),
+  STRUCT("T54" AS code, "Access" AS description),
+  STRUCT("T55" AS code, "Audit / Assessment" AS description),
+  STRUCT("T56" AS code, "Controls" AS description),
+  STRUCT("T57" AS code, "Lifting Equipment" AS description),
+  STRUCT("T58" AS code, "Main Plant" AS description),
+  STRUCT("T59" AS code, "Trade" AS description),
+  STRUCT("T60" AS code, "Water Treatment" AS description),
+  STRUCT("T61" AS code, "A/C Split System (Inc F Gas)" AS description),
+  STRUCT("T62" AS code, "BMS" AS description),
+  STRUCT("T63" AS code, "Fall arrest system" AS description),
+  STRUCT("T64" AS code, "Attendance" AS description),
+  STRUCT("T65" AS code, "whiteboard" AS description),
+  STRUCT("T66" AS code, "Spare part Acquisition" AS description),
+  STRUCT("T67" AS code, "Building Shutdown" AS description),
+  STRUCT("T68" AS code, "Roof" AS description),
+  STRUCT("T69" AS code, "Waste Management" AS description),
+  STRUCT("T70" AS code, "Move In & Out" AS description),
+  STRUCT("T71" AS code, "Water Hygiene & Compliance" AS description),
+  STRUCT("T72" AS code, "Ceiling(s)" AS description)
+]);
