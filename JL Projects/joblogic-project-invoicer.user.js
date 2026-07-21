@@ -1,10 +1,13 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.13
+// @version      1.14
 // @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
 // @connect      api.monday.com
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
@@ -125,8 +128,8 @@
     const MB_PRICE   = 'numbers_mkmk43k6';  // Price Est. (ex. VAT)
     const MB_PO      = 'text_mky86hyy';      // PO Number (primary match key)
     const MB_JOBREF  = 'text_mkyrcb16';      // Job Ref. (fallback match key)
-    const MONDAY_TOKEN_KEY = 'jl-monday-token';   // shared with other JL scripts
-    function mondayToken() { try { return localStorage.getItem(MONDAY_TOKEN_KEY) || ''; } catch (e) { return ''; } }
+    const MONDAY_TOKEN_KEY = 'jl-monday-token';   // Tampermonkey GM storage, set via a prompt (no DOM field → password managers can't clobber it)
+    function mondayToken() { try { return GM_getValue(MONDAY_TOKEN_KEY, '') || ''; } catch (e) { return ''; } }
 
     // With @grant GM_xmlhttpRequest the script runs in TM's sandbox, so page globals
     // (e.g. JL's onClickShareEmail) live on unsafeWindow, not the sandbox `window`.
@@ -138,7 +141,7 @@
     function clearState() { localStorage.removeItem(STATE_KEY); }
 
     // --- UI refs ---
-    let panel, inputArea, autoSendCheck, skipEmailCheck, mondayCheck, mondayTokenInput, startBtn, stopBtn, resetBtn, copyBtn, nextBtn, refillBtn, logArea, progressText, resultsArea;
+    let panel, inputArea, autoSendCheck, skipEmailCheck, mondayCheck, startBtn, stopBtn, resetBtn, copyBtn, nextBtn, refillBtn, logArea, progressText, resultsArea;
 
     // =======================================================================
     // Helpers
@@ -678,13 +681,8 @@
         const existing = loadState();
         if (existing && existing.running) { alert('A run is already in progress. Use Stop or Reset first.'); return; }
 
-        // Persist a freshly-typed Monday token (kept locally; leave blank to reuse saved).
-        if (mondayTokenInput && mondayTokenInput.value.trim()) {
-            try { localStorage.setItem(MONDAY_TOKEN_KEY, mondayTokenInput.value.trim()); } catch (e) {}
-            mondayTokenInput.value = ''; mondayTokenInput.placeholder = '•••• Monday token saved ••••';
-        }
         const wantMonday = mondayCheck.checked;
-        if (wantMonday && !mondayToken()) log('⚠ "Update Monday" is on but no Monday token is saved — paste your token first, or the Monday step will be skipped with an error.', '#fd0');
+        if (wantMonday && !mondayToken()) log('⚠ "Update Monday" is on but no Monday token is saved — click "Set Monday token" first, or the Monday step will error.', '#fd0');
 
         // Offer to resume a stopped, unfinished run so we never re-create done invoices.
         if (existing && existing.jobs && existing.idx < existing.jobs.length &&
@@ -813,12 +811,29 @@
         const md = mkCheck('Update Monday', 'After each invoice, set the matching Monday item (board "Minor Projects - WW Active") Finance Stat → "Invoiced" and Price Est. (ex VAT) ← the invoice net total. Matches by PO Number, then Job Ref.');
         mondayCheck = md.cb; mondayCheck.checked = true;
         opts.appendChild(a.l); opts.appendChild(sk.l); opts.appendChild(md.l);
-        mondayTokenInput = document.createElement('input');
-        mondayTokenInput.type = 'password';
-        mondayTokenInput.placeholder = mondayToken() ? '•••• Monday token saved ••••' : 'Monday API token';
-        mondayTokenInput.title = 'Stored locally in this browser (localStorage). Leave blank to keep the saved one.';
-        mondayTokenInput.style.cssText = 'flex:1;min-width:160px;padding:5px;background:#0a0a1a;color:#eee;border:1px solid #555;border-radius:4px;font-family:monospace;';
-        opts.appendChild(mondayTokenInput);
+        // Token via a native prompt + Tampermonkey storage — no password field for a
+        // password manager to autofill/overwrite.
+        const mondayStat = document.createElement('span');
+        mondayStat.style.cssText = 'font-size:11px;';
+        const refreshMondayStat = () => {
+            const has = !!mondayToken();
+            mondayStat.textContent = has ? '🔑 token saved' : '🔑 no token';
+            mondayStat.style.color = has ? '#7d7' : '#fd0';
+        };
+        const mondayBtn = mkBtn('Set Monday token', '#334');
+        mondayBtn.style.padding = '4px 10px';
+        mondayBtn.title = 'Paste your Monday API token into the popup. Stored in Tampermonkey, persists across sessions.';
+        mondayBtn.addEventListener('click', () => {
+            const has = !!mondayToken();
+            const t = prompt('Paste your Monday API token' + (has ? '\n(blank = keep current, "clear" = remove):' : ':'), '');
+            if (t === null) return;                              // cancelled
+            const v = t.trim();
+            if (v === '') return;                                // keep existing
+            if (v.toLowerCase() === 'clear') { GM_deleteValue(MONDAY_TOKEN_KEY); log('Monday token cleared.', '#fd0'); refreshMondayStat(); return; }
+            GM_setValue(MONDAY_TOKEN_KEY, v); log('Monday token saved.', '#0fa'); refreshMondayStat();
+        });
+        opts.appendChild(mondayBtn); opts.appendChild(mondayStat);
+        refreshMondayStat();
 
         // Controls
         const ctl = document.createElement('div');
