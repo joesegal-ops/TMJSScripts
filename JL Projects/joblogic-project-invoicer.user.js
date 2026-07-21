@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.14
+// @version      1.15
 // @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
@@ -119,6 +119,9 @@
     ];
 
     const STATE_KEY = 'jl-project-invoicer-state';
+    const LOG_KEY = 'jl-project-invoicer-log';   // persists the log across page navigations (email step reloads the page)
+    function loadLog() { try { return JSON.parse(localStorage.getItem(LOG_KEY)) || []; } catch (e) { return []; } }
+    function saveLog(lines) { try { localStorage.setItem(LOG_KEY, JSON.stringify(lines.slice(-400))); } catch (e) {} }
     const DELAY = 500;               // politeness delay between API calls (ms)
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -714,7 +717,7 @@
             })),
         };
         saveState(s);
-        logArea.innerHTML = '';
+        clearLog();
         setRunningUI(true);
         log(`Processing ${s.jobs.length} job(s), one at a time: create → approve → email${wantMonday ? ' → Monday' : ''} → next.`, '#0af');
         if (wantMonday) log('Monday update ON — each invoiced job sets its board item to "Invoiced" + Price Est. (matched by PO, then Job Ref).', '#0af');
@@ -734,7 +737,7 @@
     function resetRun() {
         if (!confirm('Clear the current run and all results?')) return;
         clearState();
-        if (logArea) logArea.innerHTML = '';
+        clearLog();
         if (resultsArea) resultsArea.value = '';
         setRunningUI(false);
         setProgress('Ready. Paste "JobNumber <tab> PO" rows and click Start.');
@@ -884,7 +887,8 @@
         document.body.appendChild(panel);
         jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
 
-        // Restore prior run into the panel.
+        // Restore prior run + log into the panel (survives the email-step navigation).
+        restoreLog();
         const s = loadState();
         if (s) {
             renderResults(s);
@@ -898,7 +902,7 @@
         b.style.cssText = `background:${color};color:#fff;border:none;padding:8px 14px;border-radius:4px;cursor:pointer;`;
         return b;
     }
-    function log(msg, color) {
+    function appendLogLine(msg, color) {
         if (!logArea) return;
         const line = document.createElement('div');
         line.style.color = color || '#ccc';
@@ -907,6 +911,21 @@
         line.textContent = msg;
         logArea.appendChild(line);
         logArea.scrollTop = logArea.scrollHeight;
+    }
+    function log(msg, color) {
+        const lines = loadLog();
+        lines.push({ m: msg, c: color || '#ccc' });
+        saveLog(lines);
+        appendLogLine(msg, color);
+    }
+    function restoreLog() {
+        if (!logArea) return;
+        logArea.innerHTML = '';
+        loadLog().forEach(l => appendLogLine(l.m, l.c));
+    }
+    function clearLog() {
+        try { localStorage.removeItem(LOG_KEY); } catch (e) {}
+        if (logArea) logArea.innerHTML = '';
     }
     const setProgress = (m) => { if (progressText) progressText.textContent = m; };
     function setRunningUI(running) {
