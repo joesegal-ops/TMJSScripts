@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.11
-// @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
+// @version      1.12
+// @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      api.monday.com
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
 // @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
@@ -100,7 +101,7 @@
     // ===== end shared dock =====
 
     // Read the version straight from the userscript metadata so it never drifts
-    // from the @version header (GM_info is available under @grant none in Tampermonkey).
+    // from the @version header (GM_info is available in Tampermonkey under any @grant).
     const VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : '';
 
     const SCRIPT_ID = 'project-invoicer';
@@ -120,13 +121,26 @@
     const DELAY = 500;               // politeness delay between API calls (ms)
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+    // --- Monday write-back (board "Minor Projects - WW Active") ---
+    const MONDAY_BOARD = 5084790211;
+    const MB_FINANCE = 'color_mkvy3avs';    // Finance Stat. → "Invoiced"
+    const MB_PRICE   = 'numbers_mkmk43k6';  // Price Est. (ex. VAT)
+    const MB_PO      = 'text_mky86hyy';      // PO Number (primary match key)
+    const MB_JOBREF  = 'text_mkyrcb16';      // Job Ref. (fallback match key)
+    const MONDAY_TOKEN_KEY = 'jl-monday-token';   // shared with other JL scripts
+    function mondayToken() { try { return localStorage.getItem(MONDAY_TOKEN_KEY) || ''; } catch (e) { return ''; } }
+
+    // With @grant GM_xmlhttpRequest the script runs in TM's sandbox, so page globals
+    // (e.g. JL's onClickShareEmail) live on unsafeWindow, not the sandbox `window`.
+    const pageWin = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+
     // --- STATE (persisted across navigations) ---
     function loadState() { try { return JSON.parse(localStorage.getItem(STATE_KEY)); } catch (e) { return null; } }
     function saveState(s) { localStorage.setItem(STATE_KEY, JSON.stringify(s)); }
     function clearState() { localStorage.removeItem(STATE_KEY); }
 
     // --- UI refs ---
-    let panel, inputArea, autoSendCheck, skipEmailCheck, startBtn, stopBtn, resetBtn, copyBtn, nextBtn, refillBtn, logArea, progressText, resultsArea;
+    let panel, inputArea, autoSendCheck, skipEmailCheck, mondayCheck, mondayTokenInput, startBtn, stopBtn, resetBtn, copyBtn, nextBtn, refillBtn, logArea, progressText, resultsArea;
 
     // =======================================================================
     // Helpers
@@ -249,6 +263,106 @@
         return true;
     }
 
+    // Invoice net (ex-VAT) total via the SearchInvoice API, filtered to the job.
+    // Field confirmed on live data: TotalExcludingVatDecimal.
+    async function fetchInvoiceNet(jobId, invoiceId) {
+        const payload = {
+            ProjectId: '', IsProjectInvoicesPage: 'false', RequireSummary: 'false',
+            searchTerm: '', JobId: String(jobId || ''), PPMContractId: '', HireContractId: '',
+            CustomerId: '', SiteId: '', PageSize: '25', PageIndex: '1', OrderBy: '0',
+            startDate: '', endDate: '', paymentDueStartDate: '', paymentDueEndDate: '',
+            SelectedTab: 'ALL_INVOICES', TagIds: '', excludeTagIds: '', batchIds: '',
+            InvoicePaymentStatusIds: '', EmailStatusIds: '',
+            includeStandardInvoices: 'true', includePPMInvoices: 'false', includeSORInvoices: 'false',
+            includeCGroupInvoices: 'false', includeRelatedJobInvoices: 'false',
+            includeHireInvoices: 'false', includeProjectInvoices: 'true',
+        };
+        const fd = new FormData();
+        Object.entries(payload).forEach(([k, v]) => fd.append(k, v));
+        const r = await fetch('/api/Invoice/SearchInvoice', {
+            method: 'POST', credentials: 'same-origin', body: fd,
+            headers: { 'X-Requested-With': 'XMLHttpRequest', '__RequestVerificationToken': getToken() },
+        });
+        if (!r.ok) throw new Error('SearchInvoice HTTP ' + r.status);
+        const j = await r.json();
+        const invs = ((j.AdditionalData || {}).Invoices) || [];
+        const inv = invs.find(x => String(x.Id) === String(invoiceId)) || invs[0];
+        if (!inv) return null;
+        const n = Number(inv.TotalExcludingVatDecimal);
+        return isNaN(n) ? null : n;
+    }
+
+    // =======================================================================
+    // MONDAY WRITE-BACK — find the project item, set Finance Stat + Price Est.
+    // Calls go through GM_xmlhttpRequest (api.monday.com blocks page-origin CORS).
+    // =======================================================================
+    function mondayApi(query, variables) {
+        return new Promise((resolve, reject) => {
+            const tok = mondayToken();
+            if (!tok) { reject(new Error('No Monday token set')); return; }
+            GM_xmlhttpRequest({
+                method: 'POST', url: 'https://api.monday.com/v2',
+                headers: { 'Content-Type': 'application/json', 'Authorization': tok, 'API-Version': '2024-01' },
+                data: JSON.stringify({ query, variables: variables || {} }),
+                timeout: 20000,
+                onload: (resp) => {
+                    let j = null; try { j = JSON.parse(resp.responseText); } catch (e) { reject(new Error('Monday parse error (HTTP ' + resp.status + ')')); return; }
+                    if (j.errors && j.errors.length) { reject(new Error(j.errors.map(e => e.message).join('; '))); return; }
+                    resolve(j.data);
+                },
+                onerror: () => reject(new Error('Monday network error')),
+                ontimeout: () => reject(new Error('Monday timeout')),
+            });
+        });
+    }
+    // Look up the board item by exact PO, then fall back to exact Job Ref.
+    async function mondayFindItem(po, jobRef) {
+        async function byColumn(colId, value) {
+            if (!value) return [];
+            const q = `query { items_page_by_column_values(limit: 10, board_id: ${MONDAY_BOARD}, columns: [{column_id: "${colId}", column_values: ${JSON.stringify([String(value)])}}]) { items { id name } } }`;
+            const d = await mondayApi(q, {});
+            return ((d.items_page_by_column_values || {}).items) || [];
+        }
+        let items = await byColumn(MB_PO, po);
+        let by = 'PO';
+        if (!items.length) { items = await byColumn(MB_JOBREF, jobRef); by = 'JobRef'; }
+        if (!items.length) return null;
+        return { id: items[0].id, name: items[0].name, by, ambiguous: items.length > 1, count: items.length };
+    }
+    async function mondaySetInvoiced(itemId, netAmount) {
+        const cv = {}; cv[MB_FINANCE] = { label: 'Invoiced' };
+        if (netAmount != null && !isNaN(netAmount)) cv[MB_PRICE] = String(netAmount);
+        const q = `mutation { change_multiple_column_values(board_id: ${MONDAY_BOARD}, item_id: ${itemId}, column_values: ${JSON.stringify(JSON.stringify(cv))}) { id } }`;
+        return mondayApi(q, {});
+    }
+
+    // Push one finished job to Monday. Never throws — logs and records status on the job.
+    async function pushJobToMonday(i) {
+        let s = loadState(); if (!s) return;
+        const job = s.jobs[i]; if (!job) return;
+        if (!s.pushMonday) { job.mondayStatus = 'off'; }
+        else if (job.mondayStatus === 'done') { /* already pushed — resume-safe */ return; }
+        else if (job.prepStatus !== 'approved') { job.mondayStatus = 'skipped (not approved)'; }
+        else {
+            try {
+                const po = formatPO(job.po);
+                const hit = await mondayFindItem(po, job.jobNumber);
+                if (!hit) throw new Error(`no Monday item for ${po} / ${job.jobNumber}`);
+                let net = (job.net != null) ? job.net : null;
+                if (net == null) { try { net = await fetchInvoiceNet(job.jobId, job.invoiceId); job.net = net; } catch (e) {} }
+                await mondaySetInvoiced(hit.id, net);
+                job.mondayItemId = hit.id;
+                job.mondayStatus = 'done' + (hit.ambiguous ? ` (⚠ ${hit.count} matched ${hit.by}, used first)` : ` (by ${hit.by})`);
+                log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}${hit.ambiguous ? ` ⚠ ${hit.count} ${hit.by} matches` : ''}`, hit.ambiguous ? '#fd0' : '#0fa');
+            } catch (e) {
+                job.mondayStatus = 'error';
+                job.mondayError = e.message;
+                log(`    ✗ Monday: ${e.message}`, '#f55');
+            }
+        }
+        const cur = loadState(); if (cur) { cur.jobs[i] = job; saveState(cur); renderResults(cur); }
+    }
+
     // =======================================================================
     // PREP PHASE — create + set order number + approve, all via API (no nav)
     // =======================================================================
@@ -302,6 +416,8 @@
             job.prepStatus = 'approved';
             job.emailStatus = 'pending';
             log(`    ✓ approved${job.invoiceNumber ? ` — invoice ${job.invoiceNumber}` : ''}`, '#0fa');
+            try { job.net = await fetchInvoiceNet(job.jobId, job.invoiceId); if (job.net != null) log(`    net (ex VAT) £${job.net}`, '#8fd'); }
+            catch (e) { log(`    (net total lookup failed: ${e.message})`, '#fd0'); }
         } catch (e) {
             job.prepStatus = 'error';
             job.error = e.message;
@@ -344,8 +460,9 @@
     // Open the invoice email composer. Returns when the modal + recipient box exist.
     async function openEmailModal(invoiceId) {
         // Prefer the page's own handler; fall back to clicking the menu item.
-        if (typeof window.onClickShareEmail === 'function') {
-            window.onClickShareEmail('/Invoice/Email/' + invoiceId);
+        // (Sandbox: JL's handler is on the page window, i.e. pageWin/unsafeWindow.)
+        if (typeof pageWin.onClickShareEmail === 'function') {
+            pageWin.onClickShareEmail('/Invoice/Email/' + invoiceId);
         } else {
             const btn = document.getElementById('emailButton') ||
                 [...document.querySelectorAll('a,button')].find(b => /^\s*Email\s*$/.test((b.innerText || '').trim()));
@@ -391,7 +508,7 @@
         //    re-init can overwrite it or replace the whole component.
         for (let attempt = 0; attempt < 8; attempt++) {
             const box = liveBox();
-            const comp = box && box.__vue__; // page context (@grant none) → real component
+            const comp = box && box.__vue__; // main-world component; DOM-typing fallback below if unreachable
             if (comp && typeof comp.updateValue === 'function') {
                 comp.updateValue(emails.slice());
             } else if (box) {
@@ -444,7 +561,7 @@
                 const cur = loadState(); cur.jobs[i].emailStatus = 'sent'; cur.jobs[i].sentAt = nowStamp();
                 saveState(cur); renderResults(cur);
                 log(`    ✓ sent`, '#0fa');
-                advanceJob(); // → prep + navigate to the next job
+                await advanceJob(); // → Monday push, then prep + navigate to the next job
             } else {
                 const cur = loadState(); cur.jobs[i].emailStatus = 'composed';
                 saveState(cur); renderResults(cur);
@@ -481,6 +598,8 @@
 
             // 2. If we can't/shouldn't email this job, move to the next one.
             if (job.prepStatus === 'error' || s.skipEmail || job.emailStatus === 'sent') {
+                // Skip-email mode still counts as "invoiced" → push to Monday (guarded).
+                if (s.skipEmail && job.prepStatus === 'approved') await pushJobToMonday(s.idx);
                 const cur = loadState(); cur.idx += 1; saveState(cur);
                 continue;
             }
@@ -509,11 +628,15 @@
     }
 
     // Advance to the next job after a send (auto, or manual "Sent → Next").
-    function advanceJob() {
-        const s = loadState();
+    async function advanceJob() {
+        let s = loadState();
         if (!s) return;
         const j = s.jobs[s.idx];
         if (j && j.emailStatus === 'composed') { j.emailStatus = 'sent'; j.sentAt = nowStamp(); }
+        saveState(s);
+        renderResults(s);
+        await pushJobToMonday(s.idx);   // Monday write-back for the job just finished (guarded/idempotent)
+        s = loadState(); if (!s) return;
         s.idx += 1;
         saveState(s);
         renderResults(s);
@@ -541,11 +664,19 @@
         const existing = loadState();
         if (existing && existing.running) { alert('A run is already in progress. Use Stop or Reset first.'); return; }
 
+        // Persist a freshly-typed Monday token (kept locally; leave blank to reuse saved).
+        if (mondayTokenInput && mondayTokenInput.value.trim()) {
+            try { localStorage.setItem(MONDAY_TOKEN_KEY, mondayTokenInput.value.trim()); } catch (e) {}
+            mondayTokenInput.value = ''; mondayTokenInput.placeholder = '•••• Monday token saved ••••';
+        }
+        const wantMonday = mondayCheck.checked;
+        if (wantMonday && !mondayToken()) log('⚠ "Update Monday" is on but no Monday token is saved — paste your token first, or the Monday step will be skipped with an error.', '#fd0');
+
         // Offer to resume a stopped, unfinished run so we never re-create done invoices.
         if (existing && existing.jobs && existing.idx < existing.jobs.length &&
             existing.jobs.some(j => j.prepStatus === 'approved' || j.prepStatus === 'error')) {
             if (confirm(`Resume the previous run from job ${existing.idx + 1}/${existing.jobs.length}?\n\nOK = resume where you stopped.\nCancel = start a NEW run from the box above.`)) {
-                const s = loadState(); s.running = true; saveState(s);
+                const s = loadState(); s.running = true; s.pushMonday = wantMonday; saveState(s);
                 setRunningUI(true);
                 log(`Resuming from job ${s.idx + 1}/${s.jobs.length}...`, '#0af');
                 drive();
@@ -560,18 +691,21 @@
             running: true,
             autoSend: autoSendCheck.checked,
             skipEmail: skipEmailCheck.checked,
+            pushMonday: wantMonday,
             idx: 0,
             jobs: rows.map(r => ({
                 jobNumber: r.jobNumber, po: r.po, bad: !!r.bad,
                 jobId: null, siteName: '', siteId: '', reference: '',
-                invoiceId: null, invoiceNumber: '',
+                invoiceId: null, invoiceNumber: '', net: null,
                 prepStatus: 'pending', emailStatus: '', sentAt: '', error: '',
+                mondayStatus: '', mondayItemId: '', mondayError: '',
             })),
         };
         saveState(s);
         logArea.innerHTML = '';
         setRunningUI(true);
-        log(`Processing ${s.jobs.length} job(s), one at a time: create → approve → email → next.`, '#0af');
+        log(`Processing ${s.jobs.length} job(s), one at a time: create → approve → email${wantMonday ? ' → Monday' : ''} → next.`, '#0af');
+        if (wantMonday) log('Monday update ON — each invoiced job sets its board item to "Invoiced" + Price Est. (matched by PO, then Job Ref).', '#0af');
         log(s.autoSend ? 'AUTO-SEND is ON — emails will be sent without pausing.' : 'DRY-RUN — each email is composed and paused for your review.', s.autoSend ? '#f80' : '#ff0');
         if (s.skipEmail) log('SKIP EMAIL is ON — invoices will be created & approved only.', '#ff0');
         drive();
@@ -597,7 +731,7 @@
     // =======================================================================
     // Output — TSV for Google Sheets
     // =======================================================================
-    const TSV_HEADERS = ['Job Number', 'PO', 'Site', 'SITEID', 'Customer Order No', 'Invoice ID', 'Invoice No', 'Status', 'Sent At', 'Error'];
+    const TSV_HEADERS = ['Job Number', 'PO', 'Site', 'SITEID', 'Customer Order No', 'Invoice ID', 'Invoice No', 'Net (ex VAT)', 'Status', 'Sent At', 'Monday', 'Error'];
     function toTSV(s) {
         const lines = [TSV_HEADERS.join('\t')];
         s.jobs.forEach(j => {
@@ -606,9 +740,10 @@
                 : j.emailStatus === 'composed' ? 'Composed (not sent)'
                 : j.emailStatus === 'error' ? 'ERROR (email)'
                 : j.prepStatus === 'approved' ? 'Approved' : 'Pending';
+            const monday = j.mondayStatus === 'error' ? ('ERROR: ' + (j.mondayError || '')) : (j.mondayStatus || '');
             lines.push([
                 j.jobNumber, formatPO(j.po), j.siteName, j.siteId, j.reference,
-                j.invoiceId || '', j.invoiceNumber || '', status, j.sentAt || '', j.error || '',
+                j.invoiceId || '', j.invoiceNumber || '', (j.net != null ? j.net : ''), status, j.sentAt || '', monday, j.error || '',
             ].map(x => String(x == null ? '' : x).replace(/\t/g, ' ').replace(/\r?\n/g, ' ')).join('\t'));
         });
         return lines.join('\n');
@@ -660,7 +795,15 @@
         autoSendCheck = a.cb;
         const sk = mkCheck('Skip email (create + approve only)', 'Create and approve the invoices but do not open the email composer.');
         skipEmailCheck = sk.cb;
-        opts.appendChild(a.l); opts.appendChild(sk.l);
+        const md = mkCheck('Update Monday', 'After each invoice, set the matching Monday item (board "Minor Projects - WW Active") Finance Stat → "Invoiced" and Price Est. (ex VAT) ← the invoice net total. Matches by PO Number, then Job Ref.');
+        mondayCheck = md.cb; mondayCheck.checked = true;
+        opts.appendChild(a.l); opts.appendChild(sk.l); opts.appendChild(md.l);
+        mondayTokenInput = document.createElement('input');
+        mondayTokenInput.type = 'password';
+        mondayTokenInput.placeholder = mondayToken() ? '•••• Monday token saved ••••' : 'Monday API token';
+        mondayTokenInput.title = 'Stored locally in this browser (localStorage). Leave blank to keep the saved one.';
+        mondayTokenInput.style.cssText = 'flex:1;min-width:160px;padding:5px;background:#0a0a1a;color:#eee;border:1px solid #555;border-radius:4px;font-family:monospace;';
+        opts.appendChild(mondayTokenInput);
 
         // Controls
         const ctl = document.createElement('div');
