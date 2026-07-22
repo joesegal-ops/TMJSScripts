@@ -319,3 +319,26 @@ SELECT ID, Site, Priority, Date_Logged, DateComplete, First_Visit, Hours_to_Visi
        WHEN Hours_to_Visit > SLA_Target_Hours THEN "Breached"
        ELSE "Within SLA" END AS SLA_Breached
 FROM with_hours;
+
+-- Statutory / Critical classification from job Tags (2026-07-21). Returns ALL raw.jobs columns EXCEPT
+-- the 27 that are 100% NULL/empty (listed in EXCEPT below) plus a derived Statutory_Category. Tags is a
+-- comma-separated STRING; split + trim so we match WHOLE tags, not substrings (so "Critical Spares" is NOT
+-- counted as "Critical"). Statutory wins if a job somehow carries both. Critical branch is currently 0 rows
+-- (no exact "Critical" tag exists yet) but is future-proof. One row per job.
+-- NB the EXCEPT list is a point-in-time snapshot of all-empty columns; if a previously-empty column starts
+-- getting populated it will stay hidden until removed from this list (re-run the null-count check to refresh).
+CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category` AS
+SELECT
+  j.* EXCEPT (
+    ActualFaultCode, ActualSubFaultCode, AssetFrequency, AttributeDescriptions, AxaAuthorisationCode,
+    AxaRef, CustomerContractId, CustomerContractNumber, DepotId, DepotName, DocumentName, EDIReference,
+    EquipmentClass, ExternalProjectNumber, ImportedEndDate, ImportedStartDate, JobSpendLimit, JobTempSite,
+    ProjectColor, ProjectMilestoneDate, ProjectMilestoneId, ProjectMilestoneName, ReportedFaultCode,
+    ReportedSubFaultCode, SitePreferredEngineerName, SiteTypeDescription, SiteTypeId
+  ),
+  CASE
+    WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory") THEN "Statutory"
+    WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "critical")  THEN "Critical"
+    ELSE "Non-Statutory"
+  END AS Statutory_Category
+FROM `vmimporteddata.raw.jobs` j;
