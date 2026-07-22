@@ -99,6 +99,7 @@
     }
     // ===== end shared dock =====
 
+    const VERSION = '1.2';
     const SCRIPT_ID = 'ppm-add-tag';
     const SCRIPT_LABEL = '🏷 PPM Add Tag to Jobs';
     const SCRIPT_COLOR = '#3d5a2b';
@@ -139,7 +140,7 @@
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;';
         const title = document.createElement('strong');
         title.style.fontSize = '14px';
-        title.textContent = 'PPM — Add Tag to Contract Jobs';
+        title.innerHTML = 'PPM — Add Tag to Contract Jobs <span style="font-weight:400;color:#8a8ab5;font-size:11px;">v' + VERSION + '</span>';
         const closeBtn = document.createElement('button');
         closeBtn.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
         closeBtn.textContent = '✕';
