@@ -53,7 +53,7 @@ function norm_(s) { return (s == null ? '' : String(s)).trim(); }
 function findItems_(vals) {
   var cols = [cfg_('COL_ANCHOR'), cfg_('COL_UPGRADED')];
   var ids = '"' + cfg_('COL_ANCHOR') + '","' + cfg_('COL_UPGRADED') + '","' + cfg_('COL_QUOTE') + '"';
-  var q = 'query($b:ID!,$c:String!,$v:[String]){items_page_by_column_values(board_id:$b,' +
+  var q = 'query($b:ID!,$c:String!,$v:[String!]!){items_page_by_column_values(board_id:$b,' +
           'columns:[{column_id:$c,column_values:$v}],limit:25){items{id name ' +
           'column_values(ids:[' + ids + ']){id text}}}}';
   var seen = {}, out = [];
