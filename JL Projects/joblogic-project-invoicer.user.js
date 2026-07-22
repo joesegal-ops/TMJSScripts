@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.15
+// @version      1.17
 // @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
@@ -351,19 +351,25 @@
         let s = loadState(); if (!s) return;
         const job = s.jobs[i]; if (!job) return;
         if (!s.pushMonday) { job.mondayStatus = 'off'; }
-        else if (job.mondayStatus === 'done') { /* already pushed — resume-safe */ return; }
+        else if (String(job.mondayStatus).indexOf('done') === 0) { /* already pushed — resume-safe */ return; }
         else if (job.prepStatus !== 'approved' && job.prepStatus !== 'already-invoiced') { job.mondayStatus = 'skipped (not approved)'; }
         else {
             try {
                 const po = formatPO(job.po);
                 const hit = await mondayFindItem(po, job.jobNumber);
                 if (!hit) throw new Error(`no Monday item for ${po} / ${job.jobNumber}`);
-                let net = (job.net != null) ? job.net : null;
-                if (net == null) { try { net = await fetchInvoiceNet(job.jobId, job.invoiceId); job.net = net; } catch (e) {} }
-                await mondaySetInvoiced(hit.id, net);
-                job.mondayItemId = hit.id;
-                job.mondayStatus = 'done' + (hit.ambiguous ? ` (⚠ ${hit.count} matched ${hit.by}, used first)` : ` (by ${hit.by})`);
-                log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}${hit.ambiguous ? ` ⚠ ${hit.count} ${hit.by} matches` : ''}`, hit.ambiguous ? '#fd0' : '#0fa');
+                if (hit.ambiguous) {
+                    // Multiple board items match → don't guess. Skip and flag for manual handling.
+                    job.mondayStatus = `skipped (⚠ ${hit.count} ${hit.by} matches — update manually)`;
+                    log(`    ⚠ Monday: ${hit.count} items match ${hit.by} "${hit.by === 'PO' ? po : job.jobNumber}" — SKIPPED, update manually`, '#fd0');
+                } else {
+                    let net = (job.net != null) ? job.net : null;
+                    if (net == null) { try { net = await fetchInvoiceNet(job.jobId, job.invoiceId); job.net = net; } catch (e) {} }
+                    await mondaySetInvoiced(hit.id, net);
+                    job.mondayItemId = hit.id;
+                    job.mondayStatus = `done (by ${hit.by})`;
+                    log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}`, '#0fa');
+                }
             } catch (e) {
                 job.mondayStatus = 'error';
                 job.mondayError = e.message;
@@ -381,8 +387,12 @@
         text.split(/\r?\n/).forEach(line => {
             const t = line.trim();
             if (!t) return;
-            const parts = t.split(/\t|,|\s{2,}|\s*\|\s*/).map(x => x.trim()).filter(Boolean);
-            const jobNumber = parts[0] || '';
+            // Split Job | PO on TAB / pipe / 2+ spaces only — NOT on single commas, because a
+            // job cell can hold several comma-separated job numbers ("PROJ0002205, PROJ0002049").
+            // (Splitting on comma used to read the 2nd job number as the PO.)
+            const parts = t.split(/\t|\s*\|\s*|\s{2,}/).map(x => x.trim()).filter(Boolean);
+            // When a cell has multiple job numbers, invoice against the FIRST one.
+            const jobNumber = (parts[0] || '').split(',')[0].trim();
             // Skip header/label/blank rows — every real Joblogic job number contains a
             // digit, so "Job Number", "PO Number", etc. are dropped automatically.
             // (Without this, "Job Number" fuzzy-matches a random job via SearchJsonData.)
@@ -675,6 +685,24 @@
         setProgress(`Done. ${appr} approved, ${sent} emailed${already ? `, ${already} already-invoiced (Monday only)` : ''}, ${errs} error(s). Copy the results into Google Sheets.`);
         log('===== FINISHED =====', '#0af');
         setRunningUI(false);
+
+        // Collect anything that needs a human, and make it unmissable at the end of the run.
+        const flags = [];
+        s.jobs.forEach(j => {
+            if (j.prepStatus === 'error') flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — invoice error: ${j.error || 'unknown'}`);
+            else if (j.emailStatus === 'error') flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — email error: ${j.error || 'unknown'}`);
+            const m = j.mondayStatus || '';
+            if (m.indexOf('skipped') === 0) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — Monday NOT updated: ${m}`);
+            else if (m === 'error') flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — Monday error: ${j.mondayError || 'unknown'}`);
+        });
+        if (flags.length) {
+            log(`⚠ ${flags.length} item(s) need attention — see popup / Results.`, '#fd0');
+            const shown = flags.slice(0, 40).join('\n');
+            const more = flags.length > 40 ? `\n\n…and ${flags.length - 40} more — see the Results table.` : '';
+            alert(`⚠ Run finished — ${flags.length} item(s) need manual attention:\n\n${shown}${more}`);
+        } else {
+            alert(`✓ Run finished cleanly — ${sent} emailed, ${appr} approved${already ? `, ${already} already-invoiced` : ''}. No items need attention.`);
+        }
     }
 
     // =======================================================================
@@ -792,7 +820,7 @@
 
         const help = document.createElement('div');
         help.style.cssText = 'color:#9fb;margin-bottom:8px;line-height:1.4;';
-        help.innerHTML = 'Paste one row per job: <b>Job Number</b> then a tab (or comma) then <b>PO number</b>. A header row is fine — it\'s skipped automatically.<br>Ref becomes <b>PROJ | PO-XXXX - SITEID</b> (SITEID = first 6 letters of the site, no spaces).';
+        help.innerHTML = 'Paste one row per job: <b>Job Number</b> then a <b>tab</b> then <b>PO number</b> (paste straight from the sheet). If a job cell has two numbers, the first is used. A header row is fine — it\'s skipped automatically.<br>Ref becomes <b>PROJ | PO-XXXX - SITEID</b> (SITEID = first 6 letters of the site, no spaces).';
 
         inputArea = document.createElement('textarea');
         inputArea.placeholder = 'PM0000579/001\tPO-01041292\nPM0000580/001\tPO-01041293';
