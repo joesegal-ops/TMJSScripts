@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - PPM Add Tag to Contract Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Paste a list of PPM Contract numbers + a tag (e.g. "PM0000848  Statutory"). For every job under that contract (PM0000848/001, /002, …) the script adds the tag via the API, preserving any existing tags. Preview (dry-run) before applying. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -99,7 +99,7 @@
     }
     // ===== end shared dock =====
 
-    const VERSION = '1.2';
+    const VERSION = '1.3';
     const SCRIPT_ID = 'ppm-add-tag';
     const SCRIPT_LABEL = '🏷 PPM Add Tag to Jobs';
     const SCRIPT_COLOR = '#3d5a2b';
@@ -576,7 +576,14 @@
         }
         let json = {};
         try { json = JSON.parse(respText); } catch (_) {}
-        if (json.success === false) throw new Error('EditDetail success=false: ' + (json.Message || respText.slice(0, 200)));
+        if (json.success === false) {
+            const errMsg = (Array.isArray(json.errors) && json.errors.length)
+                ? json.errors.join('; ')
+                : (json.Message || respText.slice(0, 200));
+            // Frozen (locked / period-locked) jobs can't be edited — report, don't error.
+            if (/frozen/i.test(errMsg)) return { frozen: true, current };
+            throw new Error(errMsg);
+        }
         return { current, merged };
     }
 
@@ -593,9 +600,20 @@
         const dryRun = dryCheck.checked;
         log(dryRun ? 'DRY RUN — no changes will be made' : 'LIVE MODE — tags will be added', dryRun ? '#ff0' : '#f55');
 
-        const stats = { contracts: 0, jobsFound: 0, tagged: 0, skipped: 0, noJobs: 0, errors: 0 };
+        const stats = { contracts: 0, jobsFound: 0, tagged: 0, skipped: 0, frozen: 0, noJobs: 0, errors: 0 };
         const failed = [];
         const unknownTags = new Set();
+
+        // Persistent progress line: contract position + live running tally + what's happening now.
+        let curContract = 0;
+        const tally = () => {
+            const p = [`✓ ${stats.tagged} tagged`];
+            if (stats.skipped) p.push(`↷ ${stats.skipped} already`);
+            if (stats.frozen)  p.push(`❄ ${stats.frozen} frozen`);
+            if (stats.errors)  p.push(`⚠ ${stats.errors} err`);
+            return p.join('  ·  ');
+        };
+        const showProgress = (now) => setProgress(`Contract ${curContract}/${groups.length}${now ? '  ·  ' + now : ''}  ·  ${tally()}`);
 
         try {
             await loadTags();
@@ -611,6 +629,8 @@
         for (let g = 0; g < groups.length; g++) {
             if (!running) { log('Stopped by user.', '#f55'); break; }
             const { contract, tags } = groups[g];
+            curContract = g + 1;
+            showProgress(`${contract} — resolving`);
 
             // Resolve tag names → ids
             const resolved = [];
@@ -630,7 +650,7 @@
             if (!resolved.length) { failed.push(`${contract} (no valid tags)`); continue; }
 
             const tagLabel = resolved.map(r => r.title).join(', ');
-            setProgress(`Contract ${g + 1}/${groups.length}: ${contract}`);
+            showProgress(`${contract} — searching jobs`);
             log('');
             log(`===== ${contract}  →  add tag: ${tagLabel} =====`, '#fff');
             stats.contracts++;
@@ -657,12 +677,16 @@
             for (let i = 0; i < jobs.length; i++) {
                 if (!running) { log('Stopped by user.', '#f55'); break outer; }
                 const job = jobs[i];
-                setProgress(`${contract} — job ${i + 1}/${jobs.length}: ${job.number}`);
+                showProgress(`${contract} — job ${i + 1}/${jobs.length}: ${job.number}`);
                 try {
                     const res = await addTagsToJob(job.id, addIds, dryRun);
                     if (res.alreadyTagged) {
                         log(`    ${job.number}: already tagged — skipped`, '#888');
                         stats.skipped++;
+                    } else if (res.frozen) {
+                        log(`    ${job.number}: frozen — cannot edit, skipped`, '#fa0');
+                        stats.frozen++;
+                        failed.push(`${job.number} (frozen)`);
                     } else if (res.dry) {
                         log(`    [DRY] ${job.number}: would set ${res.current.length} → ${res.merged.length} tags`, '#ff0');
                         stats.tagged++;
@@ -675,6 +699,7 @@
                     stats.errors++;
                     failed.push(`${job.number} (${e.message})`);
                 }
+                showProgress();
                 await sleep(DELAY_BETWEEN_JOBS);
             }
         }
@@ -685,14 +710,15 @@
         log(`Jobs found:          ${stats.jobsFound}`, '#0fa');
         log(`Tagged:              ${stats.tagged}`, '#0fa');
         log(`Already tagged:      ${stats.skipped}`, stats.skipped ? '#fa0' : '#888');
+        log(`Frozen (skipped):    ${stats.frozen}`, stats.frozen ? '#fa0' : '#888');
         log(`Contracts w/ 0 jobs: ${stats.noJobs}`, stats.noJobs ? '#fa0' : '#888');
         log(`Errors:              ${stats.errors}`, stats.errors ? '#f55' : '#888');
         if (failed.length) {
             log('');
-            log('Failed:', '#f55');
+            log('Not tagged:', '#f55');
             failed.forEach(f => log('  ' + f, '#f99'));
         }
-        setProgress(`Done. ${stats.tagged} job${stats.tagged === 1 ? '' : 's'} tagged.`);
+        setProgress(`Done — ${curContract}/${groups.length} contracts  ·  ${tally()}`);
 
         running = false;
         startBtn.style.display = 'inline-block';

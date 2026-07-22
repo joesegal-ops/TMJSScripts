@@ -11,6 +11,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 25 */3 * * * root /opt/jl-loader/run_incremental.sh invoices      >> /opt/jl-loader/loader.log 2>&1
 30 */3 * * * root /opt/jl-loader/run_incremental.sh forms_logbook >> /opt/jl-loader/loader.log 2>&1
 35 */3 * * * root /opt/jl-loader/run_tier.sh "purchaseorder/getall:purchase_orders,SubcontractorPurchaseOrder/GetAll:subcontractor_purchase_orders" >> /opt/jl-loader/loader.log 2>&1
+# Quote -> Monday: fill blank Quote cells + refresh mismatch report (fill-blanks-only; never overwrites). After the quote refresh.
+45 */3 * * * root MONDAY_REPORT_PATH=/opt/jl-loader/monday_quote_report.csv /opt/jl-loader/run_sync_monday.sh apply >> /opt/jl-loader/loader.log 2>&1
 # Nightly full nets for cheap transactional tables (catch edits the date windows miss)
 40 2 * * * root /opt/jl-loader/run_tier.sh "Quote/GetAll:quotes,FormsLogbook/getall:forms_logbook" >> /opt/jl-loader/loader.log 2>&1
 # Weekly invoices full backfill (chunked monthly to avoid the 403 quota) - Sunday 01:00
