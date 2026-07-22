@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - PPM Add Tag to Contract Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.2
 // @description  Paste a list of PPM Contract numbers + a tag (e.g. "PM0000848  Statutory"). For every job under that contract (PM0000848/001, /002, …) the script adds the tag via the API, preserving any existing tags. Preview (dry-run) before applying. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -338,31 +338,56 @@
         return resp.text();
     }
 
-    // Global tag library (entityType is the STRING "Job") → norm(title) -> {id, title}
-    async function loadTags() {
-        if (tagMap) return tagMap;
-        const resp = await fetch('/api/Tag/GetTags?entityType=Job', {
+    // Query the Job tag library. entityType is the STRING "Job"; the endpoint
+    // acts as an autocomplete — text='' returns the full list, text=<name>
+    // returns matches (useful if the full list is ever capped/empty).
+    async function fetchTags(text) {
+        const resp = await fetch('/api/Tag/GetTags?entityType=Job&text=' + encodeURIComponent(text || ''), {
             credentials: 'same-origin',
             headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' }
         });
         if (!resp.ok) throw new Error('GetTags HTTP ' + resp.status);
         const list = await resp.json();
         const arr = Array.isArray(list) ? list : (list.AdditionalData || list.Data || []);
-        const map = {};
+        const found = [];
         for (const t of arr) {
             const id = t.Id != null ? t.Id : t.TagId;
             const title = t.Title || t.Name || t.Text;
-            if (id != null && title) map[norm(title)] = { id: String(id), title };
+            if (id != null && title) found.push({ id: String(id), title });
         }
+        return found;
+    }
+
+    // Build the global tag map (norm(title) -> {id, title}) once.
+    async function loadTags() {
+        if (tagMap) return tagMap;
+        const map = {};
+        for (const t of await fetchTags('')) map[norm(t.title)] = t;
         tagMap = map;
-        log(`Tag library loaded (${Object.keys(map).length} tags).`, '#0a8');
+        const n = Object.keys(map).length;
+        if (n === 0) {
+            log('Tag library is EMPTY — this Joblogic company has no Job tags defined.', '#f55');
+            log('  Check you are logged into the correct company (top-right company switcher),', '#fa0');
+            log('  or create the tag(s) once under Settings → Tags before running.', '#fa0');
+        } else {
+            log(`Tag library loaded (${n} tags).`, '#0a8');
+        }
         return map;
     }
 
-    function resolveTag(tagName) {
+    // Resolve a tag name → {id,title}. Exact, then autocomplete fetch, then fuzzy.
+    async function resolveTag(tagName) {
         const key = norm(tagName);
         if (tagMap[key]) return tagMap[key];
-        // fuzzy contains match as a fallback
+        // Autocomplete fallback: ask the server directly for this name.
+        try {
+            for (const t of await fetchTags(tagName)) {
+                tagMap[norm(t.title)] = t;
+                if (norm(t.title) === key) return t;
+            }
+        } catch (e) { /* fall through to fuzzy */ }
+        if (tagMap[key]) return tagMap[key];
+        // fuzzy contains match as a last resort
         const partial = Object.values(tagMap).find(t => norm(t.title).includes(key) || key.includes(norm(t.title)));
         return partial || null;
     }
@@ -371,7 +396,8 @@
     // JobNumber matches <contract>/NNN.
     async function findContractJobs(contract) {
         const token = getCsrf();
-        const re = new RegExp('^' + escapeRe(contract) + '\\/\\d+$', 'i');
+        // Match <contract>/NNN and also 3-part numbers like <contract>/NNN/NNN
+        const re = new RegExp('^' + escapeRe(contract) + '\\/\\d+(?:\\/\\d+)*$', 'i');
         const matches = [];
         let pageIndex = 1, total = null, seen = 0;
 
@@ -588,7 +614,7 @@
             // Resolve tag names → ids
             const resolved = [];
             for (const tg of tags) {
-                const r = resolveTag(tg);
+                const r = await resolveTag(tg);
                 if (!r) {
                     log(`Unknown tag "${tg}" (contract ${contract}) — skipping this tag`, '#f55');
                     if (!unknownTags.has(norm(tg))) {
