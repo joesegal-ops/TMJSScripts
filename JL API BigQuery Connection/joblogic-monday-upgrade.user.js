@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JobLogic → Monday: Upgraded Job Ref
 // @namespace    up-fm.joblogic.monday
-// @version      1.1.0
+// @version      1.1.1
 // @description  When a JobLogic quote has been upgraded to a job, push the upgraded job number to the matching Monday item (via the Apps Script relay). Part of the JobLogic→Monday integration.
 // @match        https://go.joblogic.com/Job/Detail/*
 // @match        https://go.joblogic.com/Quote/Detail/*
@@ -10,6 +10,8 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_listValues
+// @grant        GM_deleteValue
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20API%20BigQuery%20Connection/joblogic-monday-upgrade.user.js
@@ -38,6 +40,12 @@
     if (v !== null) { GM_setValue(SECRET_KEY, v.trim()); alert('Saved. Reload a JobLogic quote/job page to use it.'); }
   });
 
+  GM_registerMenuCommand('Reset JL→Monday sent cache', function () {
+    let n = 0;
+    GM_listValues().forEach(function (k) { if (k.indexOf('jlm:') === 0) { GM_deleteValue(k); n++; } });
+    alert('Cleared ' + n + ' cached send(s). Reload the page to re-send.');
+  });
+
   async function quoteIdForPage() {
     const path = location.pathname;
     let m = path.match(/\/Quote\/Detail\/(\d+)/);
@@ -51,7 +59,7 @@
     return (qid && qid !== '0') ? qid : null;
   }
 
-  function postToRelay(payload) {
+  function postToRelay(payload, dedupeKey) {
     GM_xmlhttpRequest({
       method: 'POST', url: RELAY_URL,
       headers: { 'Content-Type': 'application/json' },
@@ -59,6 +67,8 @@
       onload: (r) => {
         let res; try { res = JSON.parse(r.responseText); } catch (e) { res = r.responseText; }
         log('relay response:', res);
+        // Only mark as sent on a real success, so errors / no-match retry on the next view.
+        if (res && res.ok === true && res.status === 'ok') GM_setValue(dedupeKey, Date.now());
       },
       onerror: (e) => log('relay error:', e),
     });
@@ -81,8 +91,7 @@
       if (GM_getValue(key)) { log('already sent', key); return; }
 
       log('sending', { quoteNumber, parentJobStringId, jobNumber });
-      postToRelay({ secret, jobNumber, parentJobStringId, quoteNumber });
-      GM_setValue(key, Date.now());
+      postToRelay({ secret, jobNumber, parentJobStringId, quoteNumber }, key);
     } catch (e) {
       log('error', e);
     }
