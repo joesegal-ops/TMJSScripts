@@ -57,7 +57,8 @@
       "WebFetch(domain:api.joblogic.com)",
       "Bash(cd \"/Users/joesegal/Documents/Claude Code\"; grep -rhoiE \"go\\\\.joblogic\\\\.com/[A-Za-z0-9/_?=&{}.#-]*\" . 2>/dev/null | grep -iE \"job\" | grep -viE \"ppmcontract|quote|invoice|purchase|form\" | sort -u | head -40)",
       "Bash(grep -rhoiE \"joblogic\\\\.com/Job[A-Za-z0-9/_?=&{}.#\\\\$'\\\\\"+-]*\" .)",
-      "Bash(ls -la \"/Users/joesegal/Documents/Claude Code/JL PPMs/\" && echo \"---MEMORY---\" && ls \"/Users/joesegal/.claude/projects/-Users-joesegal-Documents-Claude-Code/memory/\")"
+      "Bash(ls -la \"/Users/joesegal/Documents/Claude Code/JL PPMs/\" && echo \"---MEMORY---\" && ls \"/Users/joesegal/.claude/projects/-Users-joesegal-Documents-Claude-Code/memory/\")",
+      "Bash(node --check ppm-renew-contracts.user.js)"
     ]
   }
 }
