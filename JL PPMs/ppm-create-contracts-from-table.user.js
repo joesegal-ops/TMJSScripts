@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL - Bulk Create PPM Contracts (WeWork 26/27)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.4.0
+// @version      1.4.1
 // @description  Bulk-creates PPM Contracts in Joblogic from a table pasted from Google Sheets (Total for 26/27, Customer Order Number, Site, Plan Reference). Resolves each site + its Billing address via /Site/GetSites and posts to /api/PPMContract/CreatePPMContract. Preview (dry-run) before creating. v1.4: skips plan references that already exist (safe to re-run), throttles + retries around the WAF 403 rate-limit.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
@@ -124,7 +124,7 @@
 
   const SCRIPT_ID = 'ppm-create-contracts-from-table';
   const SCRIPT_LABEL = '🏢 Create PPM Contracts';
-  const SCRIPT_COLOR = '#1b8a4b';
+  const SCRIPT_COLOR = '#ff7919';
   const SCRIPT_DESC = 'Paste the WeWork PPM table from Google Sheets (include the header row). Each row becomes an Invoice / Monthly (in advance) contract, 01/08/2026–31/07/2027, value = "Total for 26/27" (ex-VAT), invoiced to the Site (Billing) address, selling rate Non-Chargeable, no job category. Columns are matched by header name (Total for 26/27, Customer Order Number, Site, Plan Reference). Sites + billing addresses are looked up live. Click Preview first (no changes are made); then Create all and confirm. Safe to re-run — any plan reference that already exists is skipped, not duplicated.';
 
   // ----------------------------------------------------------------------------
