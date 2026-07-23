@@ -7,6 +7,8 @@
 // @match        https://go.joblogic.com/PPMContract/*
 // @run-at       document-idle
 // @grant        none
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-renew-contracts.user.js
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-renew-contracts.user.js
 // ==/UserScript==
 
 /*
