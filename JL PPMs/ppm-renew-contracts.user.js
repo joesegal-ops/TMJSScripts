@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL - Renew / Duplicate PPM Contracts (next year)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.1.0
+// @version      1.2.0
 // @description  Bulk-renews (duplicates) a list of PPM Contracts into the next year using Joblogic's native Renew flow. Paste PM numbers (or plan references), one per line. For each contract it opens the Renew form, rolls the visits by the rule — MORE THAN 12 visits → 52 weeks later, otherwise → 365 days later — keeps Joblogic's +1-year start date, and posts to /api/PPMContract/RenewPPMContract. Preview (dry-run) first; nothing is created until you click Renew all and confirm.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
@@ -329,7 +329,7 @@
       '<input type="checkbox" id="rc-opt-' + o.key + '"' + (o.def ? ' checked' : '') + '> ' + esc(o.label) + '</label>'
     ).join('');
     p.innerHTML = `
-      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🔁 Renew PPM Contracts <span style="font-weight:400;color:#888;">v1.1</span></div>
+      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🔁 Renew PPM Contracts <span style="font-weight:400;color:#888;">v1.2</span></div>
       <div style="background:#f4f6f9;border:1px solid #e2e7ee;border-radius:4px;padding:8px;margin-bottom:8px;line-height:1.55;">
         Duplicates each contract into the next year via Joblogic's native Renew.<br>
         <b>Visit roll:</b> &gt; ${CFG.visitThreshold} visits → <b>${rollLabel(CFG.rollManyVisits)}</b> later · otherwise → <b>${rollLabel(CFG.rollFewVisits)}</b> later.<br>
@@ -347,7 +347,8 @@
       <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
         <button id="rc-preview" class="jl-button-green" style="padding:5px 14px;">Preview</button>
         <button id="rc-renew" class="jl-button-green" style="padding:5px 14px;">Renew all</button>
-        <button id="rc-copy" style="padding:5px 12px;margin-left:auto;background:#eef1f5;color:#243b46;border:1px solid #c9d4da;border-radius:4px;cursor:pointer;">Copy log</button>
+        <button id="rc-copyfail" title="Copy the not-renewed rows as tab-separated text you can paste straight into Google Sheets" style="padding:5px 12px;margin-left:auto;background:#fff2e8;color:#8a4b00;border:1px solid #f0c39a;border-radius:4px;cursor:pointer;opacity:.5;" disabled>Copy failures</button>
+        <button id="rc-copy" style="padding:5px 12px;background:#eef1f5;color:#243b46;border:1px solid #c9d4da;border-radius:4px;cursor:pointer;">Copy log</button>
       </div>
       <div id="rc-status" style="margin-bottom:6px;font-weight:600;"></div>
       <div id="rc-out" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;max-height:40vh;overflow:auto;background:#fbfcfe;border:1px solid #e2e7ee;border-radius:4px;padding:8px;white-space:pre-wrap;">Paste PM numbers above, then click Preview — nothing is created.</div>`;
@@ -369,6 +370,14 @@
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const optState = () => { const s = {}; OPTIONS.forEach(o => { s[o.key] = panel.querySelector('#rc-opt-' + o.key).checked; }); return s; };
 
+    const failBtn = $('copyfail');
+    let failTsv = '';
+    const setFailTsv = tsv => {
+      failTsv = tsv || '';
+      failBtn.disabled = !failTsv;
+      failBtn.style.opacity = failTsv ? '1' : '.5';
+    };
+    failBtn.onclick = () => { if (failTsv) navigator.clipboard.writeText(failTsv); };
     $('copy').onclick = () => { navigator.clipboard.writeText(outEl.textContent); };
     prevBtn.onclick = () => run(true);
     goBtn.onclick = () => run(false);
@@ -377,6 +386,10 @@
       if (running) return;
       const entries = parseList($('list').value);
       outEl.textContent = '';
+      setFailTsv('');
+      // Rows that did NOT renew — collected for the copy-to-Sheets summary.
+      const report = [];
+      const addReport = (term, pm, site, statusTxt, detail) => report.push({ term, pm: pm || '', site: site || '', status: statusTxt, detail: detail || '' });
       if (!entries.length) { status('Paste at least one PM number first.', 'err'); return; }
       if (!getToken()) log('! Anti-forgery token not found on page — try reloading if requests are rejected.', 'warn');
       log('Parsed ' + entries.length + ' contract(s) to renew.');
@@ -405,6 +418,7 @@
           const flag = src.IsCancelled ? 'cancelled' : (src.IsSuspended ? 'suspended' : '');
           if (flag && skipSuspended) {
             log('↷ ' + tag + ' — ' + src.PPMContractNumber + ' is ' + flag + '; skipped', 'warn');
+            addReport(entry.term, src.PPMContractNumber, src.SiteName, flag.charAt(0).toUpperCase() + flag.slice(1) + ' (skipped)', '');
             skipped++; await sleep(200); continue;
           }
           const rf = await fetchRenewForm(src.UniqueId);
@@ -422,13 +436,13 @@
             log('    ' + info);
             log('    NEW: "' + rf.planReference + '"  start ' + rf.startDate + (rf.endDate ? ' → ' + rf.endDate : ''));
             log('    roll visits ' + rollLabel(roll) + ' later' + (rf.visitCount > CFG.visitThreshold ? '  (>' + CFG.visitThreshold + ' visits)' : ''));
-            if (dup) log('    ⚠ a contract with this plan ref + start date already exists — would DUPLICATE', 'warn');
+            if (dup) { log('    ⚠ a contract with this plan ref + start date already exists — would DUPLICATE', 'warn'); addReport(entry.term, src.PPMContractNumber, src.SiteName, 'Would duplicate', 'plan ref "' + rf.planReference + '" + start ' + rf.startDate + ' already exists'); }
             continue;
           }
 
-          if (dup) { log('↷ ' + tag + ' — already renewed (plan ref + start date exist); skipped', 'warn'); skipped++; await sleep(300); continue; }
+          if (dup) { log('↷ ' + tag + ' — already renewed (plan ref + start date exist); skipped', 'warn'); addReport(entry.term, src.PPMContractNumber, src.SiteName, 'Duplicate (skipped)', 'plan ref "' + rf.planReference + '" + start ' + rf.startDate + ' already exists'); skipped++; await sleep(300); continue; }
 
-          let created = false;
+          let created = false, failReason = '';
           for (let attempt = 0; attempt <= CFG.maxRetries && !created; attempt++) {
             const fd = buildRenewBody(rf, opts, roll);
             const res = await postRenew(fd, rf.token || getToken());
@@ -450,21 +464,39 @@
               log('… ' + tag + ' — HTTP ' + res.status + ' (rate-limited); retrying in ' + Math.round(wait / 1000) + 's', 'warn');
               await sleep(wait);
             } else {
-              log('✗ ' + tag + ' — FAILED (HTTP ' + (res.status || '?') + ') ' + (res.resp ? JSON.stringify(res.resp).slice(0, 160) : res.raw), 'err');
+              failReason = 'HTTP ' + (res.status || '?') + (res.resp ? ' ' + JSON.stringify(res.resp).slice(0, 160) : (res.raw ? ' ' + res.raw : ''));
+              log('✗ ' + tag + ' — FAILED (' + failReason + ')', 'err');
               break;
             }
           }
-          if (created) done++; else failed++;
+          if (created) done++;
+          else { failed++; addReport(entry.term, src.PPMContractNumber, src.SiteName, 'Failed', failReason || 'renew did not confirm after ' + (CFG.maxRetries + 1) + ' attempt(s)'); }
           await sleep(CFG.postDelayMs);
         } catch (e) {
           failed++;
-          log('✗ ' + tag + ' — ' + (e && e.message ? e.message : e), 'err');
+          const msg = (e && e.message ? e.message : String(e));
+          log('✗ ' + tag + ' — ' + msg, 'err');
+          addReport(entry.term, '', '', 'Error', msg);
         }
       }
 
       const tail = skipped ? (', ' + skipped + ' skipped') : '';
       status('Done: ' + done + ' ' + (dryRun ? 'to renew' : 'renewed') + ', ' + failed + ' problem(s)' + tail + '.', failed ? 'warn' : 'ok');
       log('── DONE: ' + done + ' ' + (dryRun ? 'to renew' : 'renewed') + ', ' + failed + ' problem(s)' + tail + ' ──', failed ? 'warn' : 'ok');
+
+      // Copy-to-Sheets summary of every row that did NOT renew.
+      if (report.length) {
+        const cell = s => String(s == null ? '' : s).replace(/[\t\r\n]+/g, ' ').trim();
+        const header = ['Input', 'PM Number', 'Site', 'Status', 'Detail'];
+        const tsv = [header.join('\t')].concat(report.map(r => [r.term, r.pm, r.site, r.status, r.detail].map(cell).join('\t'))).join('\n');
+        setFailTsv(tsv);
+        log('');
+        log(report.length + ' row(s) did not renew — click "Copy failures" to copy them (tab-separated) for Google Sheets:', 'warn');
+        log(tsv);
+      } else {
+        log('No problems — nothing to copy.', 'ok');
+      }
+
       if (dryRun && !failed) log('Preview looks clean. Click "Renew all" to proceed.', 'ok');
       running = false; prevBtn.disabled = goBtn.disabled = false; prevBtn.style.opacity = goBtn.style.opacity = '1';
     }
