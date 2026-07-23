@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.17
+// @version      1.18
 // @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
@@ -267,9 +267,18 @@
         return true;
     }
 
-    // Invoice net (ex-VAT) total via the SearchInvoice API, filtered to the job.
-    // Field confirmed on live data: TotalExcludingVatDecimal.
-    async function fetchInvoiceNet(jobId, invoiceId) {
+    // Pull the PO token out of a Customer Order Number (which "can be anything").
+    // e.g. "PROJ | PO-01023659 - 120MOO" or "po 011924580" → "PO-011924580".
+    function extractPO(orderNumber, fallbackPo) {
+        const m = String(orderNumber || '').match(/\b(PO|RE)\s*[-\/]?\s*(\d+)/i);
+        if (m) return m[1].toUpperCase() + '-' + m[2];
+        const fb = String(fallbackPo || '').trim();
+        return fb ? formatPO(fb) : '';
+    }
+
+    // Invoice net (ex-VAT total) + Customer Order Number via the SearchInvoice API, for the job.
+    // Fields confirmed on live data: TotalExcludingVatDecimal, OrderNumber.
+    async function fetchInvoiceInfo(jobId, invoiceId) {
         const payload = {
             ProjectId: '', IsProjectInvoicesPage: 'false', RequireSummary: 'false',
             searchTerm: '', JobId: String(jobId || ''), PPMContractId: '', HireContractId: '',
@@ -290,16 +299,18 @@
         if (!r.ok) throw new Error('SearchInvoice HTTP ' + r.status);
         const j = await r.json();
         const invs = ((j.AdditionalData || {}).Invoices) || [];
-        if (!invs.length) return null;
-        // Normal path: the invoice we just created has lines → use its net.
+        if (!invs.length) return { net: null, orderNumber: '' };
+        // Pick the source invoice: normally the one we just created (has lines); if that's
+        // empty/£0 (already-invoiced job), fall back to the job's largest-net invoice — the
+        // real prior one — and read BOTH its net and its Customer Order Number from there.
         const exact = invs.find(x => String(x.Id) === String(invoiceId));
-        const exactNet = exact ? Number(exact.TotalExcludingVatDecimal) : NaN;
-        if (!isNaN(exactNet) && exactNet > 0) return exactNet;
-        // Empty/already-invoiced job: our new invoice is £0 → take the largest net among
-        // this job's invoices, i.e. the real (prior) invoice.
-        const best = invs.reduce((m, x) => { const v = Number(x.TotalExcludingVatDecimal) || 0; return v > m ? v : m; }, 0);
-        if (best > 0) return best;
-        return isNaN(exactNet) ? null : exactNet;
+        let chosen = (exact && Number(exact.TotalExcludingVatDecimal) > 0) ? exact : null;
+        if (!chosen) {
+            const top = invs.reduce((b, x) => ((Number(x.TotalExcludingVatDecimal) || 0) > (Number(b.TotalExcludingVatDecimal) || 0) ? x : b), invs[0]);
+            chosen = (Number(top.TotalExcludingVatDecimal) || 0) > 0 ? top : (exact || top);
+        }
+        const net = chosen ? Number(chosen.TotalExcludingVatDecimal) : NaN;
+        return { net: isNaN(net) ? null : net, orderNumber: (chosen && chosen.OrderNumber) || (exact && exact.OrderNumber) || '' };
     }
 
     // =======================================================================
@@ -339,9 +350,10 @@
         if (!items.length) return null;
         return { id: items[0].id, name: items[0].name, by, ambiguous: items.length > 1, count: items.length };
     }
-    async function mondaySetInvoiced(itemId, netAmount) {
+    async function mondaySetInvoiced(itemId, netAmount, poNumber) {
         const cv = {}; cv[MB_FINANCE] = { label: 'Invoiced' };
         if (netAmount != null && !isNaN(netAmount)) cv[MB_PRICE] = String(netAmount);
+        if (poNumber) cv[MB_PO] = String(poNumber);
         const q = `mutation { change_multiple_column_values(board_id: ${MONDAY_BOARD}, item_id: ${itemId}, column_values: ${JSON.stringify(JSON.stringify(cv))}) { id } }`;
         return mondayApi(q, {});
     }
@@ -363,12 +375,17 @@
                     job.mondayStatus = `skipped (⚠ ${hit.count} ${hit.by} matches — update manually)`;
                     log(`    ⚠ Monday: ${hit.count} items match ${hit.by} "${hit.by === 'PO' ? po : job.jobNumber}" — SKIPPED, update manually`, '#fd0');
                 } else {
+                    // Make sure we have the net + the invoice's Customer Order Number.
                     let net = (job.net != null) ? job.net : null;
-                    if (net == null) { try { net = await fetchInvoiceNet(job.jobId, job.invoiceId); job.net = net; } catch (e) {} }
-                    await mondaySetInvoiced(hit.id, net);
+                    let orderNo = job.orderNumber || '';
+                    if (net == null || !orderNo) {
+                        try { const info = await fetchInvoiceInfo(job.jobId, job.invoiceId); if (net == null) { net = info.net; job.net = net; } if (!orderNo) { orderNo = info.orderNumber; job.orderNumber = orderNo; } } catch (e) {}
+                    }
+                    const poForMonday = extractPO(orderNo, job.po);   // from Customer Order Number, fall back to pasted PO
+                    await mondaySetInvoiced(hit.id, net, poForMonday);
                     job.mondayItemId = hit.id;
                     job.mondayStatus = `done (by ${hit.by})`;
-                    log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}`, '#0fa');
+                    log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}${poForMonday ? `, PO ${poForMonday}` : ''}`, '#0fa');
                 }
             } catch (e) {
                 job.mondayStatus = 'error';
@@ -436,15 +453,15 @@
             job.prepStatus = 'approved';
             job.emailStatus = 'pending';
             log(`    ✓ approved${job.invoiceNumber ? ` — invoice ${job.invoiceNumber}` : ''}`, '#0fa');
-            try { job.net = await fetchInvoiceNet(job.jobId, job.invoiceId); if (job.net != null) log(`    net (ex VAT) £${job.net}`, '#8fd'); }
-            catch (e) { log(`    (net total lookup failed: ${e.message})`, '#fd0'); }
+            try { const info = await fetchInvoiceInfo(job.jobId, job.invoiceId); job.net = info.net; job.orderNumber = info.orderNumber; if (job.net != null) log(`    net (ex VAT) £${job.net}`, '#8fd'); }
+            catch (e) { log(`    (net/order-number lookup failed: ${e.message})`, '#fd0'); }
         } catch (e) {
             if (/no lines/i.test(e.message)) {
                 // "No lines to add" = the job was already invoiced earlier. Skip the email
                 // (nothing to send) but still flip Monday, pulling the net from the real invoice.
                 job.prepStatus = 'already-invoiced';
                 job.emailStatus = 'skipped';
-                try { job.net = await fetchInvoiceNet(job.jobId, job.invoiceId); } catch (x) {}
+                try { const info = await fetchInvoiceInfo(job.jobId, job.invoiceId); job.net = info.net; job.orderNumber = info.orderNumber; } catch (x) {}
                 log(`    ⓘ already invoiced (no new lines) — skipping email, still updating Monday${job.net != null ? ` (net £${job.net})` : ''}`, '#fd0');
             } else {
                 job.prepStatus = 'error';
@@ -739,7 +756,7 @@
             jobs: rows.map(r => ({
                 jobNumber: r.jobNumber, po: r.po, bad: !!r.bad,
                 jobId: null, siteName: '', siteId: '', reference: '',
-                invoiceId: null, invoiceNumber: '', net: null,
+                invoiceId: null, invoiceNumber: '', net: null, orderNumber: '',
                 prepStatus: 'pending', emailStatus: '', sentAt: '', error: '',
                 mondayStatus: '', mondayItemId: '', mondayError: '',
             })),
