@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL - Renew / Duplicate PPM Contracts (next year)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.4.0
+// @version      1.5.0
 // @description  Bulk-renews (duplicates) a list of PPM Contracts into the next year using Joblogic's native Renew flow. Paste PM numbers (or plan references), one per line. For each contract it opens the Renew form, rolls the visits by the rule — MORE THAN 12 visits → 52 weeks later, otherwise → 365 days later — keeps Joblogic's +1-year start date, and posts to /api/PPMContract/RenewPPMContract. Preview (dry-run) first; nothing is created until you click Renew all and confirm.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
@@ -130,6 +130,7 @@
   const SCRIPT_LABEL = '🔁 Renew PPM Contracts';
   const SCRIPT_COLOR = '#ff7919';
   const SCRIPT_DESC = 'Paste a list of PPM contracts to duplicate into the next year (PM numbers like PM0001723, one per line — plan references also work). Each one is renewed through Joblogic\'s native Renew flow: it keeps Joblogic\'s +1-year start date and carries everything over, and rolls the VISITS by your rule — more than 12 visits → 52 weeks later, otherwise → 365 days later. Renew options default to Joblogic\'s defaults; adjust the tick-boxes if needed. Click Preview first (nothing is created); then Renew all and confirm. Each renewal creates a NEW contract — running twice makes duplicates.';
+  const LS_KEY = 'ppm-renew-last-results'; // persists the last run’s results table so it survives navigating away
 
   // ----------------------------------------------------------------------------
   // CONFIG
@@ -351,7 +352,7 @@
       '<input type="checkbox" id="rc-opt-' + o.key + '"' + (o.def ? ' checked' : '') + '> ' + esc(o.label) + '</label>'
     ).join('');
     p.innerHTML = `
-      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🔁 Renew PPM Contracts <span style="font-weight:400;color:#888;">v1.4</span></div>
+      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🔁 Renew PPM Contracts <span style="font-weight:400;color:#888;">v1.5</span></div>
       <div style="background:#f4f6f9;border:1px solid #e2e7ee;border-radius:4px;padding:8px;margin-bottom:8px;line-height:1.55;">
         Duplicates each contract into the next year via Joblogic's native Renew.<br>
         <b>Visit roll:</b> &gt; ${CFG.visitThreshold} visits → <b>${rollLabel(CFG.rollManyVisits)}</b> later · otherwise → <b>${rollLabel(CFG.rollFewVisits)}</b> later.<br>
@@ -370,6 +371,7 @@
         <button id="rc-preview" class="jl-button-green" style="padding:5px 14px;">Preview</button>
         <button id="rc-renew" class="jl-button-green" style="padding:5px 14px;">Renew all</button>
         <button id="rc-copyres" title="Copy one row per pasted contract — new PPM number on success, or the error/status — as tab-separated text you can paste straight into Google Sheets" style="padding:5px 12px;margin-left:auto;background:#fff2e8;color:#8a4b00;border:1px solid #f0c39a;border-radius:4px;cursor:pointer;opacity:.5;" disabled>Copy results</button>
+        <button id="rc-last" style="padding:5px 12px;background:#eef1f5;color:#243b46;border:1px solid #c9d4da;border-radius:4px;cursor:pointer;opacity:.5;" disabled>Last results</button>
         <button id="rc-copy" style="padding:5px 12px;background:#eef1f5;color:#243b46;border:1px solid #c9d4da;border-radius:4px;cursor:pointer;">Copy log</button>
       </div>
       <div id="rc-status" style="margin-bottom:6px;font-weight:600;"></div>
@@ -400,6 +402,31 @@
       resBtn.style.opacity = resTsv ? '1' : '.5';
     };
     resBtn.onclick = () => { if (resTsv) navigator.clipboard.writeText(resTsv); };
+
+    // "Last results" — the previous run's table, saved on this browser so it survives
+    // navigating away / closing the tab. Persisted after every run below.
+    const lastBtn = $('last');
+    const readLast = () => { try { return JSON.parse(localStorage.getItem(LS_KEY)); } catch (e) { return null; } };
+    const refreshLast = () => {
+      const m = readLast();
+      if (m && m.tsv) {
+        lastBtn.disabled = false; lastBtn.style.opacity = '1';
+        lastBtn.title = 'Copy the last run’s results (' + m.count + ' row(s), saved ' + m.savedAt + (m.dryRun ? ', preview' : '') + '). Saved on this browser — survives navigating away.';
+      } else {
+        lastBtn.disabled = true; lastBtn.style.opacity = '.5';
+        lastBtn.title = 'No saved results yet — every run is saved here automatically.';
+      }
+    };
+    lastBtn.onclick = () => {
+      const m = readLast();
+      if (!m || !m.tsv) { status('No saved results found on this browser.', 'warn'); return; }
+      navigator.clipboard.writeText(m.tsv).then(
+        () => status('Copied last run’s ' + m.count + ' result row(s) (saved ' + m.savedAt + ') — paste into Google Sheets.', 'ok'),
+        () => status('Clipboard blocked — click anywhere on the page, then click Last results again.', 'warn')
+      );
+    };
+    refreshLast();
+
     $('copy').onclick = () => { navigator.clipboard.writeText(outEl.textContent); };
     prevBtn.onclick = () => run(true);
     goBtn.onclick = () => run(false);
@@ -523,6 +550,9 @@
         const header = ['Input', 'Source PM', 'Site', 'Status', 'New Contract', 'Detail'];
         const tsv = [header.join('\t')].concat(results.map(r => [r.term, r.srcPm, r.site, r.status, r.newPm, r.detail].map(cell).join('\t'))).join('\n');
         setResTsv(tsv);
+        // Persist so the results survive navigating away / closing the tab.
+        try { localStorage.setItem(LS_KEY, JSON.stringify({ savedAt: new Date().toLocaleString('en-GB'), dryRun, count: results.length, tsv })); } catch (e) {}
+        refreshLast();
         log('');
         log(results.length + ' result row(s) — click "Copy results" to copy (tab-separated) for Google Sheets:', failed ? 'warn' : 'ok');
         log(tsv);
