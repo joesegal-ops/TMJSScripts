@@ -1,0 +1,17 @@
+Monday PM Stat,Push to JobLogic? (Y/N),JL Status (EDIT),JL StatusId (EDIT)
+Scoping,N,,
+Quoted,N,,
+Approved,N (JL-only — set by JobLogic; never pushed from Monday),,
+To Schedule,,,
+Assigned,,,
+Project In Progress,,,
+Snagging,N,,
+Complete,Y,Completed,11
+CHASE,N,,
+CHASED,N,,
+ON HOLD,,,
+Reassigned,N,,
+Referred to Member/WW,N,,
+Stuck,N,,
+Unassigned,N,,
+Lost/Not Progressed,Y,Cancelled,10
