@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL - Renew / Duplicate PPM Contracts (next year)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.3.0
+// @version      1.4.0
 // @description  Bulk-renews (duplicates) a list of PPM Contracts into the next year using Joblogic's native Renew flow. Paste PM numbers (or plan references), one per line. For each contract it opens the Renew form, rolls the visits by the rule — MORE THAN 12 visits → 52 weeks later, otherwise → 365 days later — keeps Joblogic's +1-year start date, and posts to /api/PPMContract/RenewPPMContract. Preview (dry-run) first; nothing is created until you click Renew all and confirm.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
@@ -306,22 +306,29 @@
     return { ok: false, status: r.status, throttled, resp: d, raw: raw.slice(0, 200) };
   }
 
-  // Has this contract already been renewed to this plan ref + start date? (best-effort)
-  async function alreadyRenewed(planRef, startDate) {
+  // Does a renewal already exist for this exact plan ref + SITE + start date?
+  // Site matters: many contracts share a plan reference across different sites, so a
+  // duplicate is only a duplicate when all three match. (best-effort)
+  const sameRenewal = (c, planRef, startDate, siteId) =>
+    (c.PlanReference || '').trim().toLowerCase() === planRef.trim().toLowerCase() &&
+    (c.StartDate || '') === startDate &&
+    (siteId == null || String(c.SiteId) === String(siteId));
+
+  async function alreadyRenewed(planRef, startDate, siteId) {
     try {
       const list = await searchContracts(planRef);
-      return list.some(c => (c.PlanReference || '').trim().toLowerCase() === planRef.trim().toLowerCase() && (c.StartDate || '') === startDate);
+      return list.some(c => sameRenewal(c, planRef, startDate, siteId));
     } catch (e) { return false; }
   }
 
   // Look up the newly-created contract → { number, guid }. Prefer an exact GUID match
-  // (the id RenewPPMContract returns); else the newest row matching plan ref + start.
-  async function findRenewed(planRef, startDate, guid) {
+  // (the id RenewPPMContract returns); else the newest row matching plan ref + site + start.
+  async function findRenewed(planRef, startDate, guid, siteId) {
     try {
       const list = await searchContracts(planRef);
       let hit = guid ? list.find(c => c.UniqueId === guid) : null;
       if (!hit) {
-        const m = list.filter(c => (c.PlanReference || '').trim().toLowerCase() === planRef.trim().toLowerCase() && (c.StartDate || '') === startDate);
+        const m = list.filter(c => sameRenewal(c, planRef, startDate, siteId));
         m.sort((a, b) => String(b.CreatedAt || '').localeCompare(String(a.CreatedAt || '')));
         hit = m[0];
       }
@@ -344,7 +351,7 @@
       '<input type="checkbox" id="rc-opt-' + o.key + '"' + (o.def ? ' checked' : '') + '> ' + esc(o.label) + '</label>'
     ).join('');
     p.innerHTML = `
-      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🔁 Renew PPM Contracts <span style="font-weight:400;color:#888;">v1.3</span></div>
+      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🔁 Renew PPM Contracts <span style="font-weight:400;color:#888;">v1.4</span></div>
       <div style="background:#f4f6f9;border:1px solid #e2e7ee;border-radius:4px;padding:8px;margin-bottom:8px;line-height:1.55;">
         Duplicates each contract into the next year via Joblogic's native Renew.<br>
         <b>Visit roll:</b> &gt; ${CFG.visitThreshold} visits → <b>${rollLabel(CFG.rollManyVisits)}</b> later · otherwise → <b>${rollLabel(CFG.rollFewVisits)}</b> later.<br>
@@ -445,19 +452,19 @@
             ' · ' + rf.visitCount + ' visit' + (rf.visitCount === 1 ? '' : 's') +
             (rf.invoiceCount ? ' / ' + rf.invoiceCount + ' invoice' + (rf.invoiceCount === 1 ? '' : 's') : '');
 
-          const dup = await alreadyRenewed(rf.planReference, rf.startDate);
+          const dup = await alreadyRenewed(rf.planReference, rf.startDate, src.SiteId);
 
           if (dryRun) {
             log('• ' + tag, 'ok');
             log('    ' + info);
             log('    NEW: "' + rf.planReference + '"  start ' + rf.startDate + (rf.endDate ? ' → ' + rf.endDate : ''));
             log('    roll visits ' + rollLabel(roll) + ' later' + (rf.visitCount > CFG.visitThreshold ? '  (>' + CFG.visitThreshold + ' visits)' : ''));
-            if (dup) { log('    ⚠ a contract with this plan ref + start date already exists — would DUPLICATE', 'warn'); addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Would duplicate', '', 'plan ref "' + rf.planReference + '" + start ' + rf.startDate + ' already exists'); }
+            if (dup) { log('    ⚠ a contract with this plan ref + site + start date already exists — would DUPLICATE', 'warn'); addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Would duplicate', '', 'plan ref "' + rf.planReference + '" + ' + (src.SiteName || 'site') + ' + start ' + rf.startDate + ' already exists'); }
             else addResult(entry.term, src.PPMContractNumber, src.SiteName, 'To renew', '', 'roll visits ' + rollLabel(roll) + '; new "' + rf.planReference + '" start ' + rf.startDate);
             continue;
           }
 
-          if (dup) { log('↷ ' + tag + ' — already renewed (plan ref + start date exist); skipped', 'warn'); addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Duplicate (skipped)', '', 'plan ref "' + rf.planReference + '" + start ' + rf.startDate + ' already exists'); skipped++; await sleep(300); continue; }
+          if (dup) { log('↷ ' + tag + ' — already renewed (plan ref + site + start date exist); skipped', 'warn'); addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Duplicate (skipped)', '', 'plan ref "' + rf.planReference + '" + ' + (src.SiteName || 'site') + ' + start ' + rf.startDate + ' already exists'); skipped++; await sleep(300); continue; }
 
           let created = false, failReason = '', newGuid = '';
           for (let attempt = 0; attempt <= CFG.maxRetries && !created; attempt++) {
@@ -471,7 +478,7 @@
               break;
             }
             // A WAF 403 may hide a real success — re-check by searching for the new ref.
-            if (await alreadyRenewed(rf.planReference, rf.startDate)) {
+            if (await alreadyRenewed(rf.planReference, rf.startDate, src.SiteId)) {
               created = true;
               log('✓ ' + tag + ' — renewed (server confirmed after HTTP ' + res.status + ')', 'ok');
               break;
@@ -488,7 +495,7 @@
           }
           if (created) {
             done++;
-            const found = await findRenewed(rf.planReference, rf.startDate, newGuid);
+            const found = await findRenewed(rf.planReference, rf.startDate, newGuid, src.SiteId);
             const newPm = found ? found.number : '';
             if (found && found.guid) newGuid = found.guid;
             addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Renewed', newPm, newGuid ? '/PPMContract/Detail/' + newGuid : '');
