@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL - Renew / Duplicate PPM Contracts (next year)
 // @namespace    https://up-fm.com/joblogic
-// @version      1.2.0
+// @version      1.3.0
 // @description  Bulk-renews (duplicates) a list of PPM Contracts into the next year using Joblogic's native Renew flow. Paste PM numbers (or plan references), one per line. For each contract it opens the Renew form, rolls the visits by the rule — MORE THAN 12 visits → 52 weeks later, otherwise → 365 days later — keeps Joblogic's +1-year start date, and posts to /api/PPMContract/RenewPPMContract. Preview (dry-run) first; nothing is created until you click Renew all and confirm.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
@@ -314,6 +314,21 @@
     } catch (e) { return false; }
   }
 
+  // Look up the newly-created contract → { number, guid }. Prefer an exact GUID match
+  // (the id RenewPPMContract returns); else the newest row matching plan ref + start.
+  async function findRenewed(planRef, startDate, guid) {
+    try {
+      const list = await searchContracts(planRef);
+      let hit = guid ? list.find(c => c.UniqueId === guid) : null;
+      if (!hit) {
+        const m = list.filter(c => (c.PlanReference || '').trim().toLowerCase() === planRef.trim().toLowerCase() && (c.StartDate || '') === startDate);
+        m.sort((a, b) => String(b.CreatedAt || '').localeCompare(String(a.CreatedAt || '')));
+        hit = m[0];
+      }
+      return hit ? { number: hit.PPMContractNumber, guid: hit.UniqueId } : null;
+    } catch (e) { return null; }
+  }
+
   // ----------------------------------------------------------------------------
   // UI
   // ----------------------------------------------------------------------------
@@ -329,7 +344,7 @@
       '<input type="checkbox" id="rc-opt-' + o.key + '"' + (o.def ? ' checked' : '') + '> ' + esc(o.label) + '</label>'
     ).join('');
     p.innerHTML = `
-      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🔁 Renew PPM Contracts <span style="font-weight:400;color:#888;">v1.2</span></div>
+      <div style="font-weight:700;font-size:14px;margin-bottom:8px;">🔁 Renew PPM Contracts <span style="font-weight:400;color:#888;">v1.3</span></div>
       <div style="background:#f4f6f9;border:1px solid #e2e7ee;border-radius:4px;padding:8px;margin-bottom:8px;line-height:1.55;">
         Duplicates each contract into the next year via Joblogic's native Renew.<br>
         <b>Visit roll:</b> &gt; ${CFG.visitThreshold} visits → <b>${rollLabel(CFG.rollManyVisits)}</b> later · otherwise → <b>${rollLabel(CFG.rollFewVisits)}</b> later.<br>
@@ -347,7 +362,7 @@
       <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
         <button id="rc-preview" class="jl-button-green" style="padding:5px 14px;">Preview</button>
         <button id="rc-renew" class="jl-button-green" style="padding:5px 14px;">Renew all</button>
-        <button id="rc-copyfail" title="Copy the not-renewed rows as tab-separated text you can paste straight into Google Sheets" style="padding:5px 12px;margin-left:auto;background:#fff2e8;color:#8a4b00;border:1px solid #f0c39a;border-radius:4px;cursor:pointer;opacity:.5;" disabled>Copy failures</button>
+        <button id="rc-copyres" title="Copy one row per pasted contract — new PPM number on success, or the error/status — as tab-separated text you can paste straight into Google Sheets" style="padding:5px 12px;margin-left:auto;background:#fff2e8;color:#8a4b00;border:1px solid #f0c39a;border-radius:4px;cursor:pointer;opacity:.5;" disabled>Copy results</button>
         <button id="rc-copy" style="padding:5px 12px;background:#eef1f5;color:#243b46;border:1px solid #c9d4da;border-radius:4px;cursor:pointer;">Copy log</button>
       </div>
       <div id="rc-status" style="margin-bottom:6px;font-weight:600;"></div>
@@ -370,14 +385,14 @@
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const optState = () => { const s = {}; OPTIONS.forEach(o => { s[o.key] = panel.querySelector('#rc-opt-' + o.key).checked; }); return s; };
 
-    const failBtn = $('copyfail');
-    let failTsv = '';
-    const setFailTsv = tsv => {
-      failTsv = tsv || '';
-      failBtn.disabled = !failTsv;
-      failBtn.style.opacity = failTsv ? '1' : '.5';
+    const resBtn = $('copyres');
+    let resTsv = '';
+    const setResTsv = tsv => {
+      resTsv = tsv || '';
+      resBtn.disabled = !resTsv;
+      resBtn.style.opacity = resTsv ? '1' : '.5';
     };
-    failBtn.onclick = () => { if (failTsv) navigator.clipboard.writeText(failTsv); };
+    resBtn.onclick = () => { if (resTsv) navigator.clipboard.writeText(resTsv); };
     $('copy').onclick = () => { navigator.clipboard.writeText(outEl.textContent); };
     prevBtn.onclick = () => run(true);
     goBtn.onclick = () => run(false);
@@ -386,10 +401,11 @@
       if (running) return;
       const entries = parseList($('list').value);
       outEl.textContent = '';
-      setFailTsv('');
-      // Rows that did NOT renew — collected for the copy-to-Sheets summary.
-      const report = [];
-      const addReport = (term, pm, site, statusTxt, detail) => report.push({ term, pm: pm || '', site: site || '', status: statusTxt, detail: detail || '' });
+      setResTsv('');
+      // One result row per pasted entry, for the copy-to-Sheets output.
+      const results = [];
+      const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+      const addResult = (term, srcPm, site, statusTxt, newPm, detail) => results.push({ term, srcPm: srcPm || '', site: site || '', status: statusTxt, newPm: newPm || '', detail: detail || '' });
       if (!entries.length) { status('Paste at least one PM number first.', 'err'); return; }
       if (!getToken()) log('! Anti-forgery token not found on page — try reloading if requests are rejected.', 'warn');
       log('Parsed ' + entries.length + ' contract(s) to renew.');
@@ -418,7 +434,7 @@
           const flag = src.IsCancelled ? 'cancelled' : (src.IsSuspended ? 'suspended' : '');
           if (flag && skipSuspended) {
             log('↷ ' + tag + ' — ' + src.PPMContractNumber + ' is ' + flag + '; skipped', 'warn');
-            addReport(entry.term, src.PPMContractNumber, src.SiteName, flag.charAt(0).toUpperCase() + flag.slice(1) + ' (skipped)', '');
+            addResult(entry.term, src.PPMContractNumber, src.SiteName, cap(flag) + ' (skipped)', '', '');
             skipped++; await sleep(200); continue;
           }
           const rf = await fetchRenewForm(src.UniqueId);
@@ -436,18 +452,19 @@
             log('    ' + info);
             log('    NEW: "' + rf.planReference + '"  start ' + rf.startDate + (rf.endDate ? ' → ' + rf.endDate : ''));
             log('    roll visits ' + rollLabel(roll) + ' later' + (rf.visitCount > CFG.visitThreshold ? '  (>' + CFG.visitThreshold + ' visits)' : ''));
-            if (dup) { log('    ⚠ a contract with this plan ref + start date already exists — would DUPLICATE', 'warn'); addReport(entry.term, src.PPMContractNumber, src.SiteName, 'Would duplicate', 'plan ref "' + rf.planReference + '" + start ' + rf.startDate + ' already exists'); }
+            if (dup) { log('    ⚠ a contract with this plan ref + start date already exists — would DUPLICATE', 'warn'); addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Would duplicate', '', 'plan ref "' + rf.planReference + '" + start ' + rf.startDate + ' already exists'); }
+            else addResult(entry.term, src.PPMContractNumber, src.SiteName, 'To renew', '', 'roll visits ' + rollLabel(roll) + '; new "' + rf.planReference + '" start ' + rf.startDate);
             continue;
           }
 
-          if (dup) { log('↷ ' + tag + ' — already renewed (plan ref + start date exist); skipped', 'warn'); addReport(entry.term, src.PPMContractNumber, src.SiteName, 'Duplicate (skipped)', 'plan ref "' + rf.planReference + '" + start ' + rf.startDate + ' already exists'); skipped++; await sleep(300); continue; }
+          if (dup) { log('↷ ' + tag + ' — already renewed (plan ref + start date exist); skipped', 'warn'); addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Duplicate (skipped)', '', 'plan ref "' + rf.planReference + '" + start ' + rf.startDate + ' already exists'); skipped++; await sleep(300); continue; }
 
-          let created = false, failReason = '';
+          let created = false, failReason = '', newGuid = '';
           for (let attempt = 0; attempt <= CFG.maxRetries && !created; attempt++) {
             const fd = buildRenewBody(rf, opts, roll);
             const res = await postRenew(fd, rf.token || getToken());
             if (res.ok) {
-              created = true;
+              created = true; newGuid = res.id || '';
               const url = res.id ? '/PPMContract/Detail/' + res.id : null;
               logHtml('<span style="color:' + COL.ok + '">✓ ' + esc(tag) + ' — renewed (' + esc(rollLabel(roll)) + ', ' + rf.visitCount + ' visits)</span>' +
                 (url ? ' <a href="' + url + '" target="_blank" style="color:#1b6fb3;">open</a>' : '') + '\n');
@@ -469,14 +486,23 @@
               break;
             }
           }
-          if (created) done++;
-          else { failed++; addReport(entry.term, src.PPMContractNumber, src.SiteName, 'Failed', failReason || 'renew did not confirm after ' + (CFG.maxRetries + 1) + ' attempt(s)'); }
+          if (created) {
+            done++;
+            const found = await findRenewed(rf.planReference, rf.startDate, newGuid);
+            const newPm = found ? found.number : '';
+            if (found && found.guid) newGuid = found.guid;
+            addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Renewed', newPm, newGuid ? '/PPMContract/Detail/' + newGuid : '');
+            log('    → new contract ' + (newPm || '(number lookup failed — see ' + (newGuid ? '/PPMContract/Detail/' + newGuid : 'contract list') + ')'), newPm ? 'ok' : 'warn');
+          } else {
+            failed++;
+            addResult(entry.term, src.PPMContractNumber, src.SiteName, 'Failed', '', failReason || 'renew did not confirm after ' + (CFG.maxRetries + 1) + ' attempt(s)');
+          }
           await sleep(CFG.postDelayMs);
         } catch (e) {
           failed++;
           const msg = (e && e.message ? e.message : String(e));
           log('✗ ' + tag + ' — ' + msg, 'err');
-          addReport(entry.term, '', '', 'Error', msg);
+          addResult(entry.term, '', '', 'Error', '', msg);
         }
       }
 
@@ -484,17 +510,15 @@
       status('Done: ' + done + ' ' + (dryRun ? 'to renew' : 'renewed') + ', ' + failed + ' problem(s)' + tail + '.', failed ? 'warn' : 'ok');
       log('── DONE: ' + done + ' ' + (dryRun ? 'to renew' : 'renewed') + ', ' + failed + ' problem(s)' + tail + ' ──', failed ? 'warn' : 'ok');
 
-      // Copy-to-Sheets summary of every row that did NOT renew.
-      if (report.length) {
+      // Copy-to-Sheets results — one row per pasted entry (new PM number or error/status).
+      if (results.length) {
         const cell = s => String(s == null ? '' : s).replace(/[\t\r\n]+/g, ' ').trim();
-        const header = ['Input', 'PM Number', 'Site', 'Status', 'Detail'];
-        const tsv = [header.join('\t')].concat(report.map(r => [r.term, r.pm, r.site, r.status, r.detail].map(cell).join('\t'))).join('\n');
-        setFailTsv(tsv);
+        const header = ['Input', 'Source PM', 'Site', 'Status', 'New Contract', 'Detail'];
+        const tsv = [header.join('\t')].concat(results.map(r => [r.term, r.srcPm, r.site, r.status, r.newPm, r.detail].map(cell).join('\t'))).join('\n');
+        setResTsv(tsv);
         log('');
-        log(report.length + ' row(s) did not renew — click "Copy failures" to copy them (tab-separated) for Google Sheets:', 'warn');
+        log(results.length + ' result row(s) — click "Copy results" to copy (tab-separated) for Google Sheets:', failed ? 'warn' : 'ok');
         log(tsv);
-      } else {
-        log('No problems — nothing to copy.', 'ok');
       }
 
       if (dryRun && !failed) log('Preview looks clean. Click "Renew all" to proceed.', 'ok');
