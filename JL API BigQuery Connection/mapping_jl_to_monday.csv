@@ -1,11 +1,12 @@
-JL Status,JL StatusId,Monday PM Stat (EDIT THIS COLUMN)
-New Job,5,To Schedule
-Allocated,7,Assigned
-Attended,1,Project In Progress
-Parts To Fit,6,Project In Progress
-Awaiting Parts,9,ON HOLD
-Costed,2,
-Reqs. Invoice,8,
-Invoiced,4,Complete
-Completed,11,Complete
-Cancelled,10,Lost/Not Progressed
+JL Status,JL StatusId,Monday Column,Monday Value
+New Job,5,(none),(no change)
+Allocated,7,PM Stat,Project In Progress
+Attended,1,PM Stat,Project In Progress
+Parts To Fit,6,PM Stat,Project In Progress
+Awaiting Parts,9,PM Stat,Project In Progress
+Costed,2,(none),(no change)
+Reqs. Invoice,8,Finance Stat,To Invoice
+Invoiced,4,PM Stat,Complete
+Invoiced,4,Finance Stat,Invoiced
+Completed,11,PM Stat,Complete
+Cancelled,10,PM Stat,Lost/Not Progressed

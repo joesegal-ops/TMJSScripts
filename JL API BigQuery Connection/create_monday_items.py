@@ -11,13 +11,15 @@ Decisions (settled 2026-07-22, see MONDAY_SYNC_SPEC.md / memory jl-monday-quote-
   * BACKFILL    : NEW-ONLY from a cutover date (MONDAY_CREATE_CUTOVER). History is left alone.
   * DEDUP KEY   : Original Job Ref (text_mkyrcb16). A job whose JobNumber already appears in the
                   Original OR Upgraded job-ref column of any item is NEVER recreated.
-  * TARGET GROUP: "topics" ("To Do / Pending") -- where new items land today.
+  * TARGET GROUP: "To Assign" (group_mm5h3yrn) -- dedicated intake group for auto-created items.
   * ITEM NAME   : first line of the JL Description (verbatim). Full multi-line description is
                   posted as the item's first Update so no context is lost.
   * FIELDS SET  : Original Job Ref <- JobNumber; Site <- SiteName (only when it exactly matches an
                   active Site dropdown label; never invents labels); Client Ref <- CustomReference
-                  (numeric Salesforce no. only); Lead PM <- JobOwner (matched to a Monday user,
-                  both name orderings; left blank if not a confident single match).
+                  or OrderNumber (numeric Customer Order / Salesforce no. only).
+  * LEAD PM     : NOT set here -- a board automation ("when an item is created, assign creator as
+                  Lead PM") owns it, so every auto-created item's Lead PM = the API token's user.
+                  Owner->user matching stays in the code, gated behind MONDAY_SET_LEAD_PM=1 (off).
   * LEFT BLANK  : Project Type, Client status, PO Number, Quote, dates, priority (PM-filled).
 
 NOT in this module: writing the Lead PM back onto the JL job owner (the requested two-way sync).
@@ -56,7 +58,7 @@ MONDAY_APIVER  = env("MONDAY_API_VERSION", "2024-10")
 BQ_PROJECT     = env("BQ_PROJECT", "vmimporteddata")
 BQ_DATASET     = env("BQ_DATASET", "raw")
 BOARD_ID       = int(env("MONDAY_BOARD_ID", "5084790211"))
-GROUP_ID       = env("MONDAY_GROUP_ID", "topics")            # "To Do / Pending"
+GROUP_ID       = env("MONDAY_GROUP_ID", "group_mm5h3yrn")     # "To Assign"
 COL_ANCHOR     = env("MONDAY_COL_ANCHOR", "text_mkyrcb16")   # Original Job Ref. (set + dedup)
 COL_UPGRADED   = env("MONDAY_COL_UPGRADED", "text_mm5gxah5")  # Upgraded Job Ref (dedup only)
 COL_SITE       = env("MONDAY_COL_SITE", "dropdown_Mjj5Knmc")  # Site (dropdown)
@@ -66,11 +68,22 @@ CUTOVER        = env("MONDAY_CREATE_CUTOVER", required=True)  # ISO date, e.g. 2
 CUSTOMER_NAME  = env("MONDAY_CREATE_CUSTOMER", "WeWork Ltd")
 JOB_TYPE       = env("MONDAY_CREATE_JOBTYPE", "Project")
 EXCLUDE_STATUS = [s.strip() for s in env("MONDAY_CREATE_EXCLUDE_STATUS", "Cancelled").split(",") if s.strip()]
+SET_LEAD_PM    = env("MONDAY_SET_LEAD_PM", "0") == "1"       # OFF: a board automation assigns
+                                                            # creator as Lead PM on create (owns it)
 APPLY          = env("MONDAY_CREATE_APPLY", "0") == "1"
 ONLY           = env("MONDAY_CREATE_ONLY")                    # optional: limit to one JobNumber
 MAX_CREATE     = int(env("MONDAY_CREATE_MAX", "50"))          # per-run backstop
 PAGE_LIMIT     = int(env("MONDAY_PAGE_LIMIT", "500"))
 REPORT_PATH    = env("MONDAY_CREATE_REPORT", "/tmp/monday_create_report.csv")
+
+# Optional: enrich each to-create job with LIVE fields from JL Job/GetById right before writing,
+# so a stale warehouse row (e.g. a Customer Order Number back-edited onto an old job after the
+# nightly full, which the incremental won't re-pull) can't yield a blank cell. Runs ONLY on the
+# whitelisted VM (needs JL creds + whitelisted IP); silently skipped elsewhere / on any per-job error.
+ENRICH         = env("MONDAY_CREATE_ENRICH", "1") == "1"
+JL_CID         = env("JL_CLIENT_ID"); JL_CSEC = env("JL_CLIENT_SECRET"); JL_TID = env("JL_TENANT_ID")
+JL_API         = env("JL_API", "https://api.joblogic.com/api/v1")
+JL_TOKEN_URL   = env("JL_TOKEN_URL", "https://identityservice.joblogic.com/connect/token")
 
 HDRS = {"Authorization": MONDAY_TOKEN, "Content-Type": "application/json",
         "API-Version": MONDAY_APIVER}
@@ -136,7 +149,7 @@ def desired_jobs():
     """WeWork Project jobs logged on/after the cutover: {JobNumber -> {...fields}}."""
     bq = bigquery.Client(project=BQ_PROJECT)
     sql = f"""
-      SELECT JobNumber, Description, SiteName, JobOwner, CustomReference, OrderNumber, DateLogged
+      SELECT Id, JobNumber, Description, SiteName, JobOwner, CustomReference, OrderNumber, DateLogged
       FROM `{BQ_PROJECT}.{BQ_DATASET}.jobs`
       WHERE TypeDescription=@jobtype AND CustomerName=@customer
         AND JobNumber IS NOT NULL AND JobNumber != ''
@@ -158,6 +171,7 @@ def desired_jobs():
         if base in out:                       # sub-job (/000,/001,...): keep the first, one item per project
             continue
         out[base] = {
+            "id": "" if r["Id"] is None else str(r["Id"]),
             "desc": r["Description"] or "",
             "site": norm(r["SiteName"]),
             "owner": norm(r["JobOwner"]),
@@ -262,6 +276,42 @@ def match_user(owner, key_ids, preferred):
 
 # ---------------------------------------------------------------------------
 
+def jl_token():
+    """OAuth client-credentials token for the official JL API (VM-only; needs whitelisted IP)."""
+    r = requests.post(JL_TOKEN_URL, timeout=60, data={
+        "grant_type": "client_credentials", "client_id": JL_CID,
+        "client_secret": JL_CSEC, "scope": "JL.Api"})
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def enrich_job(job, token):
+    """Override job fields with LIVE values from Job/GetById (Description, Customer Order Number,
+    Site, Owner). No-op on any error -> falls back to the warehouse values already in `job`."""
+    jid = job.get("id")
+    if not jid:
+        return
+    try:
+        r = requests.get(f"{JL_API}/Job/GetById", params={"id": jid, "tenantId": JL_TID},
+                         headers={"Authorization": f"Bearer {token}"}, timeout=40)
+        if r.status_code != 200:
+            log.warning("  enrich %s: GetById HTTP %s -- using warehouse fields", jid, r.status_code)
+            return
+        o = r.json()
+        o = o.get("Data", o) if isinstance(o, dict) else {}
+        if o.get("Description"):
+            job["desc"] = o["Description"]
+        if norm(o.get("OrderNumber")):
+            job["clientref"] = norm(o["OrderNumber"])
+        site = (o.get("Site") or {}).get("Name") if isinstance(o.get("Site"), dict) else None
+        if norm(site):
+            job["site"] = norm(site)
+        if norm(o.get("Owner")):
+            job["owner"] = norm(o["Owner"])
+    except Exception as e:
+        log.warning("  enrich %s failed (%s) -- using warehouse fields", jid, e)
+
+
 def build_values(job, sites, key_ids, preferred):
     """column_values dict + a list of human notes about anything left blank."""
     vals = {COL_ANCHOR: job["_jobnumber"]}
@@ -280,7 +330,7 @@ def build_values(job, sites, key_ids, preferred):
         notes.append(f"client ref '{ref}' not numeric")
 
     owner = job["owner"]
-    if owner:
+    if SET_LEAD_PM and owner:                 # off by default: board automation assigns Lead PM
         uid, reason = match_user(owner, key_ids, preferred)
         if uid:
             vals[COL_PERSON] = {"personsAndTeams": [{"id": uid, "kind": "person"}]}
@@ -314,6 +364,15 @@ def main():
     sites = site_label_map()
     key_ids, preferred = user_index()
 
+    token = None
+    if ENRICH and JL_CID and JL_CSEC and JL_TID:
+        try:
+            token = jl_token(); log.info("enrichment ON: live Job/GetById per new job")
+        except Exception as e:
+            log.warning("enrichment OFF: JL token failed (%s) -- using warehouse fields", e)
+    elif ENRICH:
+        log.info("enrichment OFF: no JL creds in env -- using warehouse fields")
+
     plan, skipped_existing = [], 0
     for jn, job in sorted(jobs.items()):
         if ONLY and jn != ONLY:
@@ -321,6 +380,8 @@ def main():
         if jn.upper() in have:
             skipped_existing += 1
             continue
+        if token:
+            enrich_job(job, token)
         job["_jobnumber"] = jn
         vals, notes = build_values(job, sites, key_ids, preferred)
         name = first_line(job["desc"]) or jn

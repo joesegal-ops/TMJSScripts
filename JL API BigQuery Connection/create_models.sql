@@ -342,3 +342,54 @@ SELECT
     ELSE "Non-Statutory"
   END AS Statutory_Category
 FROM `vmimporteddata.raw.jobs` j;
+
+-- Neko Health UK Limited slice of job_statutory_category (for a Neko-specific report). (2026-07-22)
+CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category_neko` AS
+SELECT *
+FROM `vmimporteddata.models.job_statutory_category`
+WHERE CustomerName = "Neko Health UK Limited";
+
+-- Invoice header + Job Type/Category/Status (one row per invoice). SELL side only (no cost on invoices).
+-- Job fields NULL for batch/PPM/credit invoices with no single-job link (~880). (2026-07-22)
+CREATE OR REPLACE VIEW `vmimporteddata.models.invoices_enriched` AS
+SELECT
+  i.InvoiceNumber            AS Invoice_Number,
+  i.Id                       AS Invoice_Id,
+  i.Type                     AS Invoice_Type_Id,
+  (i.PPMContractId IS NOT NULL) AS Is_PPM_Invoice,
+  i.DateRaised               AS Invoice_Date,
+  i.PaymentDueDate           AS Payment_Due_Date,
+  i.CustomerName             AS Customer,
+  i.CustomerId               AS Customer_Id,
+  i.SiteName                 AS Site,
+  i.SiteId                   AS Site_Id,
+  i.SitePostCode             AS Site_Postcode,
+  i.OrderNumber              AS Order_Number,
+  i.Description              AS Description,
+  i.JobDescription           AS Job_Description,
+  i.TotalExcludingVat        AS Total_Excl_VAT,
+  i.TotalVatAmount           AS Total_VAT,
+  i.TotalIncludingVat        AS Total_Incl_VAT,
+  i.GrandTotal               AS Grand_Total,
+  i.GlobalDiscount           AS Global_Discount,
+  i.IsCredit                 AS Is_Credit,
+  i.CreditReason             AS Credit_Reason,
+  i.IsDraft                  AS Is_Draft,
+  i.Tags                     AS Invoice_Tags,
+  i.JobNumber                AS Job_Number,
+  i.JobId                    AS Job_Id,
+  j.TypeDescription          AS Job_Type,
+  j.CategoryDescription      AS Job_Category,
+  j.JobStatusDescription     AS Job_Status,
+  j.JobTrade                 AS Job_Trade,
+  i.PPMContractId            AS PPM_Contract_Id,
+  i.UniqueId                 AS Invoice_Uid,
+  i._ingested_at
+FROM `vmimporteddata.raw.invoices` i
+LEFT JOIN `vmimporteddata.raw.jobs` j ON j.Id = i.JobId;
+
+-- Neko Health UK Limited slice of invoices_enriched. (2026-07-22)
+CREATE OR REPLACE VIEW `vmimporteddata.models.invoices_enriched_neko` AS
+SELECT *
+FROM `vmimporteddata.models.invoices_enriched`
+WHERE Customer = "Neko Health UK Limited";

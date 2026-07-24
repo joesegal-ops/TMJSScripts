@@ -13,6 +13,10 @@ APP=/opt/jl-loader
 set -a
 source "$APP/config.env"
 MONDAY_TOKEN="$(gcloud secrets versions access latest --secret=monday-token --project=vmimporteddata)"
+# JL creds enable live Job/GetById enrichment (fresh Customer Order Number / site / desc at create time)
+JL_CLIENT_ID="$(gcloud secrets versions access latest --secret=jl-client-id --project=vmimporteddata)"
+JL_CLIENT_SECRET="$(gcloud secrets versions access latest --secret=jl-client-secret --project=vmimporteddata)"
+JL_TENANT_ID="$(gcloud secrets versions access latest --secret=jl-tenant-id --project=vmimporteddata)"
 [ "${1:-}" = "apply" ] && MONDAY_CREATE_APPLY=1
 set +a
 exec "$APP/venv/bin/python" "$APP/create_monday_items.py"

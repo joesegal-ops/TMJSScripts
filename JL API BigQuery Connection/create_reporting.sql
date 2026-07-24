@@ -48,6 +48,9 @@ SELECT
   j.ActualFaultCode           AS Actual_Fault_Code,
   j.Tags                      AS Job_Tags,
   j.NoOfVisits                AS No_Of_Visits,
+  -- subcontractor (from raw.jobs.Subcontractors repeated field)
+  ARRAY_LENGTH(j.Subcontractors) > 0      AS Subcontractor_Used,
+  ARRAY_TO_STRING(j.Subcontractors, ", ") AS Subcontractor_Names,
   -- dates
   j.DateLogged                AS Date_Logged,
   j.AppointmentDate           AS Appointment_Date,
@@ -79,3 +82,9 @@ FROM `vmimporteddata.raw.jobs` j
 LEFT JOIN job_notes   jn ON jn.job_id = j.Id
 LEFT JOIN visit_notes vn ON vn.job_id = j.Id
 LEFT JOIN last_note   ln ON ln.job_id = j.Id;
+
+-- Neko Health UK Limited slice of reporting.jobs (Neko-specific dashboard). (2026-07-22)
+CREATE OR REPLACE VIEW `vmimporteddata.reporting.jobs_neko` AS
+SELECT *
+FROM `vmimporteddata.reporting.jobs`
+WHERE Customer = "Neko Health UK Limited";
