@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.18
+// @version      1.19
 // @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
@@ -267,15 +267,6 @@
         return true;
     }
 
-    // Pull the PO token out of a Customer Order Number (which "can be anything").
-    // e.g. "PROJ | PO-01023659 - 120MOO" or "po 011924580" → "PO-011924580".
-    function extractPO(orderNumber, fallbackPo) {
-        const m = String(orderNumber || '').match(/\b(PO|RE)\s*[-\/]?\s*(\d+)/i);
-        if (m) return m[1].toUpperCase() + '-' + m[2];
-        const fb = String(fallbackPo || '').trim();
-        return fb ? formatPO(fb) : '';
-    }
-
     // Invoice net (ex-VAT total) + Customer Order Number via the SearchInvoice API, for the job.
     // Fields confirmed on live data: TotalExcludingVatDecimal, OrderNumber.
     async function fetchInvoiceInfo(jobId, invoiceId) {
@@ -381,11 +372,12 @@
                     if (net == null || !orderNo) {
                         try { const info = await fetchInvoiceInfo(job.jobId, job.invoiceId); if (net == null) { net = info.net; job.net = net; } if (!orderNo) { orderNo = info.orderNumber; job.orderNumber = orderNo; } } catch (e) {}
                     }
-                    const poForMonday = extractPO(orderNo, job.po);   // from Customer Order Number, fall back to pasted PO
+                    // Write the Customer Order Number verbatim (whatever it contains); fall back to the pasted PO only if it's blank.
+                    const poForMonday = String(orderNo || '').trim() || String(job.po || '').trim();
                     await mondaySetInvoiced(hit.id, net, poForMonday);
                     job.mondayItemId = hit.id;
                     job.mondayStatus = `done (by ${hit.by})`;
-                    log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}${poForMonday ? `, PO ${poForMonday}` : ''}`, '#0fa');
+                    log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}${poForMonday ? `, PO "${poForMonday}"` : ''}`, '#0fa');
                 }
             } catch (e) {
                 job.mondayStatus = 'error';
