@@ -103,7 +103,11 @@ def get_job_cost(guid, token):
             log.warning("HTTP %s job %s (try %s/%s) wait %ss", r.status_code, guid, attempt, MAX_RETRIES, wait)
             time.sleep(wait)
             continue
-        if r.status_code == 404:
+        if 400 <= r.status_code < 500:
+            # 400 "Job doesn't exist" (brand-new jobs not yet in the costing subsystem), 403/404 etc.
+            # Skip the job rather than kill the whole batch.
+            log.warning("HTTP %s job %s — skipping (%s)", r.status_code, guid,
+                        r.text[:80].replace("\n", " "))
             return None
         r.raise_for_status()
         return r.json()

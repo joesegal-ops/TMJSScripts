@@ -27,6 +27,7 @@ WITH rejected AS (
   GROUP BY quote_id
 )
 SELECT
+  q.Id AS quote_id,
   q.QuoteNumber AS quote_number, q.Title AS title, q.Description AS description,
   COALESCE(jtm.description, qt.job_type_code) AS job_type,
   qt.job_type_code AS job_type_code,
@@ -204,6 +205,9 @@ SELECT
   CAST(NULL AS NUMERIC)       AS TotalQuoteSell,           -- FULL PASS: quote roll-up per job
   CAST(NULL AS NUMERIC)       AS PurchaseOrderAdjustment,  -- FULL PASS: PO line-item roll-up
   j.PriorityDescription       AS Priority,
+  -- count of COMPLETE visits only (for First Time Fix: FTF job = Visit_Count = 1).
+  (SELECT COUNT(*) FROM UNNEST(j.VisitsStatus) v
+     WHERE v.StatusDescription = "Complete") AS Visit_Count,
   vn.Visit_Notes              AS Visit_Notes,
   j.Tags                      AS Job_Tags,
   CAST(NULL AS BOOL)          AS Service_Job,              -- FULL PASS: PPM service flag
@@ -393,3 +397,15 @@ CREATE OR REPLACE VIEW `vmimporteddata.models.invoices_enriched_neko` AS
 SELECT *
 FROM `vmimporteddata.models.invoices_enriched`
 WHERE Customer = "Neko Health UK Limited";
+
+-- Neko Health UK Limited slice of all_in_job. (2026-07-23)
+CREATE OR REPLACE VIEW `vmimporteddata.models.all_in_job_neko` AS
+SELECT *
+FROM `vmimporteddata.models.all_in_job`
+WHERE Customer = "Neko Health UK Limited";
+
+-- Neko Health UK Limited slice of quote_tracking. (2026-07-23)
+CREATE OR REPLACE VIEW `vmimporteddata.models.quote_tracking_neko` AS
+SELECT *
+FROM `vmimporteddata.models.quote_tracking`
+WHERE customer = "Neko Health UK Limited";

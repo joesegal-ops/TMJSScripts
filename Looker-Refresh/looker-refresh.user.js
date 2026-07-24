@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Looker Studio Auto-Refresh
 // @namespace    https://up-fm.com/
-// @version      1.3.0
+// @version      1.4.0
 // @description  Automatically clicks the "Refresh data" button on Looker Studio / Data Studio reports on a configurable interval.
 // @author       Joe Segal
+// @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/Looker-Refresh/looker-refresh.user.js
+// @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/Looker-Refresh/looker-refresh.user.js
 // @match        https://datastudio.google.com/*
 // @match        https://lookerstudio.google.com/*
 // @grant        GM_getValue

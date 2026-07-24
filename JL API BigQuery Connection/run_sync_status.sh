@@ -2,7 +2,7 @@
 # JL job status -> Monday PM Stat./Finance Stat. Dry-run by default; pass "apply" to write.
 #   run_sync_status.sh            # dry-run (prints planned changes)
 #   run_sync_status.sh apply      # writes to Monday
-#   MONDAY_SYNC_ONLY=PROJ0000885 run_sync_status.sh apply   # single-job test
+#   MONDAY_STATUS_ONLY=PROJ0000885 run_sync_status.sh apply  # force-push ONE job's current status (test/manual)
 set -euo pipefail
 APP=/opt/jl-loader
 set -a
