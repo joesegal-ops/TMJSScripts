@@ -409,3 +409,103 @@ CREATE OR REPLACE VIEW `vmimporteddata.models.quote_tracking_neko` AS
 SELECT *
 FROM `vmimporteddata.models.quote_tracking`
 WHERE customer = "Neko Health UK Limited";
+
+-- Cost line items: one row per JobCost line (exploded from raw.job_costs.lines_json). (2026-07-23)
+CREATE OR REPLACE VIEW `vmimporteddata.models.cost_line_items` AS
+-- One row per JobCost line, exploded from raw.job_costs.lines_json across all 10 categories.
+-- Invoiced lines link to the invoice by InvoiceGuid (InvoiceId is mostly null); we join
+-- InvoiceGuid -> raw.invoices.UniqueId (fallback InvoiceId -> Id) to get invoice number + date.
+WITH exploded AS (
+  SELECT job_id, job_number, _ingested_at, "Material" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.MaterialLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "Labour" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.LabourLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "Expense" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.ExpenseLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "Travel" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.TravelLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "Mileage" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.MileageLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "Callout" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.CalloutLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "Overtime" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.OvertimeLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "Subcontractor" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.SubcontractorLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "ScheduleOfRates" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.ScheduleOfRatesLines")) AS line
+  UNION ALL
+  SELECT job_id, job_number, _ingested_at, "Other" AS category, line
+  FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.OtherLines")) AS line
+)
+SELECT
+  e.job_id, e.job_number, e.category,
+  SAFE_CAST(JSON_VALUE(e.line, "$.Id") AS INT64)                     AS line_id,
+  JSON_VALUE(e.line, "$.Description")                                AS description,
+  SAFE_CAST(JSON_VALUE(e.line, "$.Quantity") AS FLOAT64)             AS quantity,
+  SAFE_CAST(JSON_VALUE(e.line, "$.TotalCostExcludingVat") AS FLOAT64) AS cost_excl_vat,
+  SAFE_CAST(JSON_VALUE(e.line, "$.TotalSellExcludingVat") AS FLOAT64) AS sell_excl_vat,
+  (JSON_VALUE(e.line, "$.HasBeenInvoiced") = "true")                 AS has_been_invoiced,
+  (JSON_VALUE(e.line, "$.IsChargeable") = "true")                    AS is_chargeable,
+  (JSON_VALUE(e.line, "$.IsQuotedValue") = "true")                   AS is_quoted_value,
+  JSON_VALUE(e.line, "$.EngineerName")                               AS engineer_name,
+  JSON_VALUE(e.line, "$.SubcontractorName")                          AS subcontractor_name,
+  JSON_VALUE(e.line, "$.StatusDescription")                          AS status,
+  JSON_VALUE(e.line, "$.InvoiceGuid")                                AS invoice_guid,
+  COALESCE(ig.InvoiceNumber, ii.InvoiceNumber)                       AS invoice_number,
+  DATE(COALESCE(ig.DateRaised, ii.DateRaised), "Europe/London")      AS invoiced_date,
+  e._ingested_at
+FROM exploded e
+LEFT JOIN `vmimporteddata.raw.invoices` ig ON ig.UniqueId = JSON_VALUE(e.line, "$.InvoiceGuid")
+LEFT JOIN `vmimporteddata.raw.invoices` ii ON ii.Id = SAFE_CAST(JSON_VALUE(e.line, "$.InvoiceId") AS INT64);
+
+
+-- Parameterised report: per-job roll-up of costs NOT invoiced before `cutoff`. (2026-07-23)
+CREATE OR REPLACE TABLE FUNCTION `vmimporteddata.models.job_uninvoiced_costs`(cutoff DATE) AS (
+-- Per-job roll-up of cost lines NOT invoiced before `cutoff` (never-invoiced OR invoiced on/after cutoff).
+-- Grain: one row per job that still has ≥1 such cost line. Total_Sell = sell of those included lines only.
+WITH incl AS (
+  SELECT job_id,
+         SUM(sell_excl_vat)   AS total_sell,
+         MAX(invoiced_date)   AS max_invoiced_date
+  FROM `vmimporteddata.models.cost_line_items`
+  WHERE invoiced_date IS NULL OR invoiced_date >= cutoff
+  GROUP BY job_id
+),
+po AS (
+  SELECT job_id, STRING_AGG(DISTINCT pon, ", ") AS po_numbers FROM (
+    SELECT SAFE_CAST(po.JobId AS INT64) AS job_id, po.PONumber AS pon
+    FROM `vmimporteddata.raw.purchase_orders` po WHERE po.PONumber IS NOT NULL
+    UNION ALL
+    SELECT j.Id AS job_id, spo.PONumber AS pon
+    FROM `vmimporteddata.raw.subcontractor_purchase_orders` spo
+    JOIN `vmimporteddata.raw.jobs` j ON j.JobNumber = spo.JobNumber
+    WHERE spo.PONumber IS NOT NULL
+  ) GROUP BY job_id
+)
+SELECT
+  incl.max_invoiced_date        AS Invoice_Date,
+  j.SiteName                    AS Site_Name,
+  j.CategoryDescription         AS Job_Category,
+  incl.total_sell               AS Total_Sell_Exc_Vat,
+  j.OrderNumber                 AS Customer_Order_Number,
+  j.Description                 AS Job_Description,
+  j.DateComplete                AS Date_Complete,
+  j.TypeDescription             AS Job_Type,
+  (SELECT v.EngineerName FROM UNNEST(j.VisitsStatus) v
+     WHERE v.EngineerName IS NOT NULL ORDER BY v.StartDate DESC LIMIT 1) AS Last_Engineer,
+  po.po_numbers                 AS PO_Number,
+  j.JobStatusDescription        AS Job_Status,
+  j.JobNumber                   AS Job_Number
+FROM incl
+JOIN `vmimporteddata.raw.jobs` j ON j.Id = incl.job_id
+LEFT JOIN po ON po.job_id = incl.job_id
+);
