@@ -447,10 +447,13 @@ WITH exploded AS (
   FROM `vmimporteddata.raw.job_costs`, UNNEST(JSON_QUERY_ARRAY(lines_json, "$.OtherLines")) AS line
 )
 SELECT
-  e.job_id, e.job_number, e.category,
+  e.job_id, e.job_number,
+  j.TypeDescription                                                  AS job_type,
+  e.category,
   SAFE_CAST(JSON_VALUE(e.line, "$.Id") AS INT64)                     AS line_id,
   JSON_VALUE(e.line, "$.Description")                                AS description,
   SAFE_CAST(JSON_VALUE(e.line, "$.Quantity") AS FLOAT64)             AS quantity,
+  SAFE.PARSE_DATETIME("%Y-%m-%dT%H:%M:%S", JSON_VALUE(e.line, "$.DateIncurred")) AS date_incurred,
   SAFE_CAST(JSON_VALUE(e.line, "$.TotalCostExcludingVat") AS FLOAT64) AS cost_excl_vat,
   SAFE_CAST(JSON_VALUE(e.line, "$.TotalSellExcludingVat") AS FLOAT64) AS sell_excl_vat,
   (JSON_VALUE(e.line, "$.HasBeenInvoiced") = "true")                 AS has_been_invoiced,
@@ -464,6 +467,7 @@ SELECT
   DATE(COALESCE(ig.DateRaised, ii.DateRaised), "Europe/London")      AS invoiced_date,
   e._ingested_at
 FROM exploded e
+LEFT JOIN `vmimporteddata.raw.jobs` j ON j.Id = e.job_id
 LEFT JOIN `vmimporteddata.raw.invoices` ig ON ig.UniqueId = JSON_VALUE(e.line, "$.InvoiceGuid")
 LEFT JOIN `vmimporteddata.raw.invoices` ii ON ii.Id = SAFE_CAST(JSON_VALUE(e.line, "$.InvoiceId") AS INT64);
 
@@ -508,4 +512,12 @@ SELECT
 FROM incl
 JOIN `vmimporteddata.raw.jobs` j ON j.Id = incl.job_id
 LEFT JOIN po ON po.job_id = incl.job_id
+);
+
+-- Neko Health UK Limited slice of cost_line_items (filtered by Neko's jobs). (2026-07-27)
+CREATE OR REPLACE VIEW `vmimporteddata.models.cost_line_items_neko` AS
+SELECT cli.*
+FROM `vmimporteddata.models.cost_line_items` cli
+WHERE cli.job_id IN (
+  SELECT Id FROM `vmimporteddata.raw.jobs` WHERE CustomerName = "Neko Health UK Limited"
 );
