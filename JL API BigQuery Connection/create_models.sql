@@ -474,8 +474,15 @@ LEFT JOIN `vmimporteddata.raw.invoices` ii ON ii.Id = SAFE_CAST(JSON_VALUE(e.lin
 
 -- Parameterised report: per-job roll-up of costs NOT invoiced before `cutoff`. (2026-07-23)
 CREATE OR REPLACE TABLE FUNCTION `vmimporteddata.models.job_uninvoiced_costs`(cutoff DATE) AS (
--- Per-job roll-up of cost lines NOT invoiced before `cutoff` (never-invoiced OR invoiced on/after cutoff).
--- Grain: one row per job that still has ≥1 such cost line. Total_Sell = sell of those included lines only.
+-- Per-job roll-up of outstanding (uninvoiced) sell value, from TWO sources:
+--  (A) COST-LINE jobs: cost lines NOT invoiced before `cutoff` (never-invoiced OR invoiced
+--      on/after cutoff). Total_Sell_Exc_Vat = sell of those included lines only.
+--  (B) QUOTE-BILLED jobs (empty cost tab, e.g. Projects): jobs whose value lives in
+--      raw.jobs.QuotedValue rather than cost lines. Total_Sell_Exc_Vat = QuotedValue minus
+--      invoiced-to-date (ex VAT); included only when that remainder is > 0.
+--      The `cutoff` does NOT apply to branch (B) — outstanding is a point-in-time balance.
+-- Grain: one row per job. Branches are mutually exclusive (B requires an empty cost tab, so
+-- such jobs never appear in `incl`), so no job is counted twice.
 WITH incl AS (
   SELECT job_id,
          SUM(sell_excl_vat)   AS total_sell,
@@ -483,6 +490,14 @@ WITH incl AS (
   FROM `vmimporteddata.models.cost_line_items`
   WHERE invoiced_date IS NULL OR invoiced_date >= cutoff
   GROUP BY job_id
+),
+inv AS (  -- invoiced-to-date per job (ex VAT), for the quote-billed branch
+  SELECT JobNumber              AS job_number,
+         SUM(TotalExcludingVat) AS invoiced_net,
+         MAX(DATE(DateRaised))  AS last_invoiced
+  FROM `vmimporteddata.raw.invoices`
+  WHERE JobNumber IS NOT NULL
+  GROUP BY JobNumber
 ),
 po AS (
   SELECT job_id, STRING_AGG(DISTINCT pon, ", ") AS po_numbers FROM (
@@ -495,6 +510,7 @@ po AS (
     WHERE spo.PONumber IS NOT NULL
   ) GROUP BY job_id
 )
+-- (A) cost-line branch
 SELECT
   incl.max_invoiced_date        AS Invoice_Date,
   j.SiteName                    AS Site_Name,
@@ -512,6 +528,31 @@ SELECT
 FROM incl
 JOIN `vmimporteddata.raw.jobs` j ON j.Id = incl.job_id
 LEFT JOIN po ON po.job_id = incl.job_id
+
+UNION ALL
+
+-- (B) quote-billed branch: empty cost tab, QuotedValue not fully invoiced
+SELECT
+  inv.last_invoiced                             AS Invoice_Date,
+  j.SiteName                                    AS Site_Name,
+  j.CategoryDescription                         AS Job_Category,
+  j.QuotedValue - COALESCE(inv.invoiced_net, 0) AS Total_Sell_Exc_Vat,
+  j.OrderNumber                                 AS Customer_Order_Number,
+  j.Description                                 AS Job_Description,
+  j.DateComplete                                AS Date_Complete,
+  j.TypeDescription                             AS Job_Type,
+  (SELECT v.EngineerName FROM UNNEST(j.VisitsStatus) v
+     WHERE v.EngineerName IS NOT NULL ORDER BY v.StartDate DESC LIMIT 1) AS Last_Engineer,
+  po.po_numbers                                 AS PO_Number,
+  j.JobStatusDescription                        AS Job_Status,
+  j.JobNumber                                   AS Job_Number
+FROM `vmimporteddata.raw.jobs` j
+LEFT JOIN `vmimporteddata.raw.job_costs` jc ON jc.job_id = j.Id
+LEFT JOIN inv ON inv.job_number = j.JobNumber
+LEFT JOIN po  ON po.job_id      = j.Id
+WHERE COALESCE(jc.n_lines, 0) = 0
+  AND j.QuotedValue > 0
+  AND j.QuotedValue - COALESCE(inv.invoiced_net, 0) > 0.01
 );
 
 -- Neko Health UK Limited slice of cost_line_items (filtered by Neko's jobs). (2026-07-27)

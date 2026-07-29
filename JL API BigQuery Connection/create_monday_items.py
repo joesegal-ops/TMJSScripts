@@ -14,13 +14,14 @@ Decisions (settled 2026-07-22, see MONDAY_SYNC_SPEC.md / memory jl-monday-quote-
   * TARGET GROUP: "To Assign" (group_mm5h3yrn) -- dedicated intake group for auto-created items.
   * ITEM NAME   : first line of the JL Description (verbatim). Full multi-line description is
                   posted as the item's first Update so no context is lost.
-  * FIELDS SET  : Original Job Ref <- JobNumber; Site <- SiteName (only when it exactly matches an
-                  active Site dropdown label; never invents labels); Client Ref <- CustomReference
-                  or OrderNumber (numeric Customer Order / Salesforce no. only).
+  * FIELDS SET  : Original Job Ref <- JobNumber; Project Type <- Category (mapping_category_to_
+                  projecttype.csv); PO Number <- a 'PO...' pattern in Order/CustomReference;
+                  Client Ref <- the 8-digit Salesforce number; Site <- SiteName (only when it
+                  exactly matches an active Site dropdown label; never invents labels).
   * LEAD PM     : NOT set here -- a board automation ("when an item is created, assign creator as
                   Lead PM") owns it, so every auto-created item's Lead PM = the API token's user.
                   Owner->user matching stays in the code, gated behind MONDAY_SET_LEAD_PM=1 (off).
-  * LEFT BLANK  : Project Type, Client status, PO Number, Quote, dates, priority (PM-filled).
+  * LEFT BLANK  : Client status, Quote, dates, priority (PM-filled).
 
 NOT in this module: writing the Lead PM back onto the JL job owner (the requested two-way sync).
 That needs JL write access + a confirmed job-update endpoint -- tracked as a follow-up spike.
@@ -62,8 +63,12 @@ GROUP_ID       = env("MONDAY_GROUP_ID", "group_mm5h3yrn")     # "To Assign"
 COL_ANCHOR     = env("MONDAY_COL_ANCHOR", "text_mkyrcb16")   # Original Job Ref. (set + dedup)
 COL_UPGRADED   = env("MONDAY_COL_UPGRADED", "text_mm5gxah5")  # Upgraded Job Ref (dedup only)
 COL_SITE       = env("MONDAY_COL_SITE", "dropdown_Mjj5Knmc")  # Site (dropdown)
-COL_CLIENTREF  = env("MONDAY_COL_CLIENTREF", "text_mkxc7pxe")  # Client Ref. (Salesforce no.)
+COL_CLIENTREF  = env("MONDAY_COL_CLIENTREF", "text_mkxc7pxe")  # Client Ref. (Salesforce no., 8 digits)
+COL_PO         = env("MONDAY_COL_PO", "text_mky86hyy")         # PO Number
+COL_PTYPE      = env("MONDAY_COL_PROJECT_TYPE", "dropdown_mkmm6b5r")  # Project Type (from Category)
 COL_PERSON     = env("MONDAY_COL_PERSON", "person")           # Lead PM (people)
+MAPPING_CSV    = env("MAPPING_CSV", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                 "mapping_category_to_projecttype.csv"))
 CUTOVER        = env("MONDAY_CREATE_CUTOVER", required=True)  # ISO date, e.g. 2026-07-23 (go-live)
 CUSTOMER_NAME  = env("MONDAY_CREATE_CUSTOMER", "WeWork Ltd")
 JOB_TYPE       = env("MONDAY_CREATE_JOBTYPE", "Project")
@@ -143,13 +148,61 @@ def name_keys(s):
     return {" ".join(sorted(toks)), "".join(toks)}
 
 
+def salesforce_no(order, custref):
+    """The 8-digit Salesforce number, from CustomReference first then OrderNumber."""
+    for f in (custref, order):
+        m = re.search(r"\b(\d{8})\b", f or "")
+        if m:
+            return m.group(1)
+    return ""
+
+
+def po_number(order, custref):
+    """A 'PO...' reference (e.g. PO-01054927), from OrderNumber first then CustomReference.
+    Free text ('Approved Awaiting PO', 'Ferdinand', 'REQ-...') yields no PO -> blank."""
+    for f in (order, custref):
+        m = re.search(r"PO[-\s]?\d[\d-]*", (f or "").upper())
+        if m:
+            return m.group(0).replace(" ", "")
+    return ""
+
+
+def load_category_map():
+    """{JL Category -> Monday Project Type label} from mapping_category_to_projecttype.csv."""
+    m = {}
+    try:
+        with open(MAPPING_CSV, newline="") as f:
+            for row in csv.reader(f):
+                if len(row) < 3 or row[0].strip() in ("JL Category", ""):
+                    continue
+                cat, ptype = row[0].strip(), row[2].strip()
+                if cat and ptype:
+                    m[cat] = ptype
+    except FileNotFoundError:
+        log.warning("category map %s not found -> Project Type left blank", MAPPING_CSV)
+    log.info("category map: %d entries", len(m))
+    return m
+
+
+def project_type_labels():
+    """Set of active Project Type dropdown labels (to validate the category mapping targets)."""
+    q = ('query ($board: [ID!]) { boards(ids: $board) { columns(ids: ["%s"]) { settings_str } } }') % COL_PTYPE
+    cols = monday(q, {"board": [BOARD_ID]})["boards"][0]["columns"]
+    if not cols:
+        return set()
+    labels = json.loads(cols[0]["settings_str"] or "{}").get("labels", [])
+    vals = labels.values() if isinstance(labels, dict) else [(x.get("label") or x.get("name")) for x in labels]
+    return {norm(v) for v in vals if v}
+
+
 # ---------------------------------------------------------------------------
 
 def desired_jobs():
     """WeWork Project jobs logged on/after the cutover: {JobNumber -> {...fields}}."""
     bq = bigquery.Client(project=BQ_PROJECT)
     sql = f"""
-      SELECT Id, JobNumber, Description, SiteName, JobOwner, CustomReference, OrderNumber, DateLogged
+      SELECT Id, JobNumber, Description, SiteName, JobOwner, CustomReference, OrderNumber,
+             CategoryDescription, DateLogged
       FROM `{BQ_PROJECT}.{BQ_DATASET}.jobs`
       WHERE TypeDescription=@jobtype AND CustomerName=@customer
         AND JobNumber IS NOT NULL AND JobNumber != ''
@@ -175,7 +228,9 @@ def desired_jobs():
             "desc": r["Description"] or "",
             "site": norm(r["SiteName"]),
             "owner": norm(r["JobOwner"]),
-            "clientref": norm(r["CustomReference"]) or norm(r["OrderNumber"]),
+            "order": norm(r["OrderNumber"]),
+            "custref": norm(r["CustomReference"]),
+            "cat": norm(r["CategoryDescription"]),
         }
     log.info("BigQuery: %d %s projects for %s logged on/after %s (excluding status: %s)",
              len(out), JOB_TYPE, CUSTOMER_NAME, CUTOVER, ", ".join(EXCLUDE_STATUS) or "none")
@@ -302,7 +357,10 @@ def enrich_job(job, token):
         if o.get("Description"):
             job["desc"] = o["Description"]
         if norm(o.get("OrderNumber")):
-            job["clientref"] = norm(o["OrderNumber"])
+            job["order"] = norm(o["OrderNumber"])
+        ref = o.get("ReferenceNumber") or o.get("ExternalId")
+        if norm(ref):
+            job["custref"] = norm(ref)
         site = (o.get("Site") or {}).get("Name") if isinstance(o.get("Site"), dict) else None
         if norm(site):
             job["site"] = norm(site)
@@ -312,7 +370,7 @@ def enrich_job(job, token):
         log.warning("  enrich %s failed (%s) -- using warehouse fields", jid, e)
 
 
-def build_values(job, sites, key_ids, preferred):
+def build_values(job, sites, catmap, ptypes, key_ids, preferred):
     """column_values dict + a list of human notes about anything left blank."""
     vals = {COL_ANCHOR: job["_jobnumber"]}
     notes = []
@@ -323,11 +381,23 @@ def build_values(job, sites, key_ids, preferred):
     elif site:
         notes.append(f"site '{site}' has no matching dropdown label")
 
-    ref = job["clientref"]
-    if ref and re.fullmatch(r"\d+", ref):
-        vals[COL_CLIENTREF] = ref
-    elif ref:
-        notes.append(f"client ref '{ref}' not numeric")
+    # Project Type <- Category (mapping_category_to_projecttype.csv)
+    cat = job.get("cat", "")
+    ptype = catmap.get(cat, "")
+    if ptype and ptype in ptypes:
+        vals[COL_PTYPE] = {"labels": [ptype]}
+    elif cat and not ptype:
+        notes.append(f"category '{cat}' has no Project Type mapping")
+    elif ptype:
+        notes.append(f"mapped Project Type '{ptype}' is not a board label")
+
+    # PO Number <- a 'PO...' pattern; Client Ref <- the 8-digit Salesforce number
+    po = po_number(job.get("order", ""), job.get("custref", ""))
+    if po:
+        vals[COL_PO] = po
+    sf = salesforce_no(job.get("custref", ""), job.get("order", ""))
+    if sf:
+        vals[COL_CLIENTREF] = sf
 
     owner = job["owner"]
     if SET_LEAD_PM and owner:                 # off by default: board automation assigns Lead PM
@@ -362,6 +432,8 @@ def main():
     jobs = desired_jobs()
     have = existing_refs()
     sites = site_label_map()
+    catmap = load_category_map()
+    ptypes = project_type_labels()
     key_ids, preferred = user_index()
 
     token = None
@@ -383,7 +455,7 @@ def main():
         if token:
             enrich_job(job, token)
         job["_jobnumber"] = jn
-        vals, notes = build_values(job, sites, key_ids, preferred)
+        vals, notes = build_values(job, sites, catmap, ptypes, key_ids, preferred)
         name = first_line(job["desc"]) or jn
         plan.append({"job": jn, "name": name, "vals": vals, "desc": job["desc"], "notes": notes})
 
@@ -391,13 +463,16 @@ def main():
 
     # --- plan report (always written) ---
     with open(REPORT_PATH, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["job", "name", "site", "client_ref", "lead_pm_set", "notes"])
+        w = csv.DictWriter(f, fieldnames=["job", "name", "project_type", "po_number", "client_ref",
+                                          "site", "lead_pm_set", "notes"])
         w.writeheader()
         for p in plan:
             w.writerow({
                 "job": p["job"], "name": p["name"][:80],
-                "site": p["vals"].get(COL_SITE, {}).get("labels", [""])[0] if COL_SITE in p["vals"] else "",
+                "project_type": p["vals"].get(COL_PTYPE, {}).get("labels", [""])[0] if COL_PTYPE in p["vals"] else "",
+                "po_number": p["vals"].get(COL_PO, ""),
                 "client_ref": p["vals"].get(COL_CLIENTREF, ""),
+                "site": p["vals"].get(COL_SITE, {}).get("labels", [""])[0] if COL_SITE in p["vals"] else "",
                 "lead_pm_set": "yes" if COL_PERSON in p["vals"] else "no",
                 "notes": "; ".join(p["notes"]),
             })

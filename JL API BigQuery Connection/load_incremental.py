@@ -50,10 +50,11 @@ def token():
     return _tok["v"]
 
 def fetch(sf, ef, frm, to):
-    rows, page = [], 1
+    rows, page, total = [], 1, None
     while True:
         body = {"TenantId": TID, "PageIndex": page, "PageSize": 50, sf: frm, ef: to}
         body.update(CFG["flags"])
+        r = None
         for attempt in range(1, 6):
             time.sleep(PACE)
             r = requests.post(f"{BASE}/{CFG['path']}", json=body,
@@ -62,11 +63,21 @@ def fetch(sf, ef, frm, to):
                 if r.status_code == 401: _tok["v"] = None
                 time.sleep(min(5 * attempt, 60)); continue
             r.raise_for_status(); break
+        # Retries exhausted on a throttling/5xx code: RAISE, don't fall through. Falling through
+        # would parse the error body, get no "Items", and silently stop paging this window —
+        # under-fetching, which a WRITE_TRUNCATE backfill then bakes in as lost rows.
+        if r is None or r.status_code in (429, 403) or r.status_code >= 500:
+            raise RuntimeError(f"{CFG['path']} window {frm}..{to} page {page}: "
+                               f"HTTP {getattr(r, 'status_code', '?')} after retries")
         d = r.json(); items = d.get("Items", []) if isinstance(d, dict) else d
         rows.extend(items)
-        if not items or len(items) < 50 or len(rows) >= (d.get("TotalCount", 0) if isinstance(d, dict) else 0):
+        total = d.get("TotalCount") if isinstance(d, dict) else None
+        if not items or len(items) < 50 or (total is not None and len(rows) >= total):
             break
         page += 1
+    # Reconcile against the window's own TotalCount so a short pull is caught, not swallowed.
+    if total is not None and len(rows) < total:
+        raise RuntimeError(f"{CFG['path']} window {frm}..{to}: got {len(rows)} of {total} rows")
     return rows
 
 def gather(date_windows):
@@ -92,14 +103,26 @@ def main():
             wins.append((cur.strftime("%Y-%m-%dT%H:%M:%SZ"), nxt.strftime("%Y-%m-%dT%H:%M:%SZ")))
             cur = nxt
         print(f"{now:%H:%M:%S} {ENTITY} backfill over {len(wins)} monthly windows", flush=True)
+        # gather() now raises if any window under-fetches (403/short pull), so a partial
+        # backfill aborts here instead of truncating the live table with missing rows.
         rows = gather(wins)
         for r in rows: r["_ingested_at"] = ing
         if not rows:
             print("no rows.", flush=True); return
+        # Guardrail: never replace the live table with FEWER rows than it already has (a full
+        # backfill should only ever grow or hold steady). Protects against a silent shortfall.
+        existing = bq.get_table(tbl).num_rows
+        if len(rows) < existing:
+            raise RuntimeError(f"backfill refused: fetched {len(rows)} < existing {existing} in {tbl}")
+        # Load into a staging table first, swap in only on success — the live table is never
+        # left truncated-but-unfilled if the load fails midway.
+        stg = f"{PROJECT}.raw._{CFG['table']}_backfill"
         bq.load_table_from_file(BytesIO("\n".join(json.dumps(r, default=str) for r in rows).encode()),
-            tbl, job_config=bigquery.LoadJobConfig(
+            stg, job_config=bigquery.LoadJobConfig(
                 source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
                 write_disposition="WRITE_TRUNCATE", autodetect=True)).result()
+        bq.query(f"CREATE OR REPLACE TABLE `{tbl}` AS SELECT * FROM `{stg}`").result()
+        bq.query(f"DROP TABLE `{stg}`").result()
         print(f"{dt.datetime.now(dt.timezone.utc):%H:%M:%S} backfill loaded {len(rows)} -> {tbl}", flush=True)
         return
 
