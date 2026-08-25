@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.20
-// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
+// @version      1.22
+// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -267,9 +267,35 @@
         return true;
     }
 
-    // Invoice net (ex-VAT total) + Customer Order Number via the SearchInvoice API, for the job.
+    // Delete a draft invoice, exactly as the UI does: fetch its delete-confirmation
+    // modal and submit that form. Used to clear away the empty £0 draft Joblogic hands
+    // back for a job that has nothing left to invoice, so falling through to the next
+    // job number on the row doesn't litter the account with stray drafts.
+    async function deleteDraftInvoice(invoiceId) {
+        const r = await fetch('/Invoice/DeleteModal?id=' + encodeURIComponent(invoiceId), {
+            credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        });
+        if (!r.ok) throw new Error('DeleteModal HTTP ' + r.status);
+        const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+        const form = doc.querySelector('form');
+        if (!form || !form.getAttribute('action')) throw new Error('No delete form in modal for invoice ' + invoiceId);
+        const action = form.getAttribute('action');
+        const body = new URLSearchParams();
+        form.querySelectorAll('input[name]').forEach(i => body.append(i.name, i.value));
+        const r2 = await fetch(action, {
+            method: 'POST', credentials: 'same-origin', body,
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+        });
+        const txt = await r2.text().catch(() => '');
+        if (!r2.ok) throw new Error(action + ' HTTP ' + r2.status);
+        let json = {}; try { json = JSON.parse(txt); } catch (e) {}
+        if (json.success === false) throw new Error(action + ' success=false: ' + (json.Message || (json.errors || []).join('; ')));
+        return true;
+    }
+
+    // All standard/project invoices on a job, via the SearchInvoice API.
     // Fields confirmed on live data: TotalExcludingVatDecimal, OrderNumber.
-    async function fetchInvoiceInfo(jobId, invoiceId) {
+    async function searchJobInvoices(jobId) {
         const payload = {
             ProjectId: '', IsProjectInvoicesPage: 'false', RequireSummary: 'false',
             searchTerm: '', JobId: String(jobId || ''), PPMContractId: '', HireContractId: '',
@@ -289,7 +315,21 @@
         });
         if (!r.ok) throw new Error('SearchInvoice HTTP ' + r.status);
         const j = await r.json();
-        const invs = ((j.AdditionalData || {}).Invoices) || [];
+        return ((j.AdditionalData || {}).Invoices) || [];
+    }
+
+    // The ex-VAT total of ONE specific invoice — no fallback to other invoices on the job.
+    // Returns null if that invoice isn't in the list yet. Used to spot the empty draft.
+    async function draftNet(jobId, invoiceId) {
+        const inv = (await searchJobInvoices(jobId)).find(x => String(x.Id) === String(invoiceId));
+        if (!inv) return null;
+        const n = Number(inv.TotalExcludingVatDecimal);
+        return isNaN(n) ? null : n;
+    }
+
+    // Invoice net (ex-VAT total) + Customer Order Number for the job.
+    async function fetchInvoiceInfo(jobId, invoiceId) {
+        const invs = await searchJobInvoices(jobId);
         if (!invs.length) return { net: null, orderNumber: '' };
         // Pick the source invoice: normally the one we just created (has lines); if that's
         // empty/£0 (already-invoiced job), fall back to the job's largest-net invoice — the
@@ -415,14 +455,18 @@
         return rows;
     }
 
-    // A create/resolve failure that means "there is nothing to invoice on THIS job"
-    // (already invoiced, no costs, or the number doesn't exist). These are the only
-    // failures that fall through to the next job number on the row.
-    const NOTHING_TO_INVOICE = /no lines|nothing to invoice|no cost|no uninvoiced|not found/i;
+    // A create/approve failure that means "there is nothing left to invoice on THIS job"
+    // (already invoiced, or no costs). Deliberately narrow: it must NOT match incidental
+    // "... not found" plumbing errors, because a match here authorises deleting the draft.
+    const NOTHING_TO_INVOICE = /no lines|nothing to invoice|no cost|no uninvoiced|nothing to approve/i;
+    // A bad/unknown job number also falls through to the next one on the row, but never
+    // reaches the create step, so it can't put a draft at risk.
+    const JOB_NOT_FOUND = /^Job not found/i;
+    const canTryNextJob = (msg) => NOTHING_TO_INVOICE.test(msg) || JOB_NOT_FOUND.test(msg);
 
     // Create + set order number + approve a single job (all headless). Resume-safe:
-    // won't re-resolve or re-create if that was already done for this job.
-    // Returns 'approved' | 'error' | 'stopped'.
+    // won't re-create or re-approve if that was already done for this job.
+    // Returns 'approved' | 'already-invoiced' | 'error' | 'stopped'.
     async function prepOne(i) {
         let s = loadState();
         if (!s || !s.running) return 'stopped';
@@ -431,15 +475,18 @@
         setProgress(`Job ${i + 1}/${s.jobs.length}: ${cands.join(', ')} — creating & approving`);
         try {
             if (job.bad) throw new Error('Row needs Job number AND PO');
-            // Resolve + create, walking the row's job numbers in order until one actually
-            // yields an invoice. Only these two steps fall through — once an invoice exists
-            // we commit to it, so a later failure can never leave a stray invoice behind.
-            if (!job.invoiceId) {
+            // Walk the row's job numbers in order until one actually produces an APPROVED
+            // invoice. A job with nothing left to invoice doesn't fail at create — Joblogic
+            // hands back an empty £0 draft and only refuses at approve — so the whole
+            // create → order-number → approve sequence lives inside the loop, and we bin
+            // the empty draft before moving on to the next job number.
+            if (job.prepStatus !== 'approved') {
                 if (cands.length > 1) log(`[${i + 1}] ${cands.length} job numbers on this row — will use the first one with something to invoice: ${cands.join(', ')}`, '#0af');
                 // Resume: if we already resolved one of these, carry on from that one.
                 let startAt = job.jobId ? Math.max(0, cands.findIndex(c => String(c).toLowerCase() === String(job.jobNumber).toLowerCase())) : 0;
                 for (let c = startAt; c < cands.length; c++) {
                     const cand = cands[c];
+                    const isLast = c === cands.length - 1;
                     try {
                         if (!(c === startAt && job.jobId)) {
                             const info = await resolveJob(cand);
@@ -451,25 +498,46 @@
                         job.reference = buildReference(job.po, job.siteId);
                         log(`[${i + 1}] ${job.jobNumber} → site "${job.siteName}" (${job.siteId}) | ${job.reference}`, '#0af');
                         await sleep(DELAY);
-                        job.invoiceId = await createInvoice(job.jobId);
-                        log(`    created invoice #${job.invoiceId}`, '#8fd');
+                        if (!job.invoiceId) {
+                            job.invoiceId = await createInvoice(job.jobId);
+                            log(`    created invoice #${job.invoiceId}`, '#8fd');
+                            await sleep(DELAY);
+                        }
+                        // Catch the empty draft BEFORE writing to it / approving it, so we
+                        // don't depend solely on the wording of the approve error.
+                        const net0 = await draftNet(job.jobId, job.invoiceId);
+                        if (net0 === 0) throw new Error('no lines to invoice (draft came back £0)');
+                        await setOrderNumber(job.invoiceId, job.reference);
+                        log(`    order number set`, '#8fd');
                         await sleep(DELAY);
+                        await approveInvoice(job.invoiceId);
                         break;
                     } catch (e) {
-                        const isLast = c === cands.length - 1;
-                        if (isLast || !NOTHING_TO_INVOICE.test(e.message)) throw e;
+                        if (!canTryNextJob(e.message)) throw e;
+                        // Nothing to invoice on this job number. Bin the empty draft (if one
+                        // got created) so it can't be approved or emailed later by mistake.
+                        // Re-check the total first and NEVER delete an invoice that has value —
+                        // if it isn't provably empty, leave it and flag it for a manual look.
+                        if (job.invoiceId) {
+                            let n = null;
+                            try { n = await draftNet(job.jobId, job.invoiceId); } catch (x) {}
+                            if (n === 0 || n === null) {
+                                try { await deleteDraftInvoice(job.invoiceId); log(`    deleted empty draft #${job.invoiceId}`, '#fd0'); }
+                                catch (x) { log(`    ⚠ could not delete empty draft #${job.invoiceId}: ${x.message} — delete it manually`, '#f80'); (job.strayDrafts = job.strayDrafts || []).push(job.invoiceId); }
+                            } else {
+                                log(`    ⚠ draft #${job.invoiceId} is £${n}, NOT empty — left in place, check it manually`, '#f80');
+                                (job.strayDrafts = job.strayDrafts || []).push(job.invoiceId);
+                            }
+                            job.invoiceId = null;
+                        }
                         (job.skipped = job.skipped || []).push(`${cand}: ${e.message}`);
-                        job.jobId = null;
-                        job.invoiceId = null;
+                        if (isLast) throw new Error('no lines to invoice on any job number on this row (' + cands.join(', ') + ')');
                         log(`    ⓘ ${cand}: ${e.message} — trying next job number "${cands[c + 1]}"`, '#fd0');
+                        job.jobId = null;
                         await sleep(DELAY);
                     }
                 }
             }
-            await setOrderNumber(job.invoiceId, job.reference);
-            log(`    order number set`, '#8fd');
-            await sleep(DELAY);
-            await approveInvoice(job.invoiceId);
             job.invoiceNumber = await fetchInvoiceNumber(job.invoiceId); // number is assigned on approve
             job.prepStatus = 'approved';
             job.emailStatus = 'pending';
@@ -478,12 +546,12 @@
             catch (e) { log(`    (net/order-number lookup failed: ${e.message})`, '#fd0'); }
         } catch (e) {
             if (/no lines/i.test(e.message)) {
-                // "No lines to add" = the job was already invoiced earlier. Skip the email
-                // (nothing to send) but still flip Monday, pulling the net from the real invoice.
-                // Every job number on the row landed here, so fall back to the row's FIRST job
-                // for the Monday match + net lookup (that's the primary one on the sheet).
-                if (cands.length > 1 && String(job.jobNumber).toLowerCase() !== String(cands[0]).toLowerCase()) {
-                    log(`    ⓘ all ${cands.length} job numbers had nothing to invoice — reporting against ${cands[0]}`, '#fd0');
+                // Nothing left to invoice on ANY job number on the row = it was all invoiced
+                // earlier. Skip the email (nothing to send) but still flip Monday, pulling the
+                // net from the real prior invoice. Report against the row's FIRST job number,
+                // which is the primary one on the sheet.
+                if (String(job.jobNumber).toLowerCase() !== String(cands[0]).toLowerCase()) {
+                    log(`    ⓘ nothing to invoice on any of ${cands.join(', ')} — reporting against ${cands[0]}`, '#fd0');
                     try { const first = await resolveJob(cands[0]); job.jobId = first.jobId; job.jobNumber = first.jobNumber; job.siteName = first.siteName; job.siteId = siteIdFrom(job.siteName); job.reference = buildReference(job.po, job.siteId); } catch (x) {}
                 }
                 job.prepStatus = 'already-invoiced';
@@ -738,6 +806,7 @@
             const m = j.mondayStatus || '';
             if (m.indexOf('skipped') === 0) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — Monday NOT updated: ${m}`);
             else if (m === 'error') flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — Monday error: ${j.mondayError || 'unknown'}`);
+            if ((j.strayDrafts || []).length) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — DELETE MANUALLY: empty £0 draft invoice(s) #${j.strayDrafts.join(', #')}`);
         });
         if (flags.length) {
             log(`⚠ ${flags.length} item(s) need attention — see popup / Results.`, '#fd0');
@@ -784,7 +853,7 @@
                 jobNumber: r.jobNumber, jobNumbers: r.jobNumbers || [r.jobNumber], po: r.po, bad: !!r.bad,
                 jobId: null, siteName: '', siteId: '', reference: '',
                 invoiceId: null, invoiceNumber: '', net: null, orderNumber: '',
-                prepStatus: 'pending', emailStatus: '', sentAt: '', error: '', skipped: null,
+                prepStatus: 'pending', emailStatus: '', sentAt: '', error: '', skipped: null, strayDrafts: null,
                 mondayStatus: '', mondayItemId: '', mondayError: '',
             })),
         };
@@ -831,7 +900,11 @@
             const monday = j.mondayStatus === 'error' ? ('ERROR: ' + (j.mondayError || '')) : (j.mondayStatus || '');
             // Note the job numbers we passed over (already invoiced / no costs) so the sheet
             // shows why the invoiced job isn't the first one in the cell.
-            const note = [(j.skipped || []).length ? 'skipped ' + j.skipped.join('; ') : '', j.error || ''].filter(Boolean).join(' | ');
+            const note = [
+                (j.skipped || []).length ? 'skipped ' + j.skipped.join('; ') : '',
+                (j.strayDrafts || []).length ? 'DELETE empty draft(s) #' + j.strayDrafts.join(', #') : '',
+                j.error || '',
+            ].filter(Boolean).join(' | ');
             lines.push([
                 j.jobNumber, formatPO(j.po), j.siteName, j.siteId, j.reference,
                 j.invoiceId || '', j.invoiceNumber || '', (j.net != null ? j.net : ''), status, j.sentAt || '', monday, note,
