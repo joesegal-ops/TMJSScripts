@@ -175,6 +175,12 @@ WITH visit_notes AS (
   FROM `vmimporteddata.models.notes`
   WHERE entity_type = "Visit" AND note_text IS NOT NULL AND TRIM(note_text) != ""
   GROUP BY job_id
+),
+last_visit_note AS (  -- single most-recent Visit-entity note per job
+  SELECT job_id, note_text AS Last_Engineer_Note
+  FROM `vmimporteddata.models.notes`
+  WHERE entity_type = "Visit" AND note_text IS NOT NULL AND TRIM(note_text) != ""
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY date_added DESC) = 1
 )
 SELECT
   j.JobNumber                 AS ID,
@@ -209,13 +215,17 @@ SELECT
   (SELECT COUNT(*) FROM UNNEST(j.VisitsStatus) v
      WHERE v.StatusDescription = "Complete") AS Visit_Count,
   vn.Visit_Notes              AS Visit_Notes,
+  (SELECT v.EngineerName FROM UNNEST(j.VisitsStatus) v
+     WHERE v.EngineerName IS NOT NULL ORDER BY v.StartDate DESC LIMIT 1) AS Engineer,
+  lvn.Last_Engineer_Note      AS Last_Engineer_Note,
   j.Tags                      AS Job_Tags,
   CAST(NULL AS BOOL)          AS Service_Job,              -- FULL PASS: PPM service flag
   CAST(NULL AS STRING)        AS Service_Description,      -- FULL PASS: PPM service
   j.Id                        AS Job_Auto_Id,
   j._ingested_at
 FROM `vmimporteddata.raw.jobs` j
-LEFT JOIN visit_notes vn ON vn.job_id = j.Id;
+LEFT JOIN visit_notes vn ON vn.job_id = j.Id
+LEFT JOIN last_visit_note lvn ON lvn.job_id = j.Id;
 
 -- Avg visits per job (faithful port of old importdata Avg_Visits_Per_Job). Sources = models.job_and_visit_details
 -- (visits) + models.all_in_job (Job_Type, Date_Logged). Excludes cancelled visits; per-job grain.

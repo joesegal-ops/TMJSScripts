@@ -9,8 +9,9 @@ APP=/opt/jl-loader
 set -a
 source "$APP/config.env"
 BQ_DATASET=sweden_raw                                   # override raw -> sweden_raw
-JL_CLIENT_ID="$(gcloud secrets versions access latest --secret=jl-se-client-id --project=vmimporteddata)"
-JL_CLIENT_SECRET="$(gcloud secrets versions access latest --secret=jl-se-client-secret --project=vmimporteddata)"
+# SE uses the SAME API client as UK (JL authorised one client for both tenants); only the tenant id differs.
+JL_CLIENT_ID="$(gcloud secrets versions access latest --secret=jl-client-id --project=vmimporteddata)"
+JL_CLIENT_SECRET="$(gcloud secrets versions access latest --secret=jl-client-secret --project=vmimporteddata)"
 JL_TENANT_ID="$(gcloud secrets versions access latest --secret=jl-se-tenant-id --project=vmimporteddata)"
 JL_ENTITIES="$1"
 set +a

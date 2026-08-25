@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.19
-// @description  Paste a list of Jobs + PO numbers. Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
+// @version      1.20
+// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -400,17 +400,25 @@
             // job cell can hold several comma-separated job numbers ("PROJ0002205, PROJ0002049").
             // (Splitting on comma used to read the 2nd job number as the PO.)
             const parts = t.split(/\t|\s*\|\s*|\s{2,}/).map(x => x.trim()).filter(Boolean);
-            // When a cell has multiple job numbers, invoice against the FIRST one.
-            const jobNumber = (parts[0] || '').split(',')[0].trim();
+            // A cell can hold several comma-separated job numbers. Keep them ALL, in order:
+            // prepOne() invoices the first one that actually has something to invoice, and
+            // falls through to the next when a job is already invoiced or has no costs.
             // Skip header/label/blank rows — every real Joblogic job number contains a
             // digit, so "Job Number", "PO Number", etc. are dropped automatically.
             // (Without this, "Job Number" fuzzy-matches a random job via SearchJsonData.)
-            if (!/\d/.test(jobNumber)) return;
-            if (parts.length < 2) { rows.push({ jobNumber, po: '', bad: true }); return; }
-            rows.push({ jobNumber, po: parts[1] });
+            const jobNumbers = (parts[0] || '').split(',').map(x => x.trim()).filter(x => /\d/.test(x));
+            if (!jobNumbers.length) return;
+            const jobNumber = jobNumbers[0];
+            if (parts.length < 2) { rows.push({ jobNumber, jobNumbers, po: '', bad: true }); return; }
+            rows.push({ jobNumber, jobNumbers, po: parts[1] });
         });
         return rows;
     }
+
+    // A create/resolve failure that means "there is nothing to invoice on THIS job"
+    // (already invoiced, no costs, or the number doesn't exist). These are the only
+    // failures that fall through to the next job number on the row.
+    const NOTHING_TO_INVOICE = /no lines|nothing to invoice|no cost|no uninvoiced|not found/i;
 
     // Create + set order number + approve a single job (all headless). Resume-safe:
     // won't re-resolve or re-create if that was already done for this job.
@@ -419,23 +427,44 @@
         let s = loadState();
         if (!s || !s.running) return 'stopped';
         const job = s.jobs[i];
-        setProgress(`Job ${i + 1}/${s.jobs.length}: ${job.jobNumber} — creating & approving`);
+        const cands = (job.jobNumbers && job.jobNumbers.length) ? job.jobNumbers.slice() : [job.jobNumber];
+        setProgress(`Job ${i + 1}/${s.jobs.length}: ${cands.join(', ')} — creating & approving`);
         try {
             if (job.bad) throw new Error('Row needs Job number AND PO');
-            if (!job.jobId) {
-                const info = await resolveJob(job.jobNumber);
-                job.jobId = info.jobId;
-                job.jobNumber = info.jobNumber;
-                job.siteName = info.siteName;
-            }
-            job.siteId = siteIdFrom(job.siteName);
-            job.reference = buildReference(job.po, job.siteId);
-            log(`[${i + 1}] ${job.jobNumber} → site "${job.siteName}" (${job.siteId}) | ${job.reference}`, '#0af');
-            await sleep(DELAY);
+            // Resolve + create, walking the row's job numbers in order until one actually
+            // yields an invoice. Only these two steps fall through — once an invoice exists
+            // we commit to it, so a later failure can never leave a stray invoice behind.
             if (!job.invoiceId) {
-                job.invoiceId = await createInvoice(job.jobId);
-                log(`    created invoice #${job.invoiceId}`, '#8fd');
-                await sleep(DELAY);
+                if (cands.length > 1) log(`[${i + 1}] ${cands.length} job numbers on this row — will use the first one with something to invoice: ${cands.join(', ')}`, '#0af');
+                // Resume: if we already resolved one of these, carry on from that one.
+                let startAt = job.jobId ? Math.max(0, cands.findIndex(c => String(c).toLowerCase() === String(job.jobNumber).toLowerCase())) : 0;
+                for (let c = startAt; c < cands.length; c++) {
+                    const cand = cands[c];
+                    try {
+                        if (!(c === startAt && job.jobId)) {
+                            const info = await resolveJob(cand);
+                            job.jobId = info.jobId;
+                            job.jobNumber = info.jobNumber;
+                            job.siteName = info.siteName;
+                        }
+                        job.siteId = siteIdFrom(job.siteName);
+                        job.reference = buildReference(job.po, job.siteId);
+                        log(`[${i + 1}] ${job.jobNumber} → site "${job.siteName}" (${job.siteId}) | ${job.reference}`, '#0af');
+                        await sleep(DELAY);
+                        job.invoiceId = await createInvoice(job.jobId);
+                        log(`    created invoice #${job.invoiceId}`, '#8fd');
+                        await sleep(DELAY);
+                        break;
+                    } catch (e) {
+                        const isLast = c === cands.length - 1;
+                        if (isLast || !NOTHING_TO_INVOICE.test(e.message)) throw e;
+                        (job.skipped = job.skipped || []).push(`${cand}: ${e.message}`);
+                        job.jobId = null;
+                        job.invoiceId = null;
+                        log(`    ⓘ ${cand}: ${e.message} — trying next job number "${cands[c + 1]}"`, '#fd0');
+                        await sleep(DELAY);
+                    }
+                }
             }
             await setOrderNumber(job.invoiceId, job.reference);
             log(`    order number set`, '#8fd');
@@ -451,6 +480,12 @@
             if (/no lines/i.test(e.message)) {
                 // "No lines to add" = the job was already invoiced earlier. Skip the email
                 // (nothing to send) but still flip Monday, pulling the net from the real invoice.
+                // Every job number on the row landed here, so fall back to the row's FIRST job
+                // for the Monday match + net lookup (that's the primary one on the sheet).
+                if (cands.length > 1 && String(job.jobNumber).toLowerCase() !== String(cands[0]).toLowerCase()) {
+                    log(`    ⓘ all ${cands.length} job numbers had nothing to invoice — reporting against ${cands[0]}`, '#fd0');
+                    try { const first = await resolveJob(cands[0]); job.jobId = first.jobId; job.jobNumber = first.jobNumber; job.siteName = first.siteName; job.siteId = siteIdFrom(job.siteName); job.reference = buildReference(job.po, job.siteId); } catch (x) {}
+                }
                 job.prepStatus = 'already-invoiced';
                 job.emailStatus = 'skipped';
                 try { const info = await fetchInvoiceInfo(job.jobId, job.invoiceId); job.net = info.net; job.orderNumber = info.orderNumber; } catch (x) {}
@@ -746,10 +781,10 @@
             pushMonday: wantMonday,
             idx: 0,
             jobs: rows.map(r => ({
-                jobNumber: r.jobNumber, po: r.po, bad: !!r.bad,
+                jobNumber: r.jobNumber, jobNumbers: r.jobNumbers || [r.jobNumber], po: r.po, bad: !!r.bad,
                 jobId: null, siteName: '', siteId: '', reference: '',
                 invoiceId: null, invoiceNumber: '', net: null, orderNumber: '',
-                prepStatus: 'pending', emailStatus: '', sentAt: '', error: '',
+                prepStatus: 'pending', emailStatus: '', sentAt: '', error: '', skipped: null,
                 mondayStatus: '', mondayItemId: '', mondayError: '',
             })),
         };
@@ -783,7 +818,7 @@
     // =======================================================================
     // Output — TSV for Google Sheets
     // =======================================================================
-    const TSV_HEADERS = ['Job Number', 'PO', 'Site', 'SITEID', 'Customer Order No', 'Invoice ID', 'Invoice No', 'Net (ex VAT)', 'Status', 'Sent At', 'Monday', 'Error'];
+    const TSV_HEADERS = ['Job Number', 'PO', 'Site', 'SITEID', 'Customer Order No', 'Invoice ID', 'Invoice No', 'Net (ex VAT)', 'Status', 'Sent At', 'Monday', 'Notes / Error'];
     function toTSV(s) {
         const lines = [TSV_HEADERS.join('\t')];
         s.jobs.forEach(j => {
@@ -794,9 +829,12 @@
                 : j.emailStatus === 'error' ? 'ERROR (email)'
                 : j.prepStatus === 'approved' ? 'Approved' : 'Pending';
             const monday = j.mondayStatus === 'error' ? ('ERROR: ' + (j.mondayError || '')) : (j.mondayStatus || '');
+            // Note the job numbers we passed over (already invoiced / no costs) so the sheet
+            // shows why the invoiced job isn't the first one in the cell.
+            const note = [(j.skipped || []).length ? 'skipped ' + j.skipped.join('; ') : '', j.error || ''].filter(Boolean).join(' | ');
             lines.push([
                 j.jobNumber, formatPO(j.po), j.siteName, j.siteId, j.reference,
-                j.invoiceId || '', j.invoiceNumber || '', (j.net != null ? j.net : ''), status, j.sentAt || '', monday, j.error || '',
+                j.invoiceId || '', j.invoiceNumber || '', (j.net != null ? j.net : ''), status, j.sentAt || '', monday, note,
             ].map(x => String(x == null ? '' : x).replace(/\t/g, ' ').replace(/\r?\n/g, ' ')).join('\t'));
         });
         return lines.join('\n');
