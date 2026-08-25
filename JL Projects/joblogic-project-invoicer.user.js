@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.22
+// @version      1.23
 // @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
@@ -131,6 +131,7 @@
     const MB_PRICE   = 'numbers_mkmk43k6';  // Price Est. (ex. VAT)
     const MB_PO      = 'text_mky86hyy';      // PO Number (primary match key)
     const MB_JOBREF  = 'text_mkyrcb16';      // Job Ref. (fallback match key)
+    const MB_PMSTAT  = 'status';             // PM Stat. — "Complete" means leave the job as Invoiced
     const MONDAY_TOKEN_KEY = 'jl-monday-token';   // Tampermonkey GM storage, set via a prompt (no DOM field → password managers can't clobber it)
     function mondayToken() { try { return GM_getValue(MONDAY_TOKEN_KEY, '') || ''; } catch (e) { return ''; } }
 
@@ -267,6 +268,181 @@
         return true;
     }
 
+    // =======================================================================
+    // JOB STATUS — capture before invoicing, put back afterwards
+    // Approving an invoice flips the JOB's status to "Invoiced". We snapshot the
+    // status first, then (unless Monday says the project is Complete) write it back.
+    // Pattern lifted from JL Jobs/joblogic-bulk-set-category.user.js: pull the job-state
+    // JSON embedded in /Job/Detail/{id}, then POST the FULL field set to
+    // /api/Job/EditDetail with one field changed. A partial payload misbehaves.
+    // =======================================================================
+    function extractJobState(html, internalId) {
+        const anchor = `"Id":${internalId}`;
+        const i = html.indexOf(anchor);
+        if (i < 0) throw new Error('Job state anchor not found in detail page');
+        let depth = 0, start = -1;
+        for (let p = i; p >= 0; p--) {
+            const c = html[p];
+            if (c === '}') depth++;
+            else if (c === '{') { if (depth === 0) { start = p; break; } depth--; }
+        }
+        if (start < 0) throw new Error('Job state open brace not found');
+        let d = 0, inStr = false, esc = false, end = -1;
+        for (let j = start; j < html.length; j++) {
+            const c = html[j];
+            if (esc) { esc = false; continue; }
+            if (c === '\\') { esc = true; continue; }
+            if (c === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (c === '{') d++;
+            else if (c === '}') { d--; if (d === 0) { end = j + 1; break; } }
+        }
+        if (end < 0) throw new Error('Job state close brace not found');
+        return JSON.parse(html.slice(start, end));
+    }
+
+    async function fetchJobState(jobId) {
+        const html = await fetchText('/Job/Detail/' + jobId);
+        return { html, job: extractJobState(html, jobId) };
+    }
+
+    // Status code → label, for logging only. Cached for the run.
+    let statusLabels = null;
+    async function statusLabel(code) {
+        if (code == null || code === '') return '';
+        if (!statusLabels) {
+            statusLabels = {};
+            try {
+                const r = await fetch('/api/Job/GetStatusesForDropdown', { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' } });
+                if (r.ok) ((await r.json()).AdditionalData || []).forEach(x => { statusLabels[String(x.Value)] = x.Text; });
+            } catch (e) {}
+        }
+        return statusLabels[String(code)] || String(code);
+    }
+
+    // Write StatusId back onto a job via /api/Job/EditDetail, echoing every other field.
+    async function setJobStatus(jobId, statusId, _retry = 0) {
+        const { html, job } = await fetchJobState(jobId);
+        const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+        const csrfToken = tokenMatch ? tokenMatch[1] : tokenFromHtml(html);
+
+        const entries = [];
+        const push = (k, v) => entries.push([k, v == null ? '' : String(v)]);
+        push('Id', job.Id);
+        push('AssignedToUserId', job.AssignedToUserId);
+        const existingTagIds = Array.isArray(job.TagIds) ? job.TagIds
+            : (Array.isArray(job.Tags) ? job.Tags.map(t => t.Id || t.TagId || t) : []);
+        existingTagIds.forEach((id, idx) => push(`TagIds[${idx}]`, id));
+        push('TradeId', job.TradeId);
+        push('IsRecuring', job.IsRecuring);
+        push('JobTypeId', job.JobTypeId);
+        push('StatusId', statusId); // ← the change
+        push('Description', job.Description);
+        push('DateLogged', job.DateLogged);
+        push('AppointmentDate', job.AppointmentDate);
+        push('TargetCompletionDate', job.TargetCompletionDate);
+        push('DateComplete', job.DateComplete);
+        push('TargetAttendanceDate', job.TargetAttendanceDate);
+        push('NextContactDate', job.NextContactDate);
+        const fc = job.JobFaultCode || {};
+        push('JobFaultCode[ReportedFaultCodeId]',      fc.ReportedFaultCodeId);
+        push('JobFaultCode[ReportedFaultCodeName]',    fc.ReportedFaultCodeName);
+        push('JobFaultCode[ReportedSubFaultCodeId]',   fc.ReportedSubFaultCodeId);
+        push('JobFaultCode[ReportedSubFaultCodeName]', fc.ReportedSubFaultCodeName);
+        push('JobFaultCode[ActualFaultCodeId]',        fc.ActualFaultCodeId);
+        push('JobFaultCode[ActualFaultCodeName]',      fc.ActualFaultCodeName);
+        push('JobFaultCode[ActualSubFaultCodeId]',     fc.ActualSubFaultCodeId);
+        push('JobFaultCode[ActualSubFaultCodeName]',   fc.ActualSubFaultCodeName);
+        push('JobCategoryId', job.JobCategoryId);
+        push('PriorityId', job.PriorityId);
+        push('OrderNumber', job.OrderNumber);
+        push('CustomReference', job.CustomReference);
+        push('IsRequireApproval', job.IsRequireApproval);
+        push('CompletionTimeSinceOnSite', job.CompletionTimeSinceOnSite);
+        push('JobUserReferenceFieldValue', job.JobUserReferenceFieldValue);
+        push('JobUserReferenceDropdownListValue', job.JobUserReferenceDropdownListValue);
+        push('CustomerContractId', job.CustomerContractId);
+        push('ProjectNumber', job.ProjectNumber);
+        push('MilestoneId', job.MilestoneId);
+        push('ProjectMilestoneId', job.ProjectMilestoneId);
+        push('ProjectId', job.ProjectId);
+        push('BaseCurrencyCode', job.BaseCurrencyCode);
+        push('BaseCurrencyName', job.BaseCurrencyName);
+        push('ToCurrencyCode', job.ToCurrencyCode);
+        push('ToCurrencyName', job.ToCurrencyName);
+        push('ConversionRate', job.ConversionRate);
+        push('ExchangeRateDate', job.ExchangeRateDate);
+        push('IsEnabledMultipleCurrencies', job.IsEnabledMultipleCurrencies);
+        push('PreferredCurrencyId', job.PreferredCurrencyId);
+        push('CustomerId', job.CustomerId);
+        push('IsAssociatedCustomer', job.IsAssociatedCustomer);
+
+        const body = entries.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
+        const headers = { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' };
+        if (csrfToken) headers['__RequestVerificationToken'] = csrfToken;
+        const resp = await fetch('/api/Job/EditDetail', {
+            method: 'POST', credentials: 'same-origin',
+            referrer: location.origin + '/Job/Detail/' + jobId, referrerPolicy: 'unsafe-url',
+            headers, body,
+        });
+        const txt = await resp.text().catch(() => '');
+        if (!resp.ok) {
+            if (resp.status === 400 && _retry < 1) { await sleep(2500); return setJobStatus(jobId, statusId, _retry + 1); }
+            throw new Error(`EditDetail HTTP ${resp.status}: ${txt.slice(0, 200)}`);
+        }
+        let json = {}; try { json = JSON.parse(txt); } catch (e) {}
+        if (json.success === false) throw new Error('EditDetail success=false: ' + (json.Message || txt.slice(0, 200)));
+        return true;
+    }
+
+    // Put the job's pre-invoice status back, unless Monday says the project is Complete.
+    // Never throws — logs and records onto the job, like pushJobToMonday.
+    async function restoreJobStatus(i) {
+        let s = loadState(); if (!s) return;
+        const job = s.jobs[i]; if (!job) return;
+        const done = (v) => { const cur = loadState(); if (cur) { cur.jobs[i] = job; saveState(cur); renderResults(cur); } return v; };
+
+        // Only jobs we actually invoiced had their status changed by us.
+        if (job.prepStatus !== 'approved') return;
+        if (String(job.statusRestore || '').indexOf('done') === 0 || job.statusRestore === 'kept (PM Stat. Complete)') return; // idempotent on resume
+        if (!job.statusBefore) { job.statusRestore = 'skipped (status not captured)'; return done(); }
+
+        // PM Stat. decides. Prefer the value read during the Monday write-back; look it
+        // up ourselves if Monday push was off or hasn't run.
+        let pm = job.pmStat;
+        if (pm === undefined || pm === null) {
+            try {
+                const hit = await mondayFindItem(formatPO(job.po), job.jobNumber);
+                if (!hit) { job.statusRestore = 'skipped (no Monday item — status left as Invoiced)'; log(`    ⚠ status: no Monday item for ${formatPO(job.po)} / ${job.jobNumber} — can't read PM Stat., leaving job as Invoiced`, '#fd0'); return done(); }
+                if (hit.ambiguous) { job.statusRestore = `skipped (${hit.count} Monday ${hit.by} matches)`; log(`    ⚠ status: ${hit.count} Monday items match — can't read PM Stat., leaving job as Invoiced`, '#fd0'); return done(); }
+                pm = hit.pmStat;
+                job.pmStat = pm;
+            } catch (e) {
+                job.statusRestore = 'skipped (Monday lookup failed: ' + e.message + ')';
+                log(`    ⚠ status: couldn't read PM Stat. (${e.message}) — leaving job as Invoiced`, '#fd0');
+                return done();
+            }
+        }
+
+        if (String(pm).trim().toLowerCase() === 'complete') {
+            job.statusRestore = 'kept (PM Stat. Complete)';
+            log(`    status: PM Stat. is "Complete" — leaving job as Invoiced`, '#8fd');
+            return done();
+        }
+
+        const was = await statusLabel(job.statusBefore);
+        try {
+            await setJobStatus(job.jobId, job.statusBefore);
+            job.statusRestore = `done (back to ${was})`;
+            log(`    status: PM Stat. is "${pm || '(blank)'}" (not Complete) — job ${job.jobNumber} put back to "${was}"`, '#0fa');
+        } catch (e) {
+            job.statusRestore = 'error';
+            job.statusError = e.message;
+            log(`    ✗ status: could not put ${job.jobNumber} back to "${was}": ${e.message}`, '#f55');
+        }
+        return done();
+    }
+
     // Delete a draft invoice, exactly as the UI does: fetch its delete-confirmation
     // modal and submit that form. Used to clear away the empty £0 draft Joblogic hands
     // back for a job that has nothing left to invoice, so falling through to the next
@@ -371,7 +547,7 @@
     async function mondayFindItem(po, jobRef) {
         async function byColumn(colId, value) {
             if (!value) return [];
-            const q = `query { items_page_by_column_values(limit: 10, board_id: ${MONDAY_BOARD}, columns: [{column_id: "${colId}", column_values: ${JSON.stringify([String(value)])}}]) { items { id name } } }`;
+            const q = `query { items_page_by_column_values(limit: 10, board_id: ${MONDAY_BOARD}, columns: [{column_id: "${colId}", column_values: ${JSON.stringify([String(value)])}}]) { items { id name column_values(ids: ["${MB_PMSTAT}"]) { text } } } }`;
             const d = await mondayApi(q, {});
             return ((d.items_page_by_column_values || {}).items) || [];
         }
@@ -379,7 +555,8 @@
         let by = 'PO';
         if (!items.length) { items = await byColumn(MB_JOBREF, jobRef); by = 'JobRef'; }
         if (!items.length) return null;
-        return { id: items[0].id, name: items[0].name, by, ambiguous: items.length > 1, count: items.length };
+        const pmStat = (((items[0].column_values || [])[0] || {}).text || '').trim();
+        return { id: items[0].id, name: items[0].name, pmStat, by, ambiguous: items.length > 1, count: items.length };
     }
     async function mondaySetInvoiced(itemId, netAmount, poNumber) {
         const cv = {}; cv[MB_FINANCE] = { label: 'Invoiced' };
@@ -401,6 +578,7 @@
                 const po = formatPO(job.po);
                 const hit = await mondayFindItem(po, job.jobNumber);
                 if (!hit) throw new Error(`no Monday item for ${po} / ${job.jobNumber}`);
+                if (!hit.ambiguous) job.pmStat = hit.pmStat; // read by restoreJobStatus()
                 if (hit.ambiguous) {
                     // Multiple board items match → don't guess. Skip and flag for manual handling.
                     job.mondayStatus = `skipped (⚠ ${hit.count} ${hit.by} matches — update manually)`;
@@ -510,6 +688,15 @@
                         await setOrderNumber(job.invoiceId, job.reference);
                         log(`    order number set`, '#8fd');
                         await sleep(DELAY);
+                        // Snapshot the job's status BEFORE approving — approving flips it to
+                        // "Invoiced", and restoreJobStatus() puts this back afterwards unless
+                        // Monday's PM Stat. says the project is Complete.
+                        try {
+                            const st = (await fetchJobState(job.jobId)).job;
+                            job.statusBefore = (st.StatusId == null ? '' : String(st.StatusId));
+                            job.statusBeforeName = await statusLabel(job.statusBefore);
+                            log(`    status before invoicing: "${job.statusBeforeName}"`, '#8fd');
+                        } catch (x) { log(`    ⚠ could not read current job status (${x.message}) — status won't be put back`, '#fd0'); }
                         await approveInvoice(job.invoiceId);
                         break;
                     } catch (e) {
@@ -740,7 +927,7 @@
             // 2. If we can't/shouldn't email this job, move to the next one.
             if (job.prepStatus === 'error' || job.prepStatus === 'already-invoiced' || s.skipEmail || job.emailStatus === 'sent') {
                 // Already-invoiced jobs, and skip-email mode, still update Monday (guarded).
-                if (job.prepStatus === 'already-invoiced' || (s.skipEmail && job.prepStatus === 'approved')) await pushJobToMonday(s.idx);
+                if (job.prepStatus === 'already-invoiced' || (s.skipEmail && job.prepStatus === 'approved')) { await pushJobToMonday(s.idx); await restoreJobStatus(s.idx); }
                 const cur = loadState(); cur.idx += 1; saveState(cur);
                 continue;
             }
@@ -777,6 +964,7 @@
         saveState(s);
         renderResults(s);
         await pushJobToMonday(s.idx);   // Monday write-back for the job just finished (guarded/idempotent)
+        await restoreJobStatus(s.idx);  // put the job's pre-invoice status back (unless PM Stat. = Complete)
         s = loadState(); if (!s) return;
         s.idx += 1;
         saveState(s);
@@ -807,6 +995,9 @@
             if (m.indexOf('skipped') === 0) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — Monday NOT updated: ${m}`);
             else if (m === 'error') flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — Monday error: ${j.mondayError || 'unknown'}`);
             if ((j.strayDrafts || []).length) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — DELETE MANUALLY: empty £0 draft invoice(s) #${j.strayDrafts.join(', #')}`);
+            const sr = j.statusRestore || '';
+            if (sr === 'error') flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — job status NOT put back (still "Invoiced"): ${j.statusError || 'unknown'}`);
+            else if (sr.indexOf('skipped') === 0) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — job status left as "Invoiced": ${sr}`);
         });
         if (flags.length) {
             log(`⚠ ${flags.length} item(s) need attention — see popup / Results.`, '#fd0');
@@ -854,6 +1045,7 @@
                 jobId: null, siteName: '', siteId: '', reference: '',
                 invoiceId: null, invoiceNumber: '', net: null, orderNumber: '',
                 prepStatus: 'pending', emailStatus: '', sentAt: '', error: '', skipped: null, strayDrafts: null,
+                statusBefore: '', statusBeforeName: '', statusRestore: '', statusError: '', pmStat: null,
                 mondayStatus: '', mondayItemId: '', mondayError: '',
             })),
         };
@@ -887,7 +1079,7 @@
     // =======================================================================
     // Output — TSV for Google Sheets
     // =======================================================================
-    const TSV_HEADERS = ['Job Number', 'PO', 'Site', 'SITEID', 'Customer Order No', 'Invoice ID', 'Invoice No', 'Net (ex VAT)', 'Status', 'Sent At', 'Monday', 'Notes / Error'];
+    const TSV_HEADERS = ['Job Number', 'PO', 'Site', 'SITEID', 'Customer Order No', 'Invoice ID', 'Invoice No', 'Net (ex VAT)', 'Status', 'Sent At', 'Monday', 'PM Stat.', 'Job Status', 'Notes / Error'];
     function toTSV(s) {
         const lines = [TSV_HEADERS.join('\t')];
         s.jobs.forEach(j => {
@@ -907,7 +1099,8 @@
             ].filter(Boolean).join(' | ');
             lines.push([
                 j.jobNumber, formatPO(j.po), j.siteName, j.siteId, j.reference,
-                j.invoiceId || '', j.invoiceNumber || '', (j.net != null ? j.net : ''), status, j.sentAt || '', monday, note,
+                j.invoiceId || '', j.invoiceNumber || '', (j.net != null ? j.net : ''), status, j.sentAt || '', monday,
+                j.pmStat || '', j.statusRestore === 'error' ? ('ERROR: ' + (j.statusError || '')) : (j.statusRestore || ''), note,
             ].map(x => String(x == null ? '' : x).replace(/\t/g, ' ').replace(/\r?\n/g, ' ')).join('\t'));
         });
         return lines.join('\n');
