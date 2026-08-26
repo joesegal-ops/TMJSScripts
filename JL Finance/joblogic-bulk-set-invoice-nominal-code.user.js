@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Set Invoice Line Nominal Code
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  On the Invoice list page, walks every invoice in the CURRENT search (same tab / filters / search term, all pages) and sets the Nominal Code on their invoice lines to one you pick. Optionally only replaces lines currently on a given code. Scan for a preview, then Apply (with dry-run). Handles Standard and PPM invoices. Collapses into the shared JL dock.
+// @version      1.1.0
+// @description  On the Invoice list page, walks every invoice in the CURRENT search (same tab / filters / search term, all pages) and sets the Nominal Code on their invoice lines to one you pick. Optionally only replaces lines currently on a given code. Scan for a preview, then Apply (with dry-run). Handles Standard and PPM invoices, draft or approved/generated. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -105,7 +105,7 @@
     const SCRIPT_ID = 'invoice-nominal';
     const SCRIPT_LABEL = '🏷️ Invoice Nominal Code';
     const SCRIPT_COLOR = '#6a3fa0';
-    const SCRIPT_VERSION = 'v1.0';
+    const SCRIPT_VERSION = 'v1.1';
     const SCRIPT_DESC = 'Bulk-changes the Nominal Code on the invoice LINES of every invoice in the current Invoice-list search — same tab, filters and search term you have applied, across all pages. Scan first for a preview, then Apply.';
 
     const SCAN_PAGE_SIZE = 100;   // rows per SearchInvoice call
@@ -187,6 +187,13 @@
             }
         }
         throw new Error(lastErr || 'request failed');
+    }
+
+    // Joblogic returns failures either as {errors:[...]} or {Message:"..."}.
+    function apiError(j, raw) {
+        if (j && Array.isArray(j.errors) && j.errors.length) return j.errors.join('; ');
+        if (j && (j.Message || j.message)) return j.Message || j.message;
+        return String(raw || '').slice(0, 160);
     }
 
     // Balanced-bracket JSON extractor.
@@ -343,40 +350,67 @@
         const txt = await r.text().catch(() => '');
         if (!r.ok) throw new Error('SaveLine HTTP ' + r.status + ': ' + txt.slice(0, 160));
         let j = null; try { j = JSON.parse(txt); } catch (e) { /* html response is fine */ }
-        if (j && j.success === false) throw new Error('SaveLine success=false: ' + (j.Message || j.message || txt.slice(0, 140)));
+        if (j && j.success === false) throw new Error('SaveLine refused: ' + apiError(j, txt));
     }
 
-    // PPM invoice line: /api/PPMInvoice/EditLine wants multipart FormData.
+    // PPM invoice line. Which endpoint depends on whether the invoice has been
+    // GENERATED (i.e. approved / numbered): a draft goes to /api/PPMInvoice/EditLine,
+    // but a generated one only accepts a nominal-code change and must go to
+    // /api/PPMInvoice/EditNominalCode — EditLine answers
+    // "PPM Invoice has been generated, it may no longer be updated".
+    // That is exactly the branch the modal's own submit handler makes off the
+    // `var invoiceGenerated` flag, and the generated modal only renders
+    // Id / PPMContractId / NominalCodeId / Quantity / InvoiceId.
     async function setPpmLineNominal(lineId, code) {
         const html = await (await fetchWithRetry('/PPMInvoice/EditLineModal?id=' + encodeURIComponent(lineId), { headers: { 'X-Requested-With': 'XMLHttpRequest' } })).text();
         const token = (html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/) || [])[1] || getToken();
-        const M = extractEnclosing(html, 'Model:', '{');
-        if (!M) throw new Error('could not read the PPM line model');
+        const M = extractEnclosing(html, 'Model:', '{') || {};
+        const generated = /var\s+invoiceGenerated\s*=\s*"?True/i.test(html) || M.InvoiceHasBeenGenerated === true;
+
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const form = doc.querySelector('#updateInvoiceLineForm') || doc;
 
         const fd = new FormData();
-        fd.append('Id', M.Id);
-        fd.append('PPMContractId', M.PPMContractId == null ? '' : M.PPMContractId);
-        fd.append('Description', M.Description == null ? '' : M.Description);
-        fd.append('Value', M.Value == null ? '' : String(M.Value));
-        fd.append('Discount_Amount', M.Discount_Amount == null ? '' : M.Discount_Amount);
-        fd.append('Discount_Percentage', M.Discount_Percentage == null ? '' : M.Discount_Percentage);
-        fd.append('TaxCodeId_input', M.TaxCodeDescription == null ? '' : M.TaxCodeDescription);
-        fd.append('TaxCodeId', M.TaxCodeId == null ? '' : M.TaxCodeId);
-        fd.append('NominalCodeId_input', code.Description);
-        fd.append('NominalCodeId', code.Id);
-        if (Array.isArray(M.TagIds)) M.TagIds.forEach(t => fd.append('TagIds', t));
-        else if (M.TagIds != null && M.TagIds !== '') fd.append('TagIds', M.TagIds);
-        fd.append('InvoiceId', M.InvoiceId);
+        const count = {};
+        const push = (n, v) => { fd.append(n, v == null ? '' : String(v)); count[n] = (count[n] || 0) + 1; };
 
-        const r = await fetchWithRetry('/api/PPMInvoice/EditLine', {
+        form.querySelectorAll('input[name], select[name], textarea[name]').forEach(el => {
+            const n = el.name;
+            if (n === '__RequestVerificationToken') return;
+            if (el.tagName === 'SELECT') {
+                count[n] = count[n] || 0;
+                [...el.options].filter(o => o.selected).forEach(o => push(n, o.value));
+                return;
+            }
+            if (el.type === 'checkbox' || el.type === 'radio') {
+                count[n] = count[n] || 0;
+                if (el.checked) push(n, el.value || 'true');
+                return;
+            }
+            push(n, n === 'NominalCodeId' ? code.Id : (el.value || ''));
+        });
+
+        if (!count.Id && M.Id) push('Id', M.Id);
+        if (!count.InvoiceId && M.InvoiceId) push('InvoiceId', M.InvoiceId);
+        if (!count.PPMContractId && M.PPMContractId) push('PPMContractId', M.PPMContractId);
+        if (!count.NominalCodeId) push('NominalCodeId', code.Id);
+        push('NominalCodeId_input', code.Description);
+        if (count.TaxCodeId) push('TaxCodeId_input', M.TaxCodeDescription || '');
+        // Description is a Vue <ai-text-area>, so it is not in the raw HTML. Only the
+        // draft form carries it — the generated one has no description control at all.
+        if (!count.Description && !generated) push('Description', M.Description == null ? '' : M.Description);
+        if (!count.TagIds && Array.isArray(M.TagIds)) M.TagIds.forEach(t => push('TagIds', t));
+
+        const action = generated ? 'EditNominalCode' : 'EditLine';
+        const r = await fetchWithRetry('/api/PPMInvoice/' + action, {
             method: 'POST',
             headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json, text/javascript, */*; q=0.01', '__RequestVerificationToken': token },
             body: fd,
         });
         const txt = await r.text().catch(() => '');
-        if (!r.ok) throw new Error('EditLine HTTP ' + r.status + ': ' + txt.slice(0, 160));
+        if (!r.ok) throw new Error(action + ' HTTP ' + r.status + ': ' + txt.slice(0, 160));
         let j = null; try { j = JSON.parse(txt); } catch (e) { /* ignore */ }
-        if (j && j.success === false) throw new Error('EditLine success=false: ' + (j.Message || j.message || txt.slice(0, 140)));
+        if (j && j.success === false) throw new Error(action + ' refused: ' + apiError(j, txt));
     }
 
     const setLineNominal = (row, line, code) =>
@@ -545,7 +579,7 @@
         busy(true);
         updateScope();
 
-        const stats = { invoices: 0, withLines: 0, todo: 0, already: 0, filtered: 0, quoted: 0, credits: 0, errors: 0 };
+        const stats = { invoices: 0, withLines: 0, todo: 0, already: 0, filtered: 0, quoted: 0, credits: 0, frozen: 0, errors: 0 };
         try {
             log('Reading the invoice list (' + tabLabel() + ')…', '#0af');
             const { rows, total } = await collectInvoices();
@@ -560,6 +594,7 @@
                 setProgress(`Reading lines ${i + 1}/${rows.length}…`);
 
                 if (row.IsCredit) { stats.credits++; continue; }
+                if (row.IsFrozen) { stats.frozen++; log(`  ${invLabel(row)} — frozen, skipped`, '#fa0'); continue; }
                 if (row.Type !== 0 && row.Type !== 1) {
                     log(`  ${invLabel(row)} — unsupported invoice type "${row.TypeDescription}", skipped`, '#fa0');
                     continue;
@@ -603,6 +638,7 @@
             if (stats.filtered) log(`Skipped by "only lines currently" filter: ${stats.filtered}`, '#888');
             if (stats.quoted) log(`Skipped quoted-value lines (not editable): ${stats.quoted}`, '#fa0');
             if (stats.credits) log(`Skipped credit notes: ${stats.credits}`, '#fa0');
+            if (stats.frozen) log(`Skipped frozen invoices: ${stats.frozen}`, '#fa0');
             if (stats.errors) log(`Errors reading lines:      ${stats.errors}`, '#f55');
             setProgress(stats.todo ? `${stats.todo} line(s) across ${planned.length} invoice(s) ready. Apply when happy.` : 'Nothing to change.');
         } catch (e) {
