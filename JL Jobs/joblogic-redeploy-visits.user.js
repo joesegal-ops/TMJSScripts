@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Redeploy Visits (from filtered list)
 // @namespace    https://go.joblogic.com/
-// @version      2.00
+// @version      2.01
 // @description  Scan the filtered Jobs list and redeploy each job's existing visits back to the same engineer via Joblogic's own RedeployVisit endpoint, so the jobs re-appear in their app. Never creates a new visit. Collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -122,7 +122,7 @@
     const STATE_KEY     = 'jl-redeploy-state-v1';
     const LOG_KEY       = 'jl-redeploy-loglines-v1';
     const LOG_MAX_LINES = 400;
-    const SCRIPT_VERSION = '2.00';   // keep in step with @version in the header
+    const SCRIPT_VERSION = '2.01';   // keep in step with @version in the header
     const VISIT_GAP_MS  = 250;   // pause between redeploy calls
     const JOB_GAP_MS    = 150;   // pause between jobs
 
