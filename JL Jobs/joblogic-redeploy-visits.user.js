@@ -122,6 +122,7 @@
     const STATE_KEY     = 'jl-redeploy-state-v1';
     const LOG_KEY       = 'jl-redeploy-loglines-v1';
     const LOG_MAX_LINES = 400;
+    const SCRIPT_VERSION = '2.00';   // keep in step with @version in the header
     const VISIT_GAP_MS  = 250;   // pause between redeploy calls
     const JOB_GAP_MS    = 150;   // pause between jobs
 
@@ -392,6 +393,7 @@
   padding:10px 14px; border-bottom:1px solid #333; cursor:move; user-select:none;
 }
 #jl-redeploy-panel header b { font-size:13px; }
+#jl-redeploy-panel header .ver { color:#6b7280; font-weight:400; font-size:11px; margin-left:4px; }
 #jl-redeploy-panel .body { padding:10px 14px; display:flex; flex-direction:column; gap:8px; overflow-y:auto; }
 #jl-redeploy-panel .progress { color:#0fa; font-weight:600; min-height:1.4em; }
 #jl-redeploy-panel .controls { display:flex; gap:6px; flex-wrap:wrap; }
@@ -415,7 +417,7 @@
 #jl-redeploy-panel .log div { padding:1px 0; line-height:1.35; }
 </style>
 <header>
-  <b>Redeploy Visits</b>
+  <b>Redeploy Visits <span class="ver">v${SCRIPT_VERSION}</span></b>
   <button class="btn-close">×</button>
 </header>
 <div class="body">
@@ -710,7 +712,6 @@
     // =========================================================================
     // BOOT
     // =========================================================================
-    const SCRIPT_VERSION = '2.00';
 
     function boot() {
         buildPanel();
