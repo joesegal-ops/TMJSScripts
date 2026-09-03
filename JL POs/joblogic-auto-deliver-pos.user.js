@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.12
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
+// @version      1.13
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -102,12 +102,14 @@
     }
     // ===== end shared dock =====
 
+    // Read from the metadata block so the on-screen version can never drift from @version.
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.13');
     const SCRIPT_ID = 'auto-deliver-pos';
     const SCRIPT_LABEL = '📦 Auto Deliver POs';
     const SCRIPT_COLOR = '#4c9f01';
     const SCRIPT_DESC = 'Reviews open and undelivered POs, checks whether the linked job is closed or completed, and marks those POs as delivered. Open the PO list, then Start.';
 
-    console.log('[JL-AutoDeliver] Script loaded');
+    console.log('[JL-AutoDeliver v' + SCRIPT_VERSION + '] Script loaded');
 
     // --- CONFIG ---
     // go.joblogic.com sits behind an Azure Application Gateway WAF that rate-limits
@@ -150,7 +152,7 @@
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;';
         const title = document.createElement('strong');
         title.style.fontSize = '14px';
-        title.textContent = 'Auto-Deliver POs for Closed Jobs';
+        title.textContent = 'Auto-Deliver POs for Closed Jobs' + (SCRIPT_VERSION ? '  (v' + SCRIPT_VERSION + ')' : '');
         const closeBtn = document.createElement('button');
         closeBtn.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
         closeBtn.textContent = 'X';
@@ -493,6 +495,7 @@
         wafBlocks = 0;
         cacheSaves = 0;
 
+        log('Auto-Deliver POs v' + SCRIPT_VERSION, '#888');
         log(dryRun ? 'DRY RUN MODE - No changes will be made' : 'LIVE MODE - POs will be marked as delivered!', dryRun ? '#ff0' : '#f55');
         log('Closed statuses: ' + CLOSED_STATUSES.join(', '), '#888');
         log('Request pacing: 1 per ' + MIN_REQUEST_INTERVAL + 'ms (~' + Math.round(60000 / MIN_REQUEST_INTERVAL) + '/min) to stay under the gateway rate limit', '#888');
