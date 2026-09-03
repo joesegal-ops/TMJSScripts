@@ -234,7 +234,9 @@
         const rawLines = text.split(/\r?\n|\r/).map(l => l.replace(/\s+$/, '')).filter(l => l.trim());
         if (!rawLines.length) return { jobs: [], error: 'Empty input' };
 
-        const delim = rawLines[0].includes('\t') ? '\t' : ',';
+        // Detect the delimiter from the raw paste, not from rawLines[0] — a first
+        // row with an empty second cell loses its trailing tab above.
+        const delim = /\t/.test(text) ? '\t' : ',';
 
         function tokenise(line) {
             if (delim === '\t') return line.split('\t').map(f => f.trim());
