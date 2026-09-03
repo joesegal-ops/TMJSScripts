@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.11
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.1: collapses to a launcher button in the shared dock (drag to reorder).
+// @version      1.12
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -110,13 +110,32 @@
     console.log('[JL-AutoDeliver] Script loaded');
 
     // --- CONFIG ---
-    const DELAY_BETWEEN_POS = 600;
+    // go.joblogic.com sits behind an Azure Application Gateway WAF that rate-limits
+    // per client IP on a sliding ~1-minute window. Exceeding it returns an HTML
+    // "403 Forbidden" page from the gateway (server: Microsoft-Azure-Application-Gateway/v2)
+    // rather than anything from Joblogic itself. The old 600ms spacing was ~100 req/min,
+    // which sat right on the threshold - any other open JL tab tipped it over and roughly
+    // half of all job lookups came back 403 for the rest of the window.
+    // 1400ms (~43 req/min) leaves headroom for the rest of the browser session.
+    const MIN_REQUEST_INTERVAL = 1400;
     const DELAY_BETWEEN_PAGES = 800;
     const CLOSED_STATUSES = ['completed', 'closed', 'invoiced'];
+    // How long to stand down when the WAF does block us, per attempt. Measured
+    // behaviour: it is a token bucket, not a lockout - a request retried immediately
+    // after five straight 403s already succeeded, and 15/15 at 1400ms spacing came
+    // back clean right after tripping it. So retry soon and escalate gently.
+    const WAF_BACKOFF_MS = [1500, 3000, 6000, 12000, 20000];
 
     // --- STATE ---
     let panel, logArea, startBtn, stopBtn, progressText;
     let running = false;
+    // Job number -> job status object (or null when not found). The PO list routinely
+    // repeats job numbers across POs, so this removes ~15% of the lookups outright.
+    let jobStatusCache = new Map();
+    // Count of gateway rate-limit blocks we absorbed, for the run summary.
+    let wafBlocks = 0;
+    // Count of job lookups served from jobStatusCache instead of the network.
+    let cacheSaves = 0;
 
     // --- UI ---
     function createUI() {
@@ -330,10 +349,73 @@
         });
     }
 
+    // --- REQUEST THROTTLE + WAF RETRY ---
+
+    var lastRequestAt = 0;
+    // Starts at MIN_REQUEST_INTERVAL and self-corrects upward if we still get
+    // blocked (e.g. lots of other JL tabs sharing the same IP budget).
+    var currentInterval = MIN_REQUEST_INTERVAL;
+
+    // Space every outbound request by at least currentInterval.
+    async function throttle() {
+        var wait = currentInterval - (Date.now() - lastRequestAt);
+        if (wait > 0) await sleep(wait);
+        lastRequestAt = Date.now();
+    }
+
+    // A gateway block is an HTML 403/429 from Azure App Gateway - retryable.
+    // A 403 from Joblogic itself (JSON, no gateway header) is a real permission
+    // error and must NOT be retried.
+    function isWafBlock(resp, bodyText) {
+        if (resp.status !== 403 && resp.status !== 429 && resp.status !== 503) return false;
+        var server = resp.headers.get('server') || '';
+        if (/Application-Gateway/i.test(server)) return true;
+        var ct = resp.headers.get('content-type') || '';
+        return /text\/html/i.test(ct) || /403 Forbidden/i.test(bodyText || '');
+    }
+
+    // fetch + throttle + back off and retry when the WAF blocks us.
+    // Returns the response body as text on success.
+    async function jlFetch(url, opts, label) {
+        for (var attempt = 0; ; attempt++) {
+            if (!running) throw new Error('stopped');
+            await throttle();
+
+            var resp = await fetch(url, opts);
+            if (resp.ok) return await resp.text();
+
+            var bodyText = await resp.text().catch(function () { return ''; });
+
+            if (isWafBlock(resp, bodyText)) {
+                if (attempt >= WAF_BACKOFF_MS.length) {
+                    throw new Error('rate limited by gateway after ' + (attempt + 1) + ' attempts');
+                }
+                var pause = WAF_BACKOFF_MS[attempt];
+                // Ease off for the remainder of the run so we stop hitting the ceiling.
+                if (currentInterval < 4000) currentInterval += 200;
+                wafBlocks++;
+                log('  Rate limited by gateway - retrying ' + label + ' in ' + (pause / 1000) + 's (pacing now ' + currentInterval + 'ms)', '#fa0');
+                setProgress('Rate limited - retrying in ' + (pause / 1000) + 's...');
+                // Sleep in slices so Stop stays responsive.
+                for (var slept = 0; slept < pause && running; slept += 500) await sleep(500);
+                continue;
+            }
+
+            throw new Error(label + ' HTTP ' + resp.status);
+        }
+    }
+
     // Look up job status by job number
     async function getJobStatus(jobNumber) {
+        if (jobStatusCache.has(jobNumber)) { cacheSaves++; return jobStatusCache.get(jobNumber); }
+        var job = await fetchJobStatus(jobNumber);
+        jobStatusCache.set(jobNumber, job);
+        return job;
+    }
+
+    async function fetchJobStatus(jobNumber) {
         var token = getCSRFToken();
-        var resp = await fetch('/api/Job/SearchJsonData', {
+        var text = await jlFetch('/api/Job/SearchJsonData', {
             method: 'POST',
             credentials: 'same-origin',
             headers: {
@@ -353,10 +435,9 @@
                 StartCompleteDate: '', EndCompleteDate: '',
                 StartNextContactDate: '', EndNextContactDate: ''
             })
-        });
+        }, 'Job search');
 
-        if (!resp.ok) throw new Error('Job search HTTP ' + resp.status);
-        var data = await resp.json();
+        var data = JSON.parse(text);
         var jobs = (data.AdditionalData && data.AdditionalData.Jobs) || data.Data || [];
         var match = jobs.find(function (j) { return j.JobNumber === jobNumber; }) || jobs[0];
         if (!match) return null;
@@ -378,7 +459,7 @@
         fd.append('ChangeJobStatus', 'false');
         fd.append('PassDiscount', 'false');
 
-        var resp = await fetch('/PurchaseOrder/SaveDeliveryDate', {
+        var text = await jlFetch('/PurchaseOrder/SaveDeliveryDate', {
             method: 'POST',
             credentials: 'same-origin',
             headers: {
@@ -386,10 +467,9 @@
                 '__RequestVerificationToken': token
             },
             body: fd
-        });
+        }, 'SaveDeliveryDate');
 
-        if (!resp.ok) throw new Error('HTTP ' + resp.status + ': ' + resp.statusText);
-        var result = await resp.json().catch(function () { return {}; });
+        var result = (function () { try { return JSON.parse(text); } catch (e) { return {}; } })();
         if (result.success === false) {
             throw new Error(result.Message || result.errors?.join(', ') || 'API returned failure');
         }
@@ -407,9 +487,15 @@
 
         var dryRun = document.getElementById('jl-autodeliver-dryrun').checked;
         var skipPartial = document.getElementById('jl-autodeliver-skip-partial').checked;
+        jobStatusCache = new Map();
+        lastRequestAt = 0;
+        currentInterval = MIN_REQUEST_INTERVAL;
+        wafBlocks = 0;
+        cacheSaves = 0;
 
         log(dryRun ? 'DRY RUN MODE - No changes will be made' : 'LIVE MODE - POs will be marked as delivered!', dryRun ? '#ff0' : '#f55');
         log('Closed statuses: ' + CLOSED_STATUSES.join(', '), '#888');
+        log('Request pacing: 1 per ' + MIN_REQUEST_INTERVAL + 'ms (~' + Math.round(60000 / MIN_REQUEST_INTERVAL) + '/min) to stay under the gateway rate limit', '#888');
         log('Skip partially delivered: ' + skipPartial, '#888');
 
         var token = getCSRFToken();
@@ -491,11 +577,12 @@
                     }
 
                 } catch (e) {
+                    if (e.message === 'stopped') break;
                     log('PO -> ' + po.jobNo + ' - ERROR: ' + e.message, '#f55');
                     errors++;
                 }
 
-                await sleep(DELAY_BETWEEN_POS);
+                // No extra sleep here - jlFetch's throttle already paces every request.
             }
 
             // Summary
@@ -506,6 +593,8 @@
             log('POs skipped (job still open): ' + skippedJobOpen, '#888');
             log('POs skipped (no job/not found): ' + skippedNoJob, '#888');
             log('Errors: ' + errors, errors > 0 ? '#f55' : '#0fa');
+            log('Job lookups saved by cache: ' + cacheSaves, '#888');
+            log('Gateway rate-limit blocks absorbed by retry: ' + wafBlocks + (wafBlocks ? ' (final pacing ' + currentInterval + 'ms)' : ''), wafBlocks ? '#fa0' : '#0fa');
             if (dryRun) log('(Dry run - no actual changes were made)', '#ff0');
             setProgress('Complete!');
 
