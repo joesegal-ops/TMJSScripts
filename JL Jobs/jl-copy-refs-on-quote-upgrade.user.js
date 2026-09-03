@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Copy Refs on Quote Upgrade
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  When a quote raised against a parent job is upgraded to a job, copy the parent job's Reference Number (CustomReference) and Job Ref 1 (JobUserReferenceFieldValue) onto the newly created child job. Runs silently on /Job/Detail/* and /Quote/Detail/* views, only fills fields that are empty, and never writes twice for the same pair.
+// @version      1.1
+// @description  When a quote raised against a parent job is upgraded to a job, copy the parent job's Reference Number (CustomReference) and Job Ref 1 (JobUserReferenceFieldValue) onto the newly created child job. Runs silently on /Job/Detail/* and /Quote/Detail/* views, only fills fields that are empty, and never writes twice for the same pair. Shows a temporary note of what it wrote - click it to reload the page.
 // @match        https://go.joblogic.com/Job/Detail/*
 // @match        https://go.joblogic.com/Quote/Detail/*
 // @grant        none
@@ -65,7 +65,8 @@
     // =======================================================================
     // toast
     // =======================================================================
-    function toast(text, kind) {
+    // reloadOnClick: clicking the note refreshes the page so the new values show.
+    function toast(text, kind, reloadOnClick) {
         const bg = kind === 'error' ? '#7d2b1f' : (kind === 'info' ? '#0e3a4f' : '#1f5c3a');
         const el = document.createElement('div');
         el.style.cssText = 'position:fixed;bottom:18px;right:18px;z-index:100001;max-width:360px;' +
@@ -73,8 +74,11 @@
             'line-height:1.5;padding:10px 12px;border-radius:4px;border-left:3px solid #ff7919;' +
             'box-shadow:0 2px 8px rgba(0,0,0,.35);cursor:pointer;white-space:pre-line;';
         el.textContent = text;
-        el.title = 'click to dismiss';
-        el.addEventListener('click', () => el.remove());
+        el.title = reloadOnClick ? 'click to reload the page' : 'click to dismiss';
+        el.addEventListener('click', () => {
+            if (reloadOnClick) { el.style.opacity = '0.6'; location.reload(); return; }
+            el.remove();
+        });
         document.body.appendChild(el);
         setTimeout(() => el.remove(), kind === 'error' ? 20000 : 12000);
         return el;
@@ -352,8 +356,8 @@
 
         let msg = `Copied from parent ${parentNumber} → ${upgradedNumber}\n` + applied.join('\n');
         if (skipped.length) msg += '\nSkipped (already set):\n' + skipped.join('\n');
-        msg += '\n\nReload the page to see the new values.';
-        toast(msg, 'ok');
+        msg += '\n\nClick this note to reload and see the new values.';
+        toast(msg, 'ok', true);
         log('done', { parentNumber, upgradedNumber, quoteNumber, applied, skipped });
     }
 
