@@ -95,20 +95,30 @@ WHERE Customer = "Neko Health UK Limited";
 -- One row per UPGRADED quote: quote approval -> completion of the job it became.
 --
 -- !! THE QUOTE -> UPGRADED-JOB LINK IS INFERRED, NOT INGESTED. !!
--- Joblogic's OAuth API exposes no job<->quote link in either direction (verified 2026-07-22:
--- Job/getall, Job/getbyid and Quote/getbyid all lack it; raw.jobs has only a HasParent bool).
--- The true link (UpgradedIntoJobNumber) exists ONLY in the cookie-authed web /Quote/Detail/{id},
--- which the VM cannot reach. So this view RECONSTRUCTS it from three observed regularities:
---   1. JL copies the quote's Description verbatim onto the upgraded job  (strongest signal)
---   2. the upgraded job carries the quote's OrderNumber
---   3. the upgraded job is logged within minutes of ApprovedDatetime, at the same site,
---      with HasParent = true
--- Candidates are ranked and the best one wins; link_confidence says which signal fired.
--- Validation: where signals 1 and 2 both resolve independently they agree on 98.9% of 1,218
--- quotes. Coverage 2,823 of 2,831 upgraded quotes (99.7%), 70% at "A - description (high)".
--- FILTER ON link_confidence FOR ANYTHING THAT MATTERS -- "D - time only" is a guess.
+-- Joblogic's OAuth API exposes no job<->quote link in either direction. Checked every field path
+-- in raw.jobs including nested ones: the only quote-ish fields are QuotedValue (a number) and
+-- HasParent (a bool) -- there is no quote id. The true link (UpgradedIntoJobNumber) exists ONLY
+-- in the cookie-authed web /Quote/Detail/{id}, which the VM cannot reach.
 --
--- Other caveats when reading this view (2,823 rows at build time):
+-- So this view reconstructs the link from FOUR independent regularities:
+--   desc_match   JL copies the quote's Description verbatim onto the upgraded job
+--   value_match  jobs.QuotedValue == quotes.QuoteValueExcludingVat, to the penny
+--   order_match  the upgraded job carries the quote's OrderNumber
+--   (timing)     the upgraded job is logged within minutes of ApprovedDatetime, same site,
+--                HasParent = true  -- median gap is ZERO hours
+--
+-- link_confidence counts how many of the three non-timing signals agree, which is a far better
+-- guide than which single one fired:
+--   high    2+ signals agree (2,619 rows, 92.8%) -- coincidence is implausible (an exact money
+--                                match AND either the verbatim description or the order number)
+--   medium  exactly 1 signal + tight timing (201 rows, 7.1%)
+--   low     timing only, nothing corroborates (3 rows) -- treat as a guess
+--
+-- Validation: description and order-number signals, resolved independently, agree on 98.9% of
+-- 1,218 quotes; value_match corroborates 98.5-99.7% of rows in EVERY tier; and the known worked
+-- example (UP01820 -> PROJ0000885) resolves correctly. Coverage 2,823 of 2,831 upgraded quotes.
+--
+-- Other caveats when reading this view:
 --   * 545 rows are jobs still open -- days_approval_to_completion is NULL for them, use
 --     days_open_so_far. Always filter on is_complete before averaging a duration.
 --   * 19 rows have a NEGATIVE duration (job completed before the quote was formally approved --
@@ -135,8 +145,10 @@ cand AS (
          j.DateComplete AS job_completed, j.JobStatusDescription AS job_status,
          j.TypeDescription AS job_type_on_job, j.CategoryDescription AS job_category_on_job,
          j.JobOwner AS job_owner, j.QuotedValue AS job_quoted_value,
-         (TO_HEX(MD5(TRIM(j.Description))) = u.dhash) AS desc_match,
-         (UPPER(TRIM(j.OrderNumber)) = u.onum)        AS order_match,
+         IFNULL(TO_HEX(MD5(TRIM(j.Description))) = u.dhash, FALSE) AS desc_match,
+         IFNULL(UPPER(TRIM(j.OrderNumber)) = u.onum, FALSE)        AS order_match,
+         IFNULL(u.QuoteValueExcludingVat IS NOT NULL AND j.QuotedValue IS NOT NULL
+                AND ABS(j.QuotedValue - u.QuoteValueExcludingVat) < 0.01, FALSE) AS value_match,
          ABS(TIMESTAMP_DIFF(j.DateLogged, u.approved_at, MINUTE)) AS mins_from_approval
   FROM upg u
   JOIN `vmimporteddata.raw.jobs` j
@@ -148,8 +160,8 @@ cand AS (
 ranked AS (
   SELECT *,
     ROW_NUMBER() OVER (PARTITION BY quote_id
-      ORDER BY desc_match DESC, order_match DESC, mins_from_approval ASC, job_id ASC) AS rn,
-    COUNTIF(desc_match) OVER (PARTITION BY quote_id) AS n_desc_matches
+      ORDER BY desc_match DESC, value_match DESC, order_match DESC,
+               mins_from_approval ASC, job_id ASC) AS rn
   FROM cand
 )
 SELECT
@@ -170,11 +182,16 @@ SELECT
   -- how long an unfinished job has been running, for ageing/WIP views
   CASE WHEN r.job_completed IS NULL
        THEN TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), r.approved_at, DAY) END AS days_open_so_far,
-  CASE WHEN r.desc_match AND r.n_desc_matches = 1 THEN "A - description (high)"
-       WHEN r.desc_match                          THEN "B - description, tied (medium)"
-       WHEN r.order_match                         THEN "C - order no + time (medium)"
-       ELSE                                            "D - time only (low)" END AS link_confidence,
-  r.mins_from_approval AS link_mins_from_approval,
+  -- link quality: how many INDEPENDENT signals agree on this job
+  CAST(r.desc_match AS INT64) + CAST(r.value_match AS INT64) + CAST(r.order_match AS INT64)
+    AS link_signals,
+  CASE WHEN CAST(r.desc_match AS INT64)+CAST(r.value_match AS INT64)+CAST(r.order_match AS INT64) >= 2
+         THEN "high"
+       WHEN CAST(r.desc_match AS INT64)+CAST(r.value_match AS INT64)+CAST(r.order_match AS INT64) = 1
+         THEN "medium"
+       ELSE "low" END AS link_confidence,
+  r.desc_match AS link_desc_match, r.value_match AS link_value_match,
+  r.order_match AS link_order_match, r.mins_from_approval AS link_mins_from_approval,
   CONCAT("https://go.joblogic.com/Quote/Detail/", CAST(r.quote_id AS STRING)) AS quote_url,
   CONCAT("https://go.joblogic.com/Job/Detail/",   CAST(r.job_id   AS STRING)) AS job_url
 FROM ranked r
