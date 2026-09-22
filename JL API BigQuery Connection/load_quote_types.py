@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 
 import requests
@@ -49,7 +50,17 @@ MODE = env("JL_QT_MODE", "incr").strip().lower()
 RATE_MIN_INTERVAL = float(env("JL_MIN_INTERVAL", "0.65"))  # ~92 req/min, under the 100 cap
 HTTP_TIMEOUT = int(env("JL_HTTP_TIMEOUT", "60"))
 MAX_RETRIES = int(env("JL_MAX_RETRIES", "5"))
-OUT = env("JL_QT_OUT", "/tmp/quote_types.jsonl")
+# NOT a fixed /tmp path. The VM runs fs.protected_regular=2, which blocks re-opening a file in
+# sticky /tmp owned by another user -- including as root. A manual run leaves the file owned by the
+# operator, and every later cron run then dies with EACCES (silently, for a week, in Jul 2026).
+# Default to a private per-run temp file; JL_QT_OUT still overrides for debugging.
+def _default_out():
+    fd, path = tempfile.mkstemp(prefix="quote_types_", suffix=".jsonl")
+    os.close(fd)
+    return path
+
+
+OUT = env("JL_QT_OUT") or _default_out()
 
 _last = [0.0]
 
@@ -163,6 +174,11 @@ def main():
     with open(OUT, "rb") as f:
         client.load_table_from_file(f, TABLE, job_config=job_cfg).result()
     log.info("loaded %s: %s rows (%s)", TABLE, n, MODE)
+    if not os.environ.get("JL_QT_OUT"):
+        try:
+            os.unlink(OUT)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

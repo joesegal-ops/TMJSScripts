@@ -1,35 +1,56 @@
 CRON_TZ=Europe/London
 SHELL=/bin/bash
+# Failure mail: jl-run.sh keeps the full transcript in loader.log and re-emits a tail on
+# stderr when a job exits non-zero, so cron mails ONLY on failure. Requires an MTA on the VM.
+MAILTO=joe.segal@up-fm.com
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 # --- Joblogic -> BigQuery scheduled loads ---
 # Jobs: incremental upsert every 15 min (business hours, Mon-Fri), 3-day window; flock prevents overlap.
 # + full refresh nightly (correctness net for changes/future-scheduled visits the window misses)
-*/15 7-19 * * 1-5 root flock -n /tmp/jl_jobs.lock env JL_INCREMENTAL_DAYS=3 /opt/jl-loader/run_incremental.sh jobs >> /opt/jl-loader/loader.log 2>&1
-0 2 * * *         root /opt/jl-loader/run_tier.sh "Job/getall:jobs" >> /opt/jl-loader/loader.log 2>&1
-# Job costs (per-job cost/sell) -> raw.job_costs: daily incr 02:30, after the nightly jobs full.
-30 2 * * *        root /opt/jl-loader/run_job_costs.sh incr >> /opt/jl-loader/loader.log 2>&1
+*/15 7-19 * * 1-5 root flock -n /tmp/jl_jobs.lock /opt/jl-loader/jl-run.sh incremental-jobs env JL_INCREMENTAL_DAYS=3 /opt/jl-loader/run_incremental.sh jobs
+0 2 * * *         root /opt/jl-loader/jl-run.sh tier-job /opt/jl-loader/run_tier.sh "Job/getall:jobs"
 # Transactional: incremental upsert every 3h (quotes, invoices, forms); purchase orders full (cheap)
-20 */3 * * * root /opt/jl-loader/run_incremental.sh quotes        >> /opt/jl-loader/loader.log 2>&1
-25 */3 * * * root /opt/jl-loader/run_incremental.sh invoices      >> /opt/jl-loader/loader.log 2>&1
-30 */3 * * * root /opt/jl-loader/run_incremental.sh forms_logbook >> /opt/jl-loader/loader.log 2>&1
-35 */3 * * * root /opt/jl-loader/run_tier.sh "purchaseorder/getall:purchase_orders,SubcontractorPurchaseOrder/GetAll:subcontractor_purchase_orders" >> /opt/jl-loader/loader.log 2>&1
+20 */3 * * * root /opt/jl-loader/jl-run.sh incremental-quotes /opt/jl-loader/run_incremental.sh quotes
+25 */3 * * * root /opt/jl-loader/jl-run.sh incremental-invoices /opt/jl-loader/run_incremental.sh invoices
+30 */3 * * * root /opt/jl-loader/jl-run.sh incremental-forms_logbook /opt/jl-loader/run_incremental.sh forms_logbook
+35 */3 * * * root /opt/jl-loader/jl-run.sh tier-purchaseorder /opt/jl-loader/run_tier.sh "purchaseorder/getall:purchase_orders,SubcontractorPurchaseOrder/GetAll:subcontractor_purchase_orders"
 # Quote -> Monday: fill blank Quote cells + refresh mismatch report (fill-blanks-only; never overwrites). After the quote refresh.
-45 */3 * * * root MONDAY_REPORT_PATH=/opt/jl-loader/monday_quote_report.csv /opt/jl-loader/run_sync_monday.sh apply >> /opt/jl-loader/loader.log 2>&1
+45 */3 * * * root MONDAY_REPORT_PATH=/opt/jl-loader/monday_quote_report.csv /opt/jl-loader/jl-run.sh sync_monday-apply /opt/jl-loader/run_sync_monday.sh apply
+# JL job status -> Monday (change-triggered, last-write-wins). ~5 min after each jobs upsert + nightly catch.
 # --- STATUS SYNC DISABLED 2026-07-28: JL 'Completed' original jobs wrongly completed Monday items.
 # Re-enable only after sync_status.py is reworked to complete solely off the UPGRADED job. ---
-# JL job status -> Monday (change-triggered, last-write-wins). ~5 min after each jobs upsert + nightly catch.
 #5-59/15 7-19 * * 1-5 root /opt/jl-loader/run_sync_status.sh apply >> /opt/jl-loader/loader.log 2>&1
 #10 2 * * *           root /opt/jl-loader/run_sync_status.sh apply >> /opt/jl-loader/loader.log 2>&1
 # Monday -> JL status + Approved guard (VM poller; JL writeback needs the whitelisted IP). Offset 5 min from the JL->Monday run.
 #10-59/15 7-19 * * 1-5 root /opt/jl-loader/run_sync_monday_to_jl.sh apply >> /opt/jl-loader/loader.log 2>&1
 #15 2 * * *            root /opt/jl-loader/run_sync_monday_to_jl.sh apply >> /opt/jl-loader/loader.log 2>&1
 # Nightly full nets for cheap transactional tables (catch edits the date windows miss)
-40 2 * * * root /opt/jl-loader/run_tier.sh "Quote/GetAll:quotes,FormsLogbook/getall:forms_logbook" >> /opt/jl-loader/loader.log 2>&1
+40 2 * * * root /opt/jl-loader/jl-run.sh tier-quote /opt/jl-loader/run_tier.sh "Quote/GetAll:quotes,FormsLogbook/getall:forms_logbook"
 # Weekly invoices full backfill (chunked monthly to avoid the 403 quota) - Sunday 01:00
-0 1 * * 0 root /opt/jl-loader/run_incremental.sh invoices backfill >> /opt/jl-loader/loader.log 2>&1
+0 1 * * 0 root /opt/jl-loader/jl-run.sh incremental-invoices-backfill /opt/jl-loader/run_incremental.sh invoices backfill
+# Quote job type/category -> raw.quote_types (Quote/GetById; the LIST endpoint returns these null).
+# RESTORED 2026-09-22: added 2026-07-20, crashed every night on a /tmp collision, then lost entirely
+# when this file was redeployed 2026-07-28 -- job_type was null for 721 quotes (18.6%) for 2 months.
+# This file is the deploy source and the repo copy mirrors it: do not drop these when editing.
+# Sunday full sits at 07:00, clear of the 05:00-06:00 SE tier block below.
+55 2 * * *   root flock -n /tmp/jl_quote_types.lock /opt/jl-loader/jl-run.sh quote_types-incr /opt/jl-loader/run_quote_types.sh incr
+0 7 * * 0    root flock -n /tmp/jl_quote_types.lock /opt/jl-loader/jl-run.sh quote_types-full /opt/jl-loader/run_quote_types.sh full
+# Quote status CDC -> raw.quote_status_events (feeds date_rejected; no API field for it) - daily 03:10
+10 3 * * *   root /opt/jl-loader/jl-run.sh quote_cdc /opt/jl-loader/run_quote_cdc.sh
 # Reference/dimension data - daily 03:00
-0 3 * * * root /opt/jl-loader/run_tier.sh "Customer/GetAll:customers,Site/GetAll:sites,Staff/GetAll:staff,Supplier/GetAll:suppliers,Subcontractor/GetAll:subcontractors,Asset/GetAll:assets,Part/GetAll:parts,Expense/GetAll:expenses" >> /opt/jl-loader/loader.log 2>&1
+0 3 * * * root /opt/jl-loader/jl-run.sh tier-customer /opt/jl-loader/run_tier.sh "Customer/GetAll:customers,Site/GetAll:sites,Staff/GetAll:staff,Supplier/GetAll:suppliers,Subcontractor/GetAll:subcontractors,Asset/GetAll:assets,Part/GetAll:parts,Expense/GetAll:expenses"
 # Timesheets - daily 04:00 (full history, weekly-chunked)
-0 4 * * * root /opt/jl-loader/run_tier.sh "Timesheet/GetAll:timesheets" >> /opt/jl-loader/loader.log 2>&1
+0 4 * * * root /opt/jl-loader/jl-run.sh tier-timesheet /opt/jl-loader/run_tier.sh "Timesheet/GetAll:timesheets"
 # Status audit sync US->EU daily 04:30 (feeds sla_analysis pause-hours; no API source)
-30 4 * * * root /opt/jl-loader/run_audit_sync.sh >> /opt/jl-loader/loader.log 2>&1
+30 4 * * * root /opt/jl-loader/jl-run.sh audit_sync /opt/jl-loader/run_audit_sync.sh
+
+# --- Swedish company (Neko Health AB, tenant c61c1df0) — shared client, staggered off UK ---
+10,40 7-19 * * 1-5 root flock -n /tmp/jl_se_jobs.lock /opt/jl-loader/jl-run.sh incremental_se-jobs env JL_INCREMENTAL_DAYS=3 /opt/jl-loader/run_incremental_se.sh jobs
+0 5 * * *  root /opt/jl-loader/jl-run.sh tier_se-job /opt/jl-loader/run_tier_se.sh "Job/getall:jobs"
+20 5 * * * root /opt/jl-loader/jl-run.sh tier_se-customer /opt/jl-loader/run_tier_se.sh "Customer/GetAll:customers,Site/GetAll:sites,Staff/GetAll:staff,Supplier/GetAll:suppliers,Subcontractor/GetAll:subcontractors,Asset/GetAll:assets,Part/GetAll:parts,Expense/GetAll:expenses"
+40 5 * * * root /opt/jl-loader/jl-run.sh tier_se-quote /opt/jl-loader/run_tier_se.sh "Quote/GetAll:quotes,FormsLogbook/getall:forms_logbook"
+50 5 * * * root /opt/jl-loader/jl-run.sh tier_se-purchaseorder /opt/jl-loader/run_tier_se.sh "purchaseorder/getall:purchase_orders,SubcontractorPurchaseOrder/GetAll:subcontractor_purchase_orders"
+0 6 * * *  root /opt/jl-loader/jl-run.sh tier_se-timesheet /opt/jl-loader/run_tier_se.sh "Timesheet/GetAll:timesheets"
+
+# Job costs (per-job cost/sell): daily incr 02:30, after the nightly jobs full. Added 2026-08-25.
+30 2 * * * root /opt/jl-loader/jl-run.sh job_costs-incr /opt/jl-loader/run_job_costs.sh incr

@@ -35,6 +35,31 @@ gcloud/bq user OAuth token is expired ("Reauthentication failed", non-interactiv
   test `run_tier_se.sh "Customer/GetAll:customers"`, backfill all entities, add staggered SE cron, build
   `sweden_models`/`sweden_reporting`. Post-reply runbook is in `joblogic-sweden-api-request.md`.
 
+## Quote job_type outage — fixed 2026-09-22
+`raw.quotes.JobType` is **always null** (the `Quote/GetAll` LIST endpoint doesn't return it) — read
+`models.quote_tracking.job_type` instead. That had been null for 721 quotes (18.6%) since 2026-07-20:
+
+- `load_quote_types.py` wrote to a fixed `/tmp/quote_types.jsonl`. The VM has `fs.protected_regular=2`,
+  which blocks re-opening a file in sticky `/tmp` owned by another user **including as root** — so the
+  manual 20 Jul backfill (run as `joe_segal_up_fm_com`) poisoned every later root cron run with EACCES.
+  Seven nightly crashes, all silent. Now uses a private `tempfile.mkstemp` path.
+- The cron lines were then lost entirely on 2026-07-28 when `/etc/cron.d/jl-loader` was redeployed from
+  this repo's `jl-loader.cron`, which never contained them. Restored (incr 02:55 daily, full 07:00 Sun,
+  CDC 03:10 daily). **`jl-loader.cron` is the deploy source — always `diff` it against the live VM file
+  before installing.** It had also drifted the other way: the repo copy was missing the whole SE block.
+- Backfilled 721 quotes; `job_type` is 100% populated again. CDC reseeded (829 rows) — 9 quotes that were
+  rejected during the gap carry an approximate `date_rejected` of 2026-09-22.
+- **Failure mail:** every cron job now runs via `jl-run.sh <label> <cmd>`, which keeps the full transcript
+  in `loader.log` and re-emits a 40-line tail on stderr when a job exits non-zero, so cron mails
+  `MAILTO=joe.segal@up-fm.com` **only on failure**. Transport is `msmtp` -> `smtp-relay.gmail.com:587`
+  (`/etc/msmtprc`, no credentials — authenticates by source IP).
+  **Mail is PARKED** (Joe, 2026-09-22): the relay rejects with `421-4.7.0` until `8.228.52.239` is
+  allowlisted in Workspace admin (Apps > Google Workspace > Gmail > Routing > SMTP relay service).
+  Nothing else is needed — msmtp and `MAILTO` are configured and mail starts flowing the moment that
+  IP is allowlisted. **Until then, failures are caught by the log marker, not by mail:**
+  `grep "jl-loader FAILED" /opt/jl-loader/loader.log` — the wrapper writes a timestamped banner there
+  on every non-zero exit.
+
 ## Open TODOs / next steps
 0. **JobCost cost pass — PARKED** by Joe ("don't need it for now"). Reverse-engineered formulas saved in the
    memory file if resumed (JobCost endpoint uses job UniqueId GUID; TotalQuoteSell=jobs.QuotedValue is free;
@@ -43,7 +68,9 @@ gcloud/bq user OAuth token is expired ("Reauthentication failed", non-interactiv
 2. **Quote category** ~1,025 quotes have null category (genuine API gap — no category set on the quote), not a mapping miss.
 3. **date_rejected** — the 105 already-rejected quotes are seeded at approx = 2026-07-20; only rejections from now on are exact.
 4. **Looker** — make Job_Number a link via calculated field `HYPERLINK(Job_URL, Job_Number)`.
-5. Job type map has only D/E/M/R; a future "Out of Hours" quote would show its raw code until added to `raw.quote_jobtype_map`.
+5. ~~Job type map has only D/E/M/R~~ **DONE 2026-09-22:** `J` = **Out of Hours** (confirmed by Joe) added
+   to `raw.quote_jobtype_map`, so all 5 codes (D/E/M/R/J) resolve to names and no quote shows a raw code.
+   Any future new type will surface the same way — as a bare letter in `models.quote_tracking.job_type`.
 6. This session ran as the (now-disabled) scheduled task `build-jl-note-models`, so it isn't in the normal sidebar — hence this handoff.
 
 ## Key API facts

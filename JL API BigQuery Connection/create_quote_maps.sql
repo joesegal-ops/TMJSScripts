@@ -7,7 +7,8 @@ SELECT * FROM UNNEST([
   STRUCT("D" AS code, "Reactive" AS description),
   STRUCT("E" AS code, "Project" AS description),
   STRUCT("M" AS code, "Maintenance" AS description),
-  STRUCT("R" AS code, "Repair" AS description)
+  STRUCT("R" AS code, "Repair" AS description),
+  STRUCT("J" AS code, "Out of Hours" AS description)   -- added 2026-09-22 (first seen on UP03428)
 ]);
 
 CREATE OR REPLACE TABLE `vmimporteddata.raw.job_category_map` AS
