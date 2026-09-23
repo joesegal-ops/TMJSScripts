@@ -7,6 +7,12 @@ its GraphQL API. Runs on the same fixed-IP VM.
 
 ---
 
+> **Reverse leg (added 2026-09-22):** this spec covers JL **->** Monday only. Monday board data now
+> also flows **into** BigQuery — `load_monday.py` / `run_monday_load.sh` -> `raw.monday_boards`,
+> `raw.monday_columns`, `raw.monday_items` -> `models.monday_*` views (`create_monday_views.sql`).
+> See the "Monday.com -> BigQuery ingest" section of `HANDOFF.md`. The two directions are
+> independent: the ingest is read-only and never writes to Monday.
+
 ## 1. The lifecycle & the data chain (verified 2026-07-22)
 
 ```
