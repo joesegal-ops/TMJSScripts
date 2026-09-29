@@ -185,6 +185,57 @@ Days-to-first-move, complete-history items only:
 `Days_In_Current_Stage`, `Current_Stage_Entered_At`, `Stage_History_Complete`.
 Undone moves (`is_undo`) are excluded from both views — the board's automations do generate them.
 
+## Quote costs + `reporting.project_margin` — built 2026-09-29
+**The cost of won work lives on the QUOTE, not the job.** Measured: of 2,899 upgraded quotes only
+**627 (21.6%)** of the resulting jobs carry any cost in JobLogic. `Quote/getall` returns only
+`QuoteValue*` (both SELL), so before this there was no cost figure at all for ~4 in 5 won projects
+and no margin was computable.
+
+- **`load_quote_costs.py` / `run_quote_costs.sh` -> `raw.quote_costs`.** Endpoint is the one we
+  already used for job_type: `GET /api/v1/Quote/GetById`, but with **`includeLines=true`**
+  (`load_quote_types.py` passes `false`, which is why nobody saw the lines).
+- **`Lines` is a DICT of 8 category arrays**, not a list — MaterialLines, LabourLines,
+  SubcontractorLines, TravelLines, CalloutLines, ExpenseLines, OtherLines, ScheduleOfRatesLines.
+  Each line carries `Cost`, `Sell`, `TotalCostExcludingVat`, `TotalSellExcludingVat`.
+  With `includeLines` omitted or false it comes back **null**, not empty.
+- **Backfilled 3,977 quotes** (~45 min at the 0.65s pace): 3,925 have lines, 3,803 have a cost,
+  **0 lines with an unmappable cost field**, and only 3 quotes where the line sum disagrees with the
+  header `QuoteValueExcludingVat`. Totals: cost £7.47M, sell £9.93M.
+- Cron: incr daily 03:20, **full Sunday 09:00** (incr never revisits a quote, so only the full picks
+  up EDITED lines). Kept clear of the quote_types full at 07:00 so the two don't race the rate limit.
+- `n_lines_no_cost` is self-diagnosing: if a future category uses different field names it shows up
+  there rather than silently costing £0. Extend `line_money()` if it ever goes non-zero.
+
+### TRAP: never add quote cost and job cost together
+Of the 623 jobs that carry a cost of their own, **268 match the quote cost to the penny** and 274
+are within 1% — **median ratio exactly 1.000**. The job figure is the quote cost *copied over* on
+upgrade, sometimes then edited: 275 end up lower (partial copy), only **74 higher** (real extras).
+Summing would double-count roughly half of all costed jobs. `Total_Cost_exVAT` therefore uses
+`GREATEST(quote_cost, job_cost)`. `Overspend_Above_Quote_exVAT` isolates the genuinely new spend.
+
+### `reporting.project_margin` — one row per quote
+Three money columns kept separate rather than collapsed into one "profit": `Quote_Cost_exVAT`
+(planned), `Job_Cost_exVAT` (the job's own figure), `Invoiced_exVAT` (actually billed).
+`Quote_Margin_Pct` = priced margin; `Realised_Margin_Pct` = invoiced revenue vs total cost;
+`Overspend_Pct` = delivery cost above the quoted cost. Plus the cost mix (`cost_material`,
+`cost_labour`, `cost_subcontractor`, …) and `Job_Cost_Duplicates_Quote`.
+
+Priced margin by month approved:
+| month | won | sell | cost | margin | % |
+|---|---|---|---|---|---|
+| 2026-09 | 281 | £548.8k | £440.0k | £108.8k | 19.8 |
+| 2026-08 | 244 | £695.8k | £496.4k | £199.4k | 28.7 |
+| 2026-07 | 320 | £670.6k | £495.1k | £175.5k | 26.2 |
+| 2026-06 | 333 | £551.1k | £407.9k | £143.2k | 26.0 |
+| 2026-05 | 296 | £638.6k | £520.4k | £118.1k | 18.5 |
+| 2026-04 | 262 | £493.2k | £358.8k | £134.4k | 27.3 |
+| 2026-03 | 242 | £695.1k | £594.1k | £101.0k | 14.5 |
+
+**This is gross margin on sold work, NOT net profit** — JobLogic holds no overheads (salaries, rent,
+vehicles, insurance). Do not label it net profit on a dashboard.
+**For margin %, always `(SUM(sell)-SUM(cost))/SUM(sell)`**, never the average of per-quote
+percentages — that weights a £200 callout the same as a £20k fit-out.
+
 ## Open TODOs / next steps
 0. **JobCost cost pass — PARKED** by Joe ("don't need it for now"). Reverse-engineered formulas saved in the
    memory file if resumed (JobCost endpoint uses job UniqueId GUID; TotalQuoteSell=jobs.QuotedValue is free;

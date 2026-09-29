@@ -43,6 +43,13 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 # Sunday full sits at 07:00, clear of the 05:00-06:00 SE tier block below.
 55 2 * * *   root flock -n /tmp/jl_quote_types.lock /opt/jl-loader/jl-run.sh quote_types-incr /opt/jl-loader/run_quote_types.sh incr
 0 7 * * 0    root flock -n /tmp/jl_quote_types.lock /opt/jl-loader/jl-run.sh quote_types-full /opt/jl-loader/run_quote_types.sh full
+# Quote COST/SELL lines -> raw.quote_costs (Quote/GetById?includeLines=true).
+# The cost of won work lives on the QUOTE: only 21.6% of upgraded jobs carry any cost of their own,
+# so raw.job_costs alone cannot produce a margin. Incr daily (new quotes); full Sunday 09:00 picks up
+# EDITED lines, which incr never revisits. Full is ~43 min at the 0.65s pace -- kept clear of the
+# quote_types full at 07:00 so the two don't race the same rate limit.
+20 3 * * *  root flock -n /tmp/jl_quote_costs.lock /opt/jl-loader/jl-run.sh quote_costs-incr /opt/jl-loader/run_quote_costs.sh incr
+0 9 * * 0   root flock -n /tmp/jl_quote_costs.lock /opt/jl-loader/jl-run.sh quote_costs-full /opt/jl-loader/run_quote_costs.sh full
 # Quote status CDC -> raw.quote_status_events (feeds date_rejected; no API field for it) - daily 03:10
 10 3 * * *   root /opt/jl-loader/jl-run.sh quote_cdc /opt/jl-loader/run_quote_cdc.sh
 # Reference/dimension data - daily 03:00
