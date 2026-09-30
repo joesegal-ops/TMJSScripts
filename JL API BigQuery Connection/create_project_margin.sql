@@ -28,9 +28,15 @@ WITH qc AS (
   SELECT * FROM `vmimporteddata.raw.quote_costs`
 ),
 link AS (
-  -- quote -> the job it was upgraded into (inferred; see reporting.quote_to_job_completion)
-  SELECT quote_id, upgraded_job_number
+  -- quote -> the job it was upgraded into (INFERRED -- the API exposes no quote<->job link, so
+  -- this is heuristic; filter on Link_Confidence before trusting the delivery timings).
+  SELECT quote_id, upgraded_job_number, completed_date,
+         days_approval_to_completion, link_confidence
   FROM `vmimporteddata.reporting.quote_to_job_completion`
+),
+parent AS (
+  -- the reactive job the quote was raised against, for time-to-quote
+  SELECT Job_Number, Date_Logged FROM `vmimporteddata.reporting.jobs`
 ),
 jc AS (
   -- only jobs that actually carry a cost of their own
@@ -66,7 +72,18 @@ SELECT
   -- ---------- dates (pick your month basis in Looker) ----------
   DATE(qc.date_logged)                                   AS Quote_Date,
   DATE(qc.approved_datetime)                             AS Approved_Date,
+  l.completed_date                                       AS Completed_Date,
   i.last_invoice_date                                    AS Last_Invoice_Date,
+
+  -- ---------- cycle times ----------
+  -- Time to quote, JobLogic's own clock: parent job raised -> quote raised. System-generated,
+  -- so unlike Monday's PM-entered Request/Quoted pair it cannot be back-filled by hand.
+  qc.parent_job_number                                   AS Parent_Job_Number,
+  DATE_DIFF(DATE(qc.date_logged), DATE(pj.Date_Logged), DAY)
+                                                         AS Days_Job_To_Quote,
+  -- Approval -> delivery. Depends on the INFERRED quote->job link; check Link_Confidence.
+  l.days_approval_to_completion                          AS Days_Approval_To_Completion,
+  l.link_confidence                                      AS Link_Confidence,
 
   -- ---------- priced margin (every quote, won or not) ----------
   qc.total_sell_exvat                                    AS Quote_Sell_exVAT,
@@ -110,6 +127,7 @@ SELECT
   qc._ingested_at
 FROM qc
 LEFT JOIN link l ON l.quote_id   = qc.quote_id
+LEFT JOIN parent pj ON pj.Job_Number = qc.parent_job_number
 LEFT JOIN jc   j ON j.job_number = l.upgraded_job_number
 LEFT JOIN inv  i ON i.job_number = l.upgraded_job_number
 LEFT JOIN qt     ON qt.quote_number = qc.quote_number;
