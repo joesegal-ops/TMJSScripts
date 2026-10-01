@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.23
-// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
+// @version      1.24
+// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → set every line on a Project-type job to nominal "202 - Projects Income" → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -110,7 +110,7 @@
     const SCRIPT_ID = 'project-invoicer';
     const SCRIPT_LABEL = '📧 Project Invoicer';
     const SCRIPT_COLOR = '#7A4FBF';
-    const SCRIPT_DESC = 'Bulk-invoice Jobs to the customer. Paste "JobNumber <tab> PO" rows; the script creates each invoice, sets the Customer Order Number to "PROJ | PO-XXXX - SITEID", approves it, then opens the email composer with the standard recipients. Dry-run by default (stops at each email for you to Send). Copy the results into Google Sheets when done.';
+    const SCRIPT_DESC = 'Bulk-invoice Jobs to the customer. Paste "JobNumber <tab> PO" rows; the script creates each invoice, sets the Customer Order Number to "PROJ | PO-XXXX - SITEID", re-codes Project-job lines to 202 - Projects Income, approves it, then opens the email composer with the standard recipients. Dry-run by default (stops at each email for you to Send). Copy the results into Google Sheets when done.';
 
     // Fixed recipients for every invoice email.
     const RECIPIENTS = [
@@ -199,7 +199,7 @@
         // Prefer an exact JobNumber match; else take the first hit.
         const exact = jobs.find(x => String(x.JobNumber).toLowerCase() === jobNumber.toLowerCase());
         const job = exact || jobs[0];
-        return { jobId: job.Id, jobNumber: job.JobNumber, siteName: job.SiteName || '' };
+        return { jobId: job.Id, jobNumber: job.JobNumber, siteName: job.SiteName || '', jobType: job.TypeDescription || '' };
     }
 
     async function createInvoice(jobId) {
@@ -255,6 +255,97 @@
             const m = html.match(/<title>([\s\S]*?)<\/title>/i);
             return invoiceNumberFromTitle(m ? m[1] : '');
         } catch (e) { return ''; }
+    }
+
+    // =======================================================================
+    // Nominal code: lines on a Project-type job → "202 - Projects Income"
+    // (same rule as the standalone "Project Invoice Lines → 202" script). Done on the
+    // DRAFT, before approve, through the line-edit modal's own form.
+    // =======================================================================
+    const PROJECT_JOB_TYPE = 'Project';
+    const PROJECT_NOMINAL_MATCH = /^202\s*-\s*Projects Income$/i;
+    const PROJECT_NOMINAL_FALLBACK = { Id: 'c5f5ae48-c11a-431a-a9a9-c28e149aee97', Description: '202 - Projects Income' };
+    let projectNominalPromise = null;
+    function getProjectNominal() {
+        if (!projectNominalPromise) {
+            projectNominalPromise = fetchText('/NominalCode/GetNominalCodes')
+                .then(t => JSON.parse(t))
+                .then(list => (Array.isArray(list) && list.find(n => PROJECT_NOMINAL_MATCH.test(n.Description))) || PROJECT_NOMINAL_FALLBACK)
+                .catch(() => PROJECT_NOMINAL_FALLBACK);
+        }
+        return projectNominalPromise;
+    }
+    async function fetchJobType(jobId) {
+        const m = (await fetchText('/Job/Detail/' + jobId)).match(/"JobTypeDescription":"([^"]*)"/);
+        return m ? m[1] : '';
+    }
+    // Balanced-bracket JSON object right after `needle` (e.g. "var MInvoices = ").
+    function extractObjectAfter(html, needle) {
+        const at = html.indexOf(needle);
+        if (at < 0) return null;
+        const start = html.indexOf('{', at);
+        if (start < 0) return null;
+        let depth = 0, inStr = false, esc = false;
+        for (let i = start; i < html.length; i++) {
+            const ch = html[i];
+            if (esc) { esc = false; continue; }
+            if (ch === '\\') { esc = true; continue; }
+            if (ch === '"') { inStr = !inStr; continue; }
+            if (inStr) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (depth === 0) { try { return JSON.parse(html.slice(start, i + 1)); } catch (e) { return null; } } }
+        }
+        return null;
+    }
+    async function readInvoiceLines(invoiceId) {
+        const model = extractObjectAfter(await fetchText('/Invoice/GetLines?invoiceId=' + invoiceId), 'var MInvoices = ');
+        if (!model) throw new Error('could not read the invoice lines');
+        return model.Lines || [];
+    }
+    async function setInvoiceLineNominal(invoiceId, line, nom) {
+        const html = await fetchText('/Invoice/UpdateLine?id=' + encodeURIComponent(line.Id) + '&invoiceId=' + encodeURIComponent(invoiceId));
+        const token = tokenFromHtml(html) || getToken();
+        const model = extractObjectAfter(html, 'var LineModel = ') || {};
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const form = doc.querySelector('#addUpdateInvoiceLineForm') || doc;
+        const params = new URLSearchParams();
+        const count = {};
+        const push = (n, v) => { params.append(n, v == null ? '' : String(v)); count[n] = (count[n] || 0) + 1; };
+        form.querySelectorAll('input[name], select[name], textarea[name]').forEach(el => {
+            const n = el.name;
+            if (n === '__RequestVerificationToken') return;
+            if (el.tagName === 'SELECT') { count[n] = count[n] || 0; [...el.options].filter(o => o.selected).forEach(o => push(n, o.value)); return; }
+            if (el.type === 'checkbox' || el.type === 'radio') { count[n] = count[n] || 0; if (el.checked) push(n, el.value || 'true'); return; }
+            push(n, n === 'NominalCodeId' ? nom.Id : (el.value || ''));
+        });
+        if (!count.NominalCodeId) push('NominalCodeId', nom.Id);
+        push('NominalCodeId_input', nom.Description);                  // Kendo combobox companion text
+        if (count.TaxCodeId) push('TaxCodeId_input', model.TaxCodeDescription || '');
+        // Description is a Vue <ai-text-area> (not in the raw HTML) — send it back or the line is blanked.
+        if (!count.Description) push('Description', model.Description != null ? model.Description : (line.Description || ''));
+        if (!count.TagIds && Array.isArray(model.TagIds)) model.TagIds.forEach(t => push('TagIds', t));
+        const r = await fetch('/api/Invoice/SaveLine', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'Accept': 'application/json, text/javascript, */*; q=0.01', '__RequestVerificationToken': token },
+            body: params.toString(),
+        });
+        const txt = await r.text().catch(() => '');
+        if (!r.ok) throw new Error('SaveLine HTTP ' + r.status);
+        let j = null; try { j = JSON.parse(txt); } catch (e) {}
+        if (j && j.success === false) throw new Error((j.errors && j.errors.join('; ')) || j.Message || 'SaveLine refused');
+    }
+    // Re-codes every non-discount line not already on 202, then verifies with a fresh read.
+    // Returns a short summary for the log; throws if any line didn't take.
+    async function recodeProjectLines(invoiceId) {
+        const nom = await getProjectNominal();
+        const todo = (await readInvoiceLines(invoiceId)).filter(l => !l.IsDiscountLine && (l.NominalCode || '') !== nom.Description);
+        if (!todo.length) return `all lines already ${nom.Description}`;
+        const from = [...new Set(todo.map(l => l.NominalCode || 'none'))].join(', ');
+        for (const line of todo) { await setInvoiceLineNominal(invoiceId, line, nom); await sleep(300); }
+        const after = new Map((await readInvoiceLines(invoiceId)).map(l => [String(l.Id), l]));
+        const ok = todo.filter(l => (after.get(String(l.Id)) || {}).NominalCode === nom.Description).length;
+        if (ok !== todo.length) throw new Error(`only ${ok}/${todo.length} lines took ${nom.Description}`);
+        return `${ok} line${ok > 1 ? 's' : ''} ${from} → ${nom.Description}`;
     }
 
     async function approveInvoice(invoiceId) {
@@ -671,6 +762,7 @@
                             job.jobId = info.jobId;
                             job.jobNumber = info.jobNumber;
                             job.siteName = info.siteName;
+                            job.jobType = info.jobType;
                         }
                         job.siteId = siteIdFrom(job.siteName);
                         job.reference = buildReference(job.po, job.siteId);
@@ -687,6 +779,22 @@
                         if (net0 === 0) throw new Error('no lines to invoice (draft came back £0)');
                         await setOrderNumber(job.invoiceId, job.reference);
                         log(`    order number set`, '#8fd');
+                        await sleep(DELAY);
+                        // Project jobs: re-code the draft's lines to 202 - Projects Income before
+                        // approving. Never blocks the run — an approved invoice's nominal code can
+                        // still be edited — but a failure is flagged for a manual fix.
+                        job.nominalError = '';
+                        try {
+                            if (!job.jobType) job.jobType = await fetchJobType(job.jobId);
+                            if (job.jobType === PROJECT_JOB_TYPE) {
+                                log(`    nominal: ${await recodeProjectLines(job.invoiceId)}`, '#8fd');
+                            } else {
+                                log(`    nominal: job type is "${job.jobType || 'unknown'}", not Project — lines left as they are`, '#fd0');
+                            }
+                        } catch (x) {
+                            job.nominalError = x.message;
+                            log(`    ⚠ nominal: ${x.message} — set the lines to 202 - Projects Income manually`, '#f80');
+                        }
                         await sleep(DELAY);
                         // Snapshot the job's status BEFORE approving — approving flips it to
                         // "Invoiced", and restoreJobStatus() puts this back afterwards unless
@@ -994,6 +1102,7 @@
             const m = j.mondayStatus || '';
             if (m.indexOf('skipped') === 0) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — Monday NOT updated: ${m}`);
             else if (m === 'error') flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — Monday error: ${j.mondayError || 'unknown'}`);
+            if (j.nominalError) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — invoice ${j.invoiceNumber || '#' + j.invoiceId} lines NOT all on 202 - Projects Income: ${j.nominalError}`);
             if ((j.strayDrafts || []).length) flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — DELETE MANUALLY: empty £0 draft invoice(s) #${j.strayDrafts.join(', #')}`);
             const sr = j.statusRestore || '';
             if (sr === 'error') flags.push(`• ${j.jobNumber} (${formatPO(j.po)}) — job status NOT put back (still "Invoiced"): ${j.statusError || 'unknown'}`);
@@ -1095,6 +1204,7 @@
             const note = [
                 (j.skipped || []).length ? 'skipped ' + j.skipped.join('; ') : '',
                 (j.strayDrafts || []).length ? 'DELETE empty draft(s) #' + j.strayDrafts.join(', #') : '',
+                j.nominalError ? 'NOMINAL not set to 202: ' + j.nominalError : '',
                 j.error || '',
             ].filter(Boolean).join(' | ');
             lines.push([
