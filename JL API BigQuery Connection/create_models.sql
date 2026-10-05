@@ -165,9 +165,9 @@ LEFT JOIN visit_notes vn ON vn.visit_id = jvd.Visit_Id;
 
 -- All-in-Job (job grain, one row per job) — reproduces the old importdata All_in_Job_clean columns.
 -- PARTIAL BUILD (2026-07-20): job fields + Visit_Notes (aggregated per job from models.notes) populated.
--- The 5 money columns (TotalJobCost/Sell, TotalQuoteCost/Sell, PurchaseOrderAdjustment) and the 2
--- Service columns are typed NULL placeholders pending the FULL pass: TotalJobCost/Sell need the JobCost
--- API endpoint backfilled into raw; quote figures need UNNEST(quotes.Lines) cost roll-up joined via
+-- TotalJobCost/Sell come from raw.job_costs (JobCost endpoint, ex-VAT; load_job_costs.py). The other 3
+-- money columns (TotalQuoteCost/Sell, PurchaseOrderAdjustment) and the 2 Service columns are typed NULL
+-- placeholders pending the FULL pass: quote figures need UNNEST(quotes.Lines) cost roll-up joined via
 -- quotes.ParentJobAutoId; PO adjustment needs UNNEST(purchase_orders.Lines) per JobId.
 CREATE OR REPLACE VIEW `vmimporteddata.models.all_in_job` AS
 WITH visit_notes AS (
@@ -181,6 +181,11 @@ last_visit_note AS (  -- single most-recent Visit-entity note per job
   FROM `vmimporteddata.models.notes`
   WHERE entity_type = "Visit" AND note_text IS NOT NULL AND TRIM(note_text) != ""
   QUALIFY ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY date_added DESC) = 1
+),
+job_cost AS (  -- one row per job; QUALIFY guards against upsert dupes
+  SELECT job_id, total_cost_exvat, total_sell_exvat
+  FROM `vmimporteddata.raw.job_costs`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY _ingested_at DESC) = 1
 )
 SELECT
   j.JobNumber                 AS ID,
@@ -205,8 +210,8 @@ SELECT
   j.ReportedSubFaultCode      AS Reported_Sub_Fault_Code,
   j.ActualFaultCode           AS Actual_Fault_Code,
   j.ActualSubFaultCode        AS Actual_Sub_Fault_Code,
-  CAST(NULL AS NUMERIC)       AS TotalJobCost,             -- FULL PASS: needs JobCost endpoint
-  CAST(NULL AS NUMERIC)       AS TotalJobSell,             -- FULL PASS: needs JobCost endpoint
+  CAST(ROUND(jc.total_cost_exvat, 2) AS NUMERIC) AS TotalJobCost,  -- ex-VAT, raw.job_costs
+  CAST(ROUND(jc.total_sell_exvat, 2) AS NUMERIC) AS TotalJobSell,  -- ex-VAT, raw.job_costs
   CAST(NULL AS NUMERIC)       AS TotalQuoteCost,           -- FULL PASS: needs quote line-item costs
   CAST(NULL AS NUMERIC)       AS TotalQuoteSell,           -- FULL PASS: quote roll-up per job
   CAST(NULL AS NUMERIC)       AS PurchaseOrderAdjustment,  -- FULL PASS: PO line-item roll-up
@@ -225,7 +230,8 @@ SELECT
   j._ingested_at
 FROM `vmimporteddata.raw.jobs` j
 LEFT JOIN visit_notes vn ON vn.job_id = j.Id
-LEFT JOIN last_visit_note lvn ON lvn.job_id = j.Id;
+LEFT JOIN last_visit_note lvn ON lvn.job_id = j.Id
+LEFT JOIN job_cost jc ON jc.job_id = j.Id;
 
 -- Avg visits per job (faithful port of old importdata Avg_Visits_Per_Job). Sources = models.job_and_visit_details
 -- (visits) + models.all_in_job (Job_Type, Date_Logged). Excludes cancelled visits; per-job grain.
