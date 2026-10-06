@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.13
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
+// @version      1.14
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -103,11 +103,17 @@
     // ===== end shared dock =====
 
     // Read from the metadata block so the on-screen version can never drift from @version.
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.13');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.14');
     const SCRIPT_ID = 'auto-deliver-pos';
     const SCRIPT_LABEL = '📦 Auto Deliver POs';
     const SCRIPT_COLOR = '#4c9f01';
-    const SCRIPT_DESC = 'Reviews open and undelivered POs, checks whether the linked job is closed or completed, and marks those POs as delivered. Open the PO list, then Start.';
+    const SCRIPT_DESC = 'Reviews open and undelivered POs, checks whether the linked job is closed or completed, and marks those POs as delivered (or completed, on the Subcontractor PO list). Open the PO list, then Start.';
+
+    // The Subcontractor PO list (/SubContractorPO) is a different grid: rows link to
+    // /SubcontractorPO/Detail/, the status column is "Completion Status" rather than
+    // "Delivery Status", and the equivalent of "deliver all" is "Complete All"
+    // (/SubContractorPO/SaveCompleteDate).
+    function isSubcontractorPage() { return /^\/SubContractorPO(\/|$)/i.test(location.pathname); }
 
     console.log('[JL-AutoDeliver v' + SCRIPT_VERSION + '] Script loaded');
 
@@ -245,22 +251,50 @@
         return day + '/' + month + '/' + d.getFullYear();
     }
 
-    // Collect POs from the currently visible table rows
+    // Map header text -> column index for the PO grid, so we don't depend on column order.
+    function getColumnIndex(row, names, fallback) {
+        var table = row.closest('table');
+        var ths = table ? table.querySelectorAll('thead th') : [];
+        for (var i = 0; i < ths.length; i++) {
+            var h = ths[i].textContent.trim().toLowerCase();
+            if (names.indexOf(h) !== -1) return i;
+        }
+        return fallback;
+    }
+
+    // Collect POs from the currently visible table rows.
+    // deliveryStatus is normalised to 'not delivered' / 'partially delivered' / other,
+    // so Subcontractor POs ("Not Completed" / "Partially Completed") flow through the
+    // same filters as supplier POs.
     function getPOsFromDOM() {
+        var spo = isSubcontractorPage();
+        var linkRe = spo ? /\/SubcontractorPO\/Detail\/([a-f0-9\-]{36})/i : /\/PurchaseOrder\/Detail\/([a-f0-9\-]{36})/i;
         var pos = [];
         var seen = {};
-        document.querySelectorAll('a[href*="/PurchaseOrder/Detail/"]').forEach(function (a) {
-            var match = a.href.match(/\/PurchaseOrder\/Detail\/([a-f0-9\-]{36})/i);
+        var cols = null;
+        document.querySelectorAll(spo ? 'a[href*="/Detail/"]' : 'a[href*="/PurchaseOrder/Detail/"]').forEach(function (a) {
+            var match = a.href.match(linkRe);
             if (!match || seen[match[1]]) return;
             seen[match[1]] = true;
             var row = a.closest('tr');
             if (!row) return;
+            if (!cols) {
+                cols = {
+                    job: getColumnIndex(row, ['job number'], 2),
+                    poStatus: getColumnIndex(row, ['po status'], spo ? 7 : 6),
+                    status: spo ? getColumnIndex(row, ['completion status'], 8) : getColumnIndex(row, ['delivery status'], 7)
+                };
+            }
             var cells = row.querySelectorAll('td');
-            // cells[2] = Job Number, cells[6] = PO Status, cells[7] = Delivery Status
-            var jobNo = cells[2] ? cells[2].textContent.trim() : '';
-            var poStatus = cells[6] ? cells[6].textContent.trim() : '';
-            var deliveryStatus = cells[7] ? cells[7].textContent.trim().toLowerCase() : '';
-            pos.push({ id: match[1], jobNo: jobNo, poStatus: poStatus, deliveryStatus: deliveryStatus });
+            var jobNo = cells[cols.job] ? cells[cols.job].textContent.trim() : '';
+            var poStatus = cells[cols.poStatus] ? cells[cols.poStatus].textContent.trim() : '';
+            var rawStatus = cells[cols.status] ? cells[cols.status].textContent.trim().toLowerCase() : '';
+            var deliveryStatus = rawStatus;
+            if (spo) {
+                if (rawStatus === 'not completed') deliveryStatus = 'not delivered';
+                else if (rawStatus.indexOf('partial') !== -1) deliveryStatus = 'partially delivered';
+            }
+            pos.push({ id: match[1], jobNo: jobNo, poStatus: poStatus, deliveryStatus: deliveryStatus, rawStatus: rawStatus });
         });
         return pos;
     }
@@ -478,6 +512,35 @@
         return result;
     }
 
+    // Subcontractor PO equivalent of "deliver all": the "Complete All" modal on the
+    // SPO Items tab posts to SaveCompleteDate. SetJobComplete is the modal's
+    // "Set the Status of the job to complete" box - left off, the job is already closed.
+    async function markSPOCompleted(poId, token) {
+        var fd = new FormData();
+        fd.append('Id', '');
+        fd.append('CompleteAll', 'true');
+        fd.append('PurchaseOrderId', poId);
+        fd.append('CompleteDate', getTodayDate());
+        fd.append('SetJobComplete', 'false');
+        fd.append('__RequestVerificationToken', token);
+
+        var text = await jlFetch('/SubContractorPO/SaveCompleteDate', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                '__RequestVerificationToken': token
+            },
+            body: fd
+        }, 'SaveCompleteDate');
+
+        var result = (function () { try { return JSON.parse(text); } catch (e) { return {}; } })();
+        if (result.success === false || result.Success === false) {
+            throw new Error(result.Message || result.message || result.errors?.join(', ') || 'API returned failure');
+        }
+        return result;
+    }
+
     // --- MAIN PROCESS ---
 
     async function startProcess() {
@@ -488,6 +551,8 @@
         logArea.innerHTML = '';
 
         var dryRun = document.getElementById('jl-autodeliver-dryrun').checked;
+        var spo = isSubcontractorPage();
+        var doneLabel = spo ? 'Completed' : 'Fully Delivered';
         var skipPartial = document.getElementById('jl-autodeliver-skip-partial').checked;
         jobStatusCache = new Map();
         lastRequestAt = 0;
@@ -500,6 +565,7 @@
         log('Closed statuses: ' + CLOSED_STATUSES.join(', '), '#888');
         log('Request pacing: 1 per ' + MIN_REQUEST_INTERVAL + 'ms (~' + Math.round(60000 / MIN_REQUEST_INTERVAL) + '/min) to stay under the gateway rate limit', '#888');
         log('Skip partially delivered: ' + skipPartial, '#888');
+        log('Page: ' + (spo ? 'Subcontractor POs (will mark as Completed)' : 'Supplier POs (will mark as Fully Delivered)'), '#888');
 
         var token = getCSRFToken();
         if (!token) {
@@ -520,7 +586,7 @@
             log('Target POs (not delivered' + (skipPartial ? '' : ' or partially delivered') + '): ' + targetPOs.length, '#0fa');
 
             if (targetPOs.length === 0) {
-                log('No undelivered POs found. Make sure you are on the Purchase Orders page.', '#fa0');
+                log('No undelivered POs found. Make sure you are on the Purchase Orders or Subcontractor Purchase Orders page.', '#fa0');
                 setProgress('No target POs found.');
                 return;
             }
@@ -563,19 +629,20 @@
                         continue;
                     }
 
-                    log('PO ' + po.id.substring(0, 8) + '... -> ' + po.jobNo + ' [' + job.statusDescription + '] - delivery: ' + po.deliveryStatus, '#aaf');
+                    log('PO ' + po.id.substring(0, 8) + '... -> ' + po.jobNo + ' [' + job.statusDescription + '] - ' + (spo ? 'completion' : 'delivery') + ': ' + po.rawStatus, '#aaf');
 
                     if (!dryRun) {
                         try {
-                            await markPODelivered(po.id, token);
-                            log('  Marked as Fully Delivered', '#0fa');
+                            if (spo) await markSPOCompleted(po.id, token);
+                            else await markPODelivered(po.id, token);
+                            log('  Marked as ' + doneLabel, '#0fa');
                             delivered++;
                         } catch (e) {
                             log('  ERROR delivering: ' + e.message, '#f55');
                             errors++;
                         }
                     } else {
-                        log('  [DRY RUN] Would mark as Fully Delivered', '#ff0');
+                        log('  [DRY RUN] Would mark as ' + doneLabel, '#ff0');
                         delivered++;
                     }
 
