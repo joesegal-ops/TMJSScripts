@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.14
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
+// @version      1.15
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -103,7 +103,7 @@
     // ===== end shared dock =====
 
     // Read from the metadata block so the on-screen version can never drift from @version.
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.14');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.15');
     const SCRIPT_ID = 'auto-deliver-pos';
     const SCRIPT_LABEL = '📦 Auto Deliver POs';
     const SCRIPT_COLOR = '#4c9f01';
@@ -144,6 +144,9 @@
     let wafBlocks = 0;
     // Count of job lookups served from jobStatusCache instead of the network.
     let cacheSaves = 0;
+    // Job id -> { rateId, rateName } and selling rate id -> uplift %s, for the sell-impact estimate.
+    let jobRateCache = new Map();
+    let rateUpliftCache = new Map();
 
     // --- UI ---
     function createUI() {
@@ -207,6 +210,16 @@
         controlsDiv.appendChild(dryLabel);
         controlsDiv.appendChild(document.createElement('br'));
         controlsDiv.appendChild(skipPartialLabel);
+
+        const impactLabel = document.createElement('label');
+        impactLabel.style.cssText = 'margin-left:12px;font-size:11px;cursor:pointer;';
+        const impactCheck = document.createElement('input');
+        impactCheck.type = 'checkbox';
+        impactCheck.id = 'jl-autodeliver-sell-impact';
+        impactCheck.checked = true;
+        impactLabel.appendChild(impactCheck);
+        impactLabel.appendChild(document.createTextNode(' Show job sell impact (slower)'));
+        controlsDiv.appendChild(impactLabel);
 
         logArea = document.createElement('div');
         logArea.style.cssText = 'flex:1;overflow-y:auto;max-height:50vh;background:#111;padding:8px;border-radius:4px;white-space:pre-wrap;line-height:1.5;';
@@ -294,7 +307,9 @@
                 if (rawStatus === 'not completed') deliveryStatus = 'not delivered';
                 else if (rawStatus.indexOf('partial') !== -1) deliveryStatus = 'partially delivered';
             }
-            pos.push({ id: match[1], jobNo: jobNo, poStatus: poStatus, deliveryStatus: deliveryStatus, rawStatus: rawStatus });
+            var jobLink = row.querySelector('a[href*="/Job/Detail/"]');
+            var jobIdMatch = jobLink && jobLink.href.match(/\/Job\/Detail\/(\d+)/);
+            pos.push({ id: match[1], jobNo: jobNo, jobId: jobIdMatch ? jobIdMatch[1] : null, poStatus: poStatus, deliveryStatus: deliveryStatus, rawStatus: rawStatus });
         });
         return pos;
     }
@@ -541,6 +556,93 @@
         return result;
     }
 
+    // --- SELL IMPACT ESTIMATE ---
+    // Delivering a supplier PO / completing a subcontractor PO is what creates the job
+    // cost line - nothing is on the job beforehand. Joblogic prices that line at
+    // cost x (1 + uplift), where uplift is the job's Selling Rate MaterialUplift (supplier
+    // POs) or SubcontractorUplift (SPOs). Verified on RE0025984: SPO £20,000 cost ->
+    // Subcontractor line 9.53% uplift, £21,906 sell, chargeable.
+    // It's an estimate: part-library sell prices or a manual edit can override the uplift.
+
+    function parseMoney(v) {
+        if (typeof v === 'number') return v;
+        var n = parseFloat(String(v || '').replace(/[^0-9.\-]/g, ''));
+        return isNaN(n) ? 0 : n;
+    }
+
+    function fmtMoney(n) {
+        return '£' + n.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    // Pull a `var Name = {...}` object literal out of a Joblogic HTML partial.
+    function extractJsObject(html, name) {
+        var i = html.indexOf(name);
+        if (i < 0) return null;
+        var start = html.indexOf('{', i);
+        var depth = 0, inStr = false, esc = false;
+        for (var k = start; k < html.length; k++) {
+            var c = html[k];
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c === '\\') esc = true;
+                else if (c === '"') inStr = false;
+                continue;
+            }
+            if (c === '"') inStr = true;
+            else if (c === '{') depth++;
+            else if (c === '}' && --depth === 0) return JSON.parse(html.slice(start, k + 1));
+        }
+        return null;
+    }
+
+    // Cost (ex VAT) of the PO lines that this run would deliver/complete.
+    async function getOutstandingPOCost(poId, spo) {
+        var headers = { 'X-Requested-With': 'XMLHttpRequest' };
+        var lines;
+        if (spo) {
+            var json = JSON.parse(await jlFetch('/SubContractorPO/GetLineItemsJson?purchaseOrderId=' + poId, { credentials: 'same-origin', headers: headers }, 'SPO lines'));
+            lines = (json.AdditionalData || []).filter(function (l) { return l.IsRequired && !l.Completed; });
+        } else {
+            var html = await jlFetch('/PurchaseOrder/GetLineItems?purchaseOrderId=' + poId, { credentials: 'same-origin', headers: headers }, 'PO lines');
+            var model = extractJsObject(html, 'PurchaseOrdersCost');
+            lines = ((model && model.Items) || []).filter(function (l) { return !l.Delivered && !l.IsNotRequired && !l.IsReturned; });
+        }
+        return {
+            count: lines.length,
+            cost: lines.reduce(function (sum, l) { return sum + parseMoney(l.TotalExcludingVATAndDiscount || l.SubTotal); }, 0)
+        };
+    }
+
+    async function getJobSellingRate(jobId) {
+        if (jobRateCache.has(jobId)) return jobRateCache.get(jobId);
+        var html = await jlFetch('/Job/GetCosts?jobId=' + jobId + '&isReadOnly=False', { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } }, 'Job costs');
+        var pm = extractJsObject(html, 'JobLinesPM') || {};
+        var rate = { rateId: pm.SellingRateId || null, rateName: pm.SellingRateDescription || '' };
+        jobRateCache.set(jobId, rate);
+        return rate;
+    }
+
+    async function getRateUplifts(rateId) {
+        if (rateUpliftCache.has(rateId)) return rateUpliftCache.get(rateId);
+        var html = await jlFetch('/SellingRate/Detail/' + rateId, { credentials: 'same-origin' }, 'Selling rate');
+        function grab(key) { var m = html.match(new RegExp('"' + key + '"\\s*:\\s*(-?[0-9.]+)')); return m ? parseFloat(m[1]) : null; }
+        var uplifts = { material: grab('MaterialUplift'), subcontractor: grab('SubcontractorUplift') };
+        rateUpliftCache.set(rateId, uplifts);
+        return uplifts;
+    }
+
+    // Returns { cost, sell, uplift, rateName, note } or throws.
+    async function estimateSellImpact(po, job, spo) {
+        var out = await getOutstandingPOCost(po.id, spo);
+        var jobId = po.jobId || job.id;
+        var rate = jobId ? await getJobSellingRate(jobId) : { rateId: null, rateName: '' };
+        if (!rate.rateId) return { cost: out.cost, sell: null, uplift: null, rateName: '', lines: out.count };
+        var uplifts = await getRateUplifts(rate.rateId);
+        var uplift = spo ? uplifts.subcontractor : uplifts.material;
+        if (uplift == null) return { cost: out.cost, sell: null, uplift: null, rateName: rate.rateName, lines: out.count };
+        return { cost: out.cost, sell: Math.round(out.cost * (1 + uplift / 100) * 100) / 100, uplift: uplift, rateName: rate.rateName, lines: out.count };
+    }
+
     // --- MAIN PROCESS ---
 
     async function startProcess() {
@@ -553,12 +655,15 @@
         var dryRun = document.getElementById('jl-autodeliver-dryrun').checked;
         var spo = isSubcontractorPage();
         var doneLabel = spo ? 'Completed' : 'Fully Delivered';
+        var showImpact = document.getElementById('jl-autodeliver-sell-impact').checked;
         var skipPartial = document.getElementById('jl-autodeliver-skip-partial').checked;
         jobStatusCache = new Map();
         lastRequestAt = 0;
         currentInterval = MIN_REQUEST_INTERVAL;
         wafBlocks = 0;
         cacheSaves = 0;
+        jobRateCache = new Map();
+        rateUpliftCache = new Map();
 
         log('Auto-Deliver POs v' + SCRIPT_VERSION, '#888');
         log(dryRun ? 'DRY RUN MODE - No changes will be made' : 'LIVE MODE - POs will be marked as delivered!', dryRun ? '#ff0' : '#f55');
@@ -597,6 +702,7 @@
             var skippedJobOpen = 0;
             var skippedNoJob = 0;
             var errors = 0;
+            var impactCost = 0, impactSell = 0, impactUnknown = 0, impactInvoicedSell = 0, impactInvoicedJobs = 0;
 
             for (var i = 0; i < targetPOs.length; i++) {
                 if (!running) { log('Stopped by user.', '#f55'); break; }
@@ -631,6 +737,31 @@
 
                     log('PO ' + po.id.substring(0, 8) + '... -> ' + po.jobNo + ' [' + job.statusDescription + '] - ' + (spo ? 'completion' : 'delivery') + ': ' + po.rawStatus, '#aaf');
 
+                    // Must run before delivering - afterwards the lines are no longer outstanding.
+                    if (showImpact) {
+                        try {
+                            var imp = await estimateSellImpact(po, job, spo);
+                            var verb = dryRun ? 'would add' : 'adds';
+                            impactCost += imp.cost;
+                            if (imp.sell == null) {
+                                impactUnknown++;
+                                log('  Job sell ' + verb + ' ? - cost ' + fmtMoney(imp.cost) + (imp.rateName ? ', no ' + (spo ? 'subcontractor' : 'material') + ' uplift on rate "' + imp.rateName + '"' : ', job has no selling rate'), '#fa0');
+                            } else {
+                                impactSell += imp.sell;
+                                log('  Job sell ' + verb + ' ' + fmtMoney(imp.sell) + ' (cost ' + fmtMoney(imp.cost) + ' + ' + imp.uplift + '% ' + (spo ? 'subcontractor' : 'material') + ' uplift, rate "' + imp.rateName + '")', imp.sell > 0 ? '#ffd27f' : '#888');
+                            }
+                            if (job.statusDescription.includes('invoiced') && imp.cost > 0) {
+                                impactInvoicedJobs++;
+                                impactInvoicedSell += imp.sell || 0;
+                                log('  ⚠ Job is already invoiced - this sell will sit uninvoiced on the job', '#f90');
+                            }
+                        } catch (e) {
+                            if (e.message === 'stopped') throw e;
+                            log('  Could not estimate sell impact: ' + e.message, '#fa0');
+                            impactUnknown++;
+                        }
+                    }
+
                     if (!dryRun) {
                         try {
                             if (spo) await markSPOCompleted(po.id, token);
@@ -663,6 +794,11 @@
             log('POs skipped (job still open): ' + skippedJobOpen, '#888');
             log('POs skipped (no job/not found): ' + skippedNoJob, '#888');
             log('Errors: ' + errors, errors > 0 ? '#f55' : '#0fa');
+            if (showImpact) {
+                log('Job cost ' + (dryRun ? 'that would be ' : '') + 'added: ' + fmtMoney(impactCost), '#ffd27f');
+                log('Job sell ' + (dryRun ? 'that would be ' : '') + 'added (est.): ' + fmtMoney(impactSell) + (impactUnknown ? '  (+ ' + impactUnknown + ' PO(s) with unknown uplift)' : ''), '#ffd27f');
+                if (impactInvoicedJobs) log('  of which on already-invoiced jobs: ' + fmtMoney(impactInvoicedSell) + ' across ' + impactInvoicedJobs + ' PO(s)', '#f90');
+            }
             log('Job lookups saved by cache: ' + cacheSaves, '#888');
             log('Gateway rate-limit blocks absorbed by retry: ' + wafBlocks + (wafBlocks ? ' (final pacing ' + currentInterval + 'ms)' : ''), wafBlocks ? '#fa0' : '#0fa');
             if (dryRun) log('(Dry run - no actual changes were made)', '#ff0');
