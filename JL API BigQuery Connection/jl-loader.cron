@@ -69,3 +69,11 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 
 # Job costs (per-job cost/sell): daily incr 02:30, after the nightly jobs full. Added 2026-08-25.
 30 2 * * * root /opt/jl-loader/jl-run.sh job_costs-incr /opt/jl-loader/run_job_costs.sh incr
+
+# Job + engineer notes -> raw.notes (models.notes -> Engineer_Notes). Added 2026-10-07: raw.notes was a
+# one-off load on 2026-07-14 and never scheduled, so engineer notes froze at 16 Jul for ~3 months.
+# Re-fetches every job updated / with a visit started in the window and replaces its notes. ~3 API
+# calls per job at 0.72s: the 3-day window is ~1h. 22:00 sits clear of the */3 :20-:55 blocks and the
+# weekday 07-19 jobs cron. Sunday widens to 14 days to catch late edits on older visits.
+0 22 * * 1-6 root flock -n /tmp/jl_notes.lock /opt/jl-loader/jl-run.sh notes-incr /opt/jl-loader/run_notes.sh 3
+0 22 * * 0   root flock -n /tmp/jl_notes.lock /opt/jl-loader/jl-run.sh notes-14d /opt/jl-loader/run_notes.sh 14
