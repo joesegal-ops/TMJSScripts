@@ -106,7 +106,8 @@ def call(path, body):
             log.warning("HTTP %s on %s (try %s/%s) wait %ss", r.status_code, path, attempt, MAX_RETRIES, wait)
             time.sleep(wait)
             continue
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {r.status_code} on {path} {json.dumps(body)}: {r.text[:300]}")
         return r.json()
     raise RuntimeError(f"{path} failed after {MAX_RETRIES} tries")
 

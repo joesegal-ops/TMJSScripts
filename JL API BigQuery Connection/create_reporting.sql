@@ -1,3 +1,4 @@
+-- Date-times are output in UK local time (DATETIME, "Europe/London") -- see TIMEZONES in create_models.sql.
 CREATE OR REPLACE VIEW `vmimporteddata.reporting.jobs` AS
 WITH job_notes AS (
   SELECT job_id,
@@ -52,19 +53,19 @@ SELECT
   ARRAY_LENGTH(j.Subcontractors) > 0      AS Subcontractor_Used,
   ARRAY_TO_STRING(j.Subcontractors, ", ") AS Subcontractor_Names,
   -- dates
-  j.DateLogged                AS Date_Logged,
-  j.AppointmentDate           AS Appointment_Date,
-  j.TargetAttendanceDate      AS Target_Attendance_Date,
-  j.TargetCompletetionDate    AS Target_Completion_Date,
-  j.DateJobAttended           AS Date_Attended,
-  j.DateComplete              AS Date_Complete,
+  DATETIME(j.DateLogged, "Europe/London")             AS Date_Logged,
+  DATETIME(j.AppointmentDate, "Europe/London")        AS Appointment_Date,
+  DATETIME(j.TargetAttendanceDate, "Europe/London")   AS Target_Attendance_Date,
+  DATETIME(j.TargetCompletetionDate, "Europe/London") AS Target_Completion_Date,
+  DATETIME(j.DateJobAttended, "Europe/London")        AS Date_Attended,
+  DATETIME(j.DateComplete, "Europe/London")           AS Date_Complete,
   -- derived status / timing (Closed = status only; completion date is not used)
   CASE WHEN j.JobStatusDescription IN ("Completed","Invoiced","Costed","Cancelled")
        THEN "Closed" ELSE "Open" END AS Open_Closed,
   (j.JobStatusDescription NOT IN ("Completed","Invoiced","Costed","Cancelled")) AS Is_Open,
-  DATE_DIFF(DATE(COALESCE(j.DateComplete, CURRENT_TIMESTAMP())), DATE(j.DateLogged), DAY) AS Age_Days,
+  DATE_DIFF(DATE(COALESCE(j.DateComplete, CURRENT_TIMESTAMP()), "Europe/London"), DATE(j.DateLogged, "Europe/London"), DAY) AS Age_Days,
   IF(j.JobStatusDescription NOT IN ("Completed","Invoiced","Costed","Cancelled"),
-     DATE_DIFF(CURRENT_DATE(), DATE(j.DateLogged), DAY), NULL) AS Open_Age_Days,
+     DATE_DIFF(CURRENT_DATE("Europe/London"), DATE(j.DateLogged, "Europe/London"), DAY), NULL) AS Open_Age_Days,
   IF(j.DateJobAttended IS NOT NULL, TIMESTAMP_DIFF(j.DateJobAttended, j.DateLogged, HOUR), NULL) AS Response_Hours,
   NULLIF(j.PriorityResponseTime, 0) AS SLA_Target_Response_Minutes,
   -- notes
@@ -169,12 +170,12 @@ SELECT
   qt.job_type, qt.job_category,                       -- from models.quote_tracking (the quote's own)
   r.CustomerName AS customer, r.SiteName AS site, r.OwnerName AS quote_owner,
   r.QuoteValueExcludingVat AS quote_value_excl_vat, r.QuoteValue AS quote_value_incl_vat,
-  DATE(r.quote_logged)  AS quote_logged_date,
-  r.approved_at, DATE(r.approved_at) AS approved_date,
+  DATE(r.quote_logged, "Europe/London") AS quote_logged_date,
+  DATETIME(r.approved_at, "Europe/London") AS approved_at, DATE(r.approved_at, "Europe/London") AS approved_date,
   r.ParentJobStringId AS original_job_number,
   r.job_number AS upgraded_job_number, r.job_id AS upgraded_job_id,
   r.job_status, r.job_type_on_job, r.job_category_on_job, r.job_owner, r.job_quoted_value,
-  r.job_completed, DATE(r.job_completed) AS completed_date,
+  DATETIME(r.job_completed, "Europe/London") AS job_completed, DATE(r.job_completed, "Europe/London") AS completed_date,
   r.job_completed IS NOT NULL AS is_complete,
   -- headline metric: approval -> completion. NULL while the job is still open.
   TIMESTAMP_DIFF(r.job_completed, r.approved_at, DAY)  AS days_approval_to_completion,

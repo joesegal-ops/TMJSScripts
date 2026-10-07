@@ -150,11 +150,11 @@ SELECT
   DATE_DIFF(b.Complete_Date, b.Approved_Date, DAY)                AS Days_Approved_To_Complete,
   DATE_DIFF(b.Complete_Date, b.Request_Date, DAY)                 AS Days_Request_To_Complete,
   -- Still open: how long it has been sitting unquoted / unapproved as of today.
-  IF(b.Quoted_Date   IS NULL, DATE_DIFF(CURRENT_DATE(), b.Request_Date, DAY), NULL)
+  IF(b.Quoted_Date   IS NULL, DATE_DIFF(CURRENT_DATE("Europe/London"), b.Request_Date, DAY), NULL)
                                                                   AS Days_Awaiting_Quote,
   IF(b.Quoted_Date IS NOT NULL AND b.Approved_Date IS NULL,
-     DATE_DIFF(CURRENT_DATE(), b.Quoted_Date, DAY), NULL)         AS Days_Awaiting_Approval,
-  b.Due_Date < CURRENT_DATE() AND b.Complete_Date IS NULL         AS Is_Overdue,
+     DATE_DIFF(CURRENT_DATE("Europe/London"), b.Quoted_Date, DAY), NULL)         AS Days_Awaiting_Approval,
+  b.Due_Date < CURRENT_DATE("Europe/London") AND b.Complete_Date IS NULL         AS Is_Overdue,
 
   -- ---------- the JobLogic original job ----------
   b.Job_Ref                                                       AS Job_Ref,

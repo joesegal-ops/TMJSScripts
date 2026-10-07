@@ -2,6 +2,8 @@
 -- only on sweden_raw tables. DEFERRED: notes/enriched, quote_types enrichment, job_costs/
 -- cost_line_items, invoices/PO/forms models, sla_analysis. all_in_job/quote_tracking/reporting.jobs
 -- are enrichment-stripped variants. Dependency order matters (all_in_job before avg_visits_per_job).
+-- TIMEZONES (2026-10-07): sweden_raw TIMESTAMPs are UTC; every date-time output here is converted to
+-- Swedish wall-clock time with DATETIME(x, "Europe/Stockholm") so Looker matches JobLogic.
 
 
 CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.customers` AS
@@ -14,9 +16,10 @@ FROM `vmimporteddata.sweden_raw.customers`;
 
 CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.all_jobs_report` AS
 SELECT
-  JobNumber AS Job_Number, Description AS Job_Description, DateLogged, JobOwner AS Job_Owner,
-  TargetAttendanceDate AS Target_AttendanceDate, AppointmentDate, TargetCompletetionDate AS Target_CompletionDate,
-  DateComplete AS CompletedDate, TypeDescription AS Job_Type, CategoryDescription AS Job_Category,
+  JobNumber AS Job_Number, Description AS Job_Description, DATETIME(DateLogged, "Europe/Stockholm") AS DateLogged, JobOwner AS Job_Owner,
+  DATETIME(TargetAttendanceDate, "Europe/Stockholm") AS Target_AttendanceDate, DATETIME(AppointmentDate, "Europe/Stockholm") AS AppointmentDate,
+  DATETIME(TargetCompletetionDate, "Europe/Stockholm") AS Target_CompletionDate,
+  DATETIME(DateComplete, "Europe/Stockholm") AS CompletedDate, TypeDescription AS Job_Type, CategoryDescription AS Job_Category,
   JobTrade AS Job_Trade, JobStatusDescription AS Job_Status, PriorityDescription AS Priority,
   OrderNumber AS Order_Number, Contact AS Job_Contact, CAST(Telephone AS STRING) AS Job_Telephone,
   EmailAddress AS Email_Address, CustomerName AS Customer, CustomerCustomReference AS Custom_Reference,
@@ -25,7 +28,7 @@ SELECT
   SiteAddress3 AS Site_Address_3, SiteAddress4 AS Site_Address_4, SitePostcode AS Site_Postcode,
   SiteCustomReference AS Site_Reference, Area, QuotedValue AS Quoted_Value, Tags AS Job_Tags,
   NoOfVisits AS No_Of_Visits, CustomerId AS Customer_Id, SiteId AS Site_id, Id AS Job_Auto_Id,
-  UpdatedAt, _ingested_at
+  DATETIME(UpdatedAt, "Europe/Stockholm") AS UpdatedAt, _ingested_at
 FROM `vmimporteddata.sweden_raw.jobs`;
 
 CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.job_and_visit_details` AS
@@ -33,9 +36,10 @@ SELECT
   j.CustomerName AS Customer, j.SiteName AS Site, j.Area AS Area, j.JobNumber AS ID,
   j.Description AS Job_Description, j.JobStatusDescription AS Job_Status, j.OrderNumber AS Order_Number,
   j.TypeDescription AS Task_Type, j.CategoryDescription AS Job_Category, j.JobTrade AS Trade,
-  j.DateLogged AS Date_Logged, j.TargetCompletetionDate AS Target_Completion_Date, j.DateComplete AS Date_Complete,
+  DATETIME(j.DateLogged, "Europe/Stockholm") AS Date_Logged, DATETIME(j.TargetCompletetionDate, "Europe/Stockholm") AS Target_Completion_Date,
+  DATETIME(j.DateComplete, "Europe/Stockholm") AS Date_Complete,
   v.EngineerName AS Engineer, v.EngineerEmail AS Engineer_Email, st.Active AS Engineer_Active,
-  v.StartDate AS VisitDateTime, v.EndDate AS VisitEndDateTime, v.StatusDescription AS Visit_Status,
+  DATETIME(v.StartDate, "Europe/Stockholm") AS VisitDateTime, DATETIME(v.EndDate, "Europe/Stockholm") AS VisitEndDateTime, v.StatusDescription AS Visit_Status,
   j.VisitRevisitReason AS Revisit_Reason, j.SiteId AS Site_id, j.Id AS Job_Auto_Id, v.VisitId AS Visit_Id,
   j.NoOfVisits AS No_Of_Visits, j.HasMoreThanThreeVisits AS Visits_Capped_At_3,
   ROW_NUMBER() OVER (PARTITION BY j.Id ORDER BY v.StartDate) AS Visit_Order, j._ingested_at
@@ -59,6 +63,17 @@ SELECT
     EquipmentClass, ExternalProjectNumber, ImportedEndDate, ImportedStartDate, JobSpendLimit, JobTempSite,
     ProjectColor, ProjectMilestoneDate, ProjectMilestoneId, ProjectMilestoneName, ReportedFaultCode,
     ReportedSubFaultCode, SitePreferredEngineerName, SiteTypeDescription, SiteTypeId
+  ) REPLACE (
+    DATETIME(j.AppointmentDate, "Europe/Stockholm")        AS AppointmentDate,
+    DATETIME(j.DateComplete, "Europe/Stockholm")           AS DateComplete,
+    DATETIME(j.DateJobAttended, "Europe/Stockholm")        AS DateJobAttended,
+    DATETIME(j.DateLogged, "Europe/Stockholm")             AS DateLogged,
+    DATETIME(j.TargetAttendanceDate, "Europe/Stockholm")   AS TargetAttendanceDate,
+    DATETIME(j.TargetCompletetionDate, "Europe/Stockholm") AS TargetCompletetionDate,
+    DATETIME(j.UpdatedAt, "Europe/Stockholm")              AS UpdatedAt,
+    ARRAY(SELECT AS STRUCT v.* REPLACE (DATETIME(v.StartDate, "Europe/Stockholm") AS StartDate,
+                                        DATETIME(v.EndDate, "Europe/Stockholm")   AS EndDate)
+          FROM UNNEST(j.VisitsStatus) v WITH OFFSET o ORDER BY o) AS VisitsStatus
   ),
   CASE
     WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory") THEN "Statutory"
@@ -72,7 +87,8 @@ SELECT
   j.JobNumber AS ID, j.SiteName AS Site, j.Area AS Area, j.SitePostcode AS Post_Code,
   CAST(j.Telephone AS STRING) AS Telephone, j.Contact AS Contact, j.Description AS Description,
   j.CustomerName AS Customer, j.OrderNumber AS Order_Number, j.JobStatusDescription AS Job_Status,
-  j.DateLogged AS Date_Logged, j.AppointmentDate AS Estimated_Appointment, j.DateComplete AS DateComplete,
+  DATETIME(j.DateLogged, "Europe/Stockholm") AS Date_Logged, DATETIME(j.AppointmentDate, "Europe/Stockholm") AS Estimated_Appointment,
+  DATETIME(j.DateComplete, "Europe/Stockholm") AS DateComplete,
   j.TypeDescription AS Job_Type, j.CategoryDescription AS Job_Category,
   IF(j.DateComplete IS NULL, "OPEN", "CLOSE") AS Open_Closed_Job, (j.DateComplete IS NULL) AS Is_Open,
   j.CustomerCustomReference AS Custom_Reference, j.ReportedFaultCode AS Reported_Fault_Code,
@@ -111,8 +127,8 @@ SELECT
   q.Id AS quote_id, q.QuoteNumber AS quote_number, q.Title AS title, q.Description AS description,
   CAST(NULL AS STRING) AS job_type, CAST(NULL AS STRING) AS job_type_code,
   CAST(NULL AS STRING) AS job_category, CAST(NULL AS STRING) AS job_category_code,
-  q.QuoteStatusDescription AS status, q.OwnerName AS owner, DATE(q.DateLogged) AS date_logged,
-  q.ApprovedDatetime AS approved_datetime, CAST(NULL AS DATE) AS date_rejected,
+  q.QuoteStatusDescription AS status, q.OwnerName AS owner, DATE(q.DateLogged, "Europe/Stockholm") AS date_logged,
+  DATETIME(q.ApprovedDatetime, "Europe/Stockholm") AS approved_datetime, CAST(NULL AS DATE) AS date_rejected,
   q.CustomerName AS customer, q.CustomerCustomReference AS customer_reference,
   q.SiteName AS site, q.SitePostcode AS site_postcode, q.Contact AS contact, q.EmailAddress AS email,
   q.QuoteValueExcludingVat AS value_excl_vat, q.QuoteValue AS value_incl_vat,
@@ -147,18 +163,18 @@ SELECT
   j.NoOfVisits                AS No_Of_Visits,
   ARRAY_LENGTH(j.Subcontractors) > 0      AS Subcontractor_Used,
   ARRAY_TO_STRING(j.Subcontractors, ", ") AS Subcontractor_Names,
-  j.DateLogged                AS Date_Logged,
-  j.AppointmentDate           AS Appointment_Date,
-  j.TargetAttendanceDate      AS Target_Attendance_Date,
-  j.TargetCompletetionDate    AS Target_Completion_Date,
-  j.DateJobAttended           AS Date_Attended,
-  j.DateComplete              AS Date_Complete,
+  DATETIME(j.DateLogged, "Europe/Stockholm")             AS Date_Logged,
+  DATETIME(j.AppointmentDate, "Europe/Stockholm")        AS Appointment_Date,
+  DATETIME(j.TargetAttendanceDate, "Europe/Stockholm")   AS Target_Attendance_Date,
+  DATETIME(j.TargetCompletetionDate, "Europe/Stockholm") AS Target_Completion_Date,
+  DATETIME(j.DateJobAttended, "Europe/Stockholm")        AS Date_Attended,
+  DATETIME(j.DateComplete, "Europe/Stockholm")           AS Date_Complete,
   CASE WHEN j.JobStatusDescription IN ("Completed","Invoiced","Costed","Cancelled")
        THEN "Closed" ELSE "Open" END AS Open_Closed,
   (j.JobStatusDescription NOT IN ("Completed","Invoiced","Costed","Cancelled")) AS Is_Open,
-  DATE_DIFF(DATE(COALESCE(j.DateComplete, CURRENT_TIMESTAMP())), DATE(j.DateLogged), DAY) AS Age_Days,
+  DATE_DIFF(DATE(COALESCE(j.DateComplete, CURRENT_TIMESTAMP()), "Europe/Stockholm"), DATE(j.DateLogged, "Europe/Stockholm"), DAY) AS Age_Days,
   IF(j.JobStatusDescription NOT IN ("Completed","Invoiced","Costed","Cancelled"),
-     DATE_DIFF(CURRENT_DATE(), DATE(j.DateLogged), DAY), NULL) AS Open_Age_Days,
+     DATE_DIFF(CURRENT_DATE("Europe/Stockholm"), DATE(j.DateLogged, "Europe/Stockholm"), DAY), NULL) AS Open_Age_Days,
   IF(j.DateJobAttended IS NOT NULL, TIMESTAMP_DIFF(j.DateJobAttended, j.DateLogged, HOUR), NULL) AS Response_Hours,
   NULLIF(j.PriorityResponseTime, 0) AS SLA_Target_Response_Minutes,
   j._ingested_at

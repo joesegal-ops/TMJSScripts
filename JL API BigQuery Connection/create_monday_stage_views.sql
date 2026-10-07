@@ -11,6 +11,8 @@
 -- moves happened earlier. Those rows carry Start_Is_Estimated / History_Is_Complete = FALSE.
 -- FILTER ON THEM before quoting an average, or the oldest projects will look like they sat in one
 -- stage since the day they were created.
+--
+-- Timestamps are output in UK local time (DATETIME, "Europe/London"); day counts use the raw UTC instants.
 
 CREATE OR REPLACE VIEW `vmimporteddata.models.monday_stage_history` AS
 WITH moves AS (
@@ -62,15 +64,15 @@ SELECT
   i.item_name                                                   AS Item,
   r.spell_no                                                    AS Spell_No,
   r.stage                                                       AS Stage,
-  r.entered_at                                                  AS Entered_At,
-  r.left_at                                                     AS Left_At,
+  DATETIME(r.entered_at, "Europe/London")                                   AS Entered_At,
+  DATETIME(r.left_at, "Europe/London")                                      AS Left_At,
   r.left_at IS NULL                                             AS Is_Current_Stage,
   ROUND(TIMESTAMP_DIFF(IFNULL(r.left_at, CURRENT_TIMESTAMP()), r.entered_at, HOUR) / 24.0, 2)
                                                                 AS Days_In_Stage,
   -- TRUE => entered_at is the item's creation date but the item predates our activity history,
   -- so earlier moves may have gone unrecorded and this dwell time is an UPPER BOUND.
   r.spell_no = 0 AND i.item_created_at < f.retention_floor      AS Start_Is_Estimated,
-  i.item_created_at                                             AS Item_Created_At,
+  DATETIME(i.item_created_at, "Europe/London")                              AS Item_Created_At,
   i.state                                                       AS Item_State,
   FORMAT("https://up-fm.monday.com/boards/%s/pulses/%s", r.board_id, r.item_id) AS Item_URL
 FROM spell_rows r
@@ -103,10 +105,10 @@ SELECT
   i.item_id                                                     AS Item_Id,
   i.item_name                                                   AS Item,
   i.group_title                                                 AS Current_Stage,
-  i.created_at                                                  AS Item_Created_At,
+  DATETIME(i.created_at, "Europe/London")                                   AS Item_Created_At,
   IFNULL(a.Stage_Changes, 0)                                    AS Stage_Changes,
-  a.First_Move_At,
-  a.Last_Move_At,
+  DATETIME(a.First_Move_At, "Europe/London")                                AS First_Move_At,
+  DATETIME(a.Last_Move_At, "Europe/London")                                 AS Last_Move_At,
   -- The headline: how long an item sat before anyone advanced it.
   -- Only meaningful when the item's whole life is inside our activity history.
   IF(i.created_at >= f.retention_floor,
@@ -115,11 +117,11 @@ SELECT
   ROUND(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(),
                        IFNULL(a.Last_Move_At, i.created_at), HOUR) / 24.0, 2)
                                                                 AS Days_In_Current_Stage,
-  IFNULL(a.Last_Move_At, i.created_at)                          AS Current_Stage_Entered_At,
+  DATETIME(IFNULL(a.Last_Move_At, i.created_at), "Europe/London")          AS Current_Stage_Entered_At,
   -- FALSE => the item predates our activity history; Stage_Changes and Days_To_First_Move
   -- are incomplete for it. Filter on this before averaging.
   i.created_at >= f.retention_floor                             AS History_Is_Complete,
-  f.retention_floor                                             AS Board_History_Starts,
+  DATETIME(f.retention_floor, "Europe/London")                              AS Board_History_Starts,
   i.state                                                       AS Item_State,
   FORMAT("https://up-fm.monday.com/boards/%s/pulses/%s", i.board_id, i.item_id) AS Item_URL
 FROM `vmimporteddata.raw.monday_items` i

@@ -1,6 +1,13 @@
 -- Recreates the models layer (dataset `models`) + UDF. Region-agnostic (refers by name),
 -- so it works whether raw/models are US or EU. sla_analysis reads an EU-local copy of the
 -- status audit (vmimporteddata.models.job_status_audit) instead of the cross-region US table.
+--
+-- TIMEZONES (2026-10-07): raw.* TIMESTAMPs are true UTC instants (JL midnight -> 23:00 UTC in BST).
+-- Every JL/Monday date-time these views OUTPUT is converted to UK wall-clock time with
+-- DATETIME(x, "Europe/London") under its original column name, so Looker matches what JobLogic shows.
+-- Day bucketing uses DATE(x, "Europe/London") / CURRENT_DATE("Europe/London"). Durations in hours or
+-- minutes are taken on the raw UTC TIMESTAMPs (exact across clock changes). _ingested_at stays UTC.
+-- A view that reads another models/reporting view gets local DATETIMEs already: don't convert twice.
 
 CREATE OR REPLACE FUNCTION `vmimporteddata.models.business_hours_elapsed`(start_dt DATETIME, end_dt DATETIME)
 RETURNS FLOAT64 AS (
@@ -33,9 +40,9 @@ SELECT
   qt.job_type_code AS job_type_code,
   COALESCE(jcm.description, qt.job_category_code) AS job_category,
   qt.job_category_code AS job_category_code,
-  q.QuoteStatusDescription AS status, q.OwnerName AS owner, DATE(q.DateLogged) AS date_logged,
-  q.ApprovedDatetime AS approved_datetime,
-  DATE(rj.date_rejected) AS date_rejected,
+  q.QuoteStatusDescription AS status, q.OwnerName AS owner, DATE(q.DateLogged, "Europe/London") AS date_logged,
+  DATETIME(q.ApprovedDatetime, "Europe/London") AS approved_datetime,
+  DATE(rj.date_rejected, "Europe/London") AS date_rejected,
   q.CustomerName AS customer, q.CustomerCustomReference AS customer_reference,
   q.SiteName AS site, q.SitePostcode AS site_postcode, q.Contact AS contact, q.EmailAddress AS email,
   q.QuoteValueExcludingVat AS value_excl_vat, q.QuoteValue AS value_incl_vat,
@@ -48,23 +55,23 @@ LEFT JOIN `vmimporteddata.raw.job_category_map`  jcm ON jcm.code = qt.job_catego
 LEFT JOIN rejected rj ON rj.quote_id = q.Id;
 
 CREATE OR REPLACE VIEW `vmimporteddata.models.purchase_orders` AS
-SELECT Id AS po_id, PONumber AS po_number, Status AS status_id, DateRaised AS date_raised,
+SELECT Id AS po_id, PONumber AS po_number, Status AS status_id, DATETIME(DateRaised, "Europe/London") AS date_raised,
        SupplierId AS supplier_id, JobId AS job_id, AccountNumber AS account_number,
        CustomReference AS custom_reference, DeliveryName AS delivery_name,
-       DeliveryPostcode AS delivery_postcode, EstimatedDeliveryDate AS est_delivery_date,
+       DeliveryPostcode AS delivery_postcode, DATETIME(EstimatedDeliveryDate, "Europe/London") AS est_delivery_date,
        ARRAY_LENGTH(Lines) AS line_count, _ingested_at
 FROM `vmimporteddata.raw.purchase_orders`;
 
 CREATE OR REPLACE VIEW `vmimporteddata.models.purchase_order_lines` AS
-SELECT po.Id AS po_id, po.PONumber AS po_number, po.DateRaised AS date_raised, po.SupplierId AS supplier_id,
+SELECT po.Id AS po_id, po.PONumber AS po_number, DATETIME(po.DateRaised, "Europe/London") AS date_raised, po.SupplierId AS supplier_id,
        po.JobId AS job_id, l.Number AS line_number, l.Description AS description, l.Quantity AS quantity,
        l.PricePerUnit AS price_per_unit, l.TotalExcludingVat AS total_excl_vat, l.TotalVatAmount AS total_vat,
-       l.IsDelivered AS is_delivered, l.DateDelivered AS date_delivered, po._ingested_at
+       l.IsDelivered AS is_delivered, DATETIME(l.DateDelivered, "Europe/London") AS date_delivered, po._ingested_at
 FROM `vmimporteddata.raw.purchase_orders` po, UNNEST(po.Lines) AS l;
 
 CREATE OR REPLACE VIEW `vmimporteddata.models.invoices` AS
-SELECT InvoiceNumber AS invoice_number, Type AS invoice_type_id, DateRaised AS date_raised,
-  PaymentDueDate AS payment_due_date, CustomerName AS customer, CustomerId AS customer_id,
+SELECT InvoiceNumber AS invoice_number, Type AS invoice_type_id, DATETIME(DateRaised, "Europe/London") AS date_raised,
+  DATETIME(PaymentDueDate, "Europe/London") AS payment_due_date, CustomerName AS customer, CustomerId AS customer_id,
   SiteName AS site, SiteId AS site_id, JobNumber AS job_number, JobId AS job_id,
   OrderNumber AS order_number, AccountNumber AS account_number, Description AS description,
   JobDescription AS job_description, TotalExcludingVat AS total_excl_vat, TotalIncludingVat AS total_incl_vat,
@@ -75,7 +82,7 @@ FROM `vmimporteddata.raw.invoices`;
 
 CREATE OR REPLACE VIEW `vmimporteddata.models.forms_logbook` AS
 SELECT FormName AS form_name, FullFormName AS full_form_name, FormType AS form_type,
-  DateCreated AS date_created, Customer AS customer, CustomerId AS customer_id, Site AS site, SiteId AS site_id,
+  DATETIME(DateCreated, "Europe/London") AS date_created, Customer AS customer, CustomerId AS customer_id, Site AS site, SiteId AS site_id,
   Engineer AS engineer, JobNumber AS job_number, JobId AS job_id, AssetDescription AS asset,
   AssetNumber AS asset_number, VisitComplete AS visit_complete, IsGeneralForm AS is_general_form,
   IsDynamicForm AS is_dynamic_form, UniqueId AS form_uid, _ingested_at
@@ -103,22 +110,59 @@ SELECT
   f.job_number, f.job_id, f.form_name, f.form_created_at, f.engineer,
   COALESCE(q.CustomerName, f.customer) AS customer, COALESCE(q.SiteName, f.site) AS site,
   q.Id AS quote_id, q.QuoteNumber AS quote_number, q.QuoteStatusDescription AS quote_status,
-  q.OwnerName AS quote_owner, q.DateLogged AS quote_logged_at,
+  q.OwnerName AS quote_owner, DATETIME(q.DateLogged, "Europe/London") AS quote_logged_at,
   q.QuoteValueExcludingVat AS quote_value_excl_vat,
   q.Id IS NOT NULL
     AND ROW_NUMBER() OVER (PARTITION BY f.job_id ORDER BY q.DateLogged, q.Id) = 1 AS is_first_quote,
-  DATE_DIFF(DATE(q.DateLogged), DATE(f.form_created_at), DAY)                    AS days_form_to_quote_logged,
-  ROUND(DATETIME_DIFF(DATETIME(q.DateLogged), DATETIME(f.form_created_at), MINUTE) / 60, 1)
+  DATE_DIFF(DATE(q.DateLogged, "Europe/London"), DATE(f.form_created_at), DAY)  AS days_form_to_quote_logged,
+  ROUND(TIMESTAMP_DIFF(q.DateLogged, TIMESTAMP(f.form_created_at, "Europe/London"), MINUTE) / 60, 1)
                                                                                  AS hours_form_to_quote_logged,
-  IF(q.Id IS NULL, DATE_DIFF(CURRENT_DATE(), DATE(f.form_created_at), DAY), NULL) AS days_awaiting_quote
+  IF(q.Id IS NULL, DATE_DIFF(CURRENT_DATE("Europe/London"), DATE(f.form_created_at), DAY), NULL) AS days_awaiting_quote
 FROM rfq_form f
 LEFT JOIN quotes q ON q.ParentJobAutoId = f.job_id;
 
+-- RFQ form -> quote SENT. quote_sent_at = first status-CDC observation of a sent-or-later status, so it
+-- is only as precise as the daily snapshot; quotes already sent before the CDC seed day are excluded.
+-- (Was live-only; captured into this file 2026-10-07.)
+CREATE OR REPLACE VIEW `vmimporteddata.models.rfq_form_to_quote_sent` AS
+WITH rfq_form AS (
+  SELECT job_id, job_number, form_name, date_created AS form_created_at
+  FROM `vmimporteddata.models.forms_logbook`
+  WHERE job_id IS NOT NULL
+    AND LOWER(form_name) LIKE "%request for quotation%"   -- "0 HVAC ... - V5", "1 Request for Quotation - V3" etc.
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY date_created) = 1
+),
+seed AS (SELECT MIN(observed_at) AS seed_at FROM `vmimporteddata.raw.quote_status_events`),
+sent AS (
+  SELECT e.quote_id, MIN(e.observed_at) AS quote_sent_at
+  FROM `vmimporteddata.raw.quote_status_events` e, seed
+  WHERE e.new_status IN ("Quote Sent", "Approved", "Rejected", "Upgraded")   -- sent-or-later (not Outstanding/Expired)
+    AND DATE(e.observed_at, "Europe/London") > DATE(seed.seed_at, "Europe/London")
+  GROUP BY e.quote_id
+)
+SELECT
+  f.job_number, f.job_id, f.form_name, f.form_created_at,
+  q.Id AS quote_id, q.QuoteNumber AS quote_number, q.QuoteStatusDescription AS quote_status,
+  q.OwnerName AS quote_owner, q.CustomerName AS customer, q.SiteName AS site,
+  DATETIME(q.DateLogged, "Europe/London")       AS quote_logged_at,
+  DATETIME(s.quote_sent_at, "Europe/London")    AS quote_sent_at,
+  DATETIME(q.ApprovedDatetime, "Europe/London") AS quote_approved_at,
+  DATE_DIFF(DATE(q.DateLogged, "Europe/London"),    DATE(f.form_created_at), DAY) AS days_form_to_quote_logged,
+  DATE_DIFF(DATE(s.quote_sent_at, "Europe/London"), DATE(f.form_created_at), DAY) AS days_form_to_quote_sent,
+  IF(s.quote_sent_at IS NULL, DATE_DIFF(CURRENT_DATE("Europe/London"), DATE(f.form_created_at), DAY), NULL)
+                                                                   AS days_form_awaiting_sent
+FROM rfq_form f
+JOIN (SELECT * FROM `vmimporteddata.raw.quotes`
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
+  ON q.ParentJobAutoId = f.job_id
+LEFT JOIN sent s ON s.quote_id = q.Id;
+
 CREATE OR REPLACE VIEW `vmimporteddata.models.all_jobs_report` AS
 SELECT
-  JobNumber AS Job_Number, Description AS Job_Description, DateLogged, JobOwner AS Job_Owner,
-  TargetAttendanceDate AS Target_AttendanceDate, AppointmentDate, TargetCompletetionDate AS Target_CompletionDate,
-  DateComplete AS CompletedDate, TypeDescription AS Job_Type, CategoryDescription AS Job_Category,
+  JobNumber AS Job_Number, Description AS Job_Description, DATETIME(DateLogged, "Europe/London") AS DateLogged, JobOwner AS Job_Owner,
+  DATETIME(TargetAttendanceDate, "Europe/London") AS Target_AttendanceDate, DATETIME(AppointmentDate, "Europe/London") AS AppointmentDate,
+  DATETIME(TargetCompletetionDate, "Europe/London") AS Target_CompletionDate,
+  DATETIME(DateComplete, "Europe/London") AS CompletedDate, TypeDescription AS Job_Type, CategoryDescription AS Job_Category,
   JobTrade AS Job_Trade, JobStatusDescription AS Job_Status, PriorityDescription AS Priority,
   OrderNumber AS Order_Number, Contact AS Job_Contact, CAST(Telephone AS STRING) AS Job_Telephone,
   EmailAddress AS Email_Address, CustomerName AS Customer, CustomerCustomReference AS Custom_Reference,
@@ -127,7 +171,7 @@ SELECT
   SiteAddress3 AS Site_Address_3, SiteAddress4 AS Site_Address_4, SitePostcode AS Site_Postcode,
   SiteCustomReference AS Site_Reference, Area, QuotedValue AS Quoted_Value, Tags AS Job_Tags,
   NoOfVisits AS No_Of_Visits, CustomerId AS Customer_Id, SiteId AS Site_id, Id AS Job_Auto_Id,
-  UpdatedAt, _ingested_at
+  DATETIME(UpdatedAt, "Europe/London") AS UpdatedAt, _ingested_at
 FROM `vmimporteddata.raw.jobs`;
 
 CREATE OR REPLACE VIEW `vmimporteddata.models.job_and_visit_details` AS
@@ -135,9 +179,10 @@ SELECT
   j.CustomerName AS Customer, j.SiteName AS Site, j.Area AS Area, j.JobNumber AS ID,
   j.Description AS Job_Description, j.JobStatusDescription AS Job_Status, j.OrderNumber AS Order_Number,
   j.TypeDescription AS Task_Type, j.CategoryDescription AS Job_Category, j.JobTrade AS Trade,
-  j.DateLogged AS Date_Logged, j.TargetCompletetionDate AS Target_Completion_Date, j.DateComplete AS Date_Complete,
+  DATETIME(j.DateLogged, "Europe/London") AS Date_Logged, DATETIME(j.TargetCompletetionDate, "Europe/London") AS Target_Completion_Date,
+  DATETIME(j.DateComplete, "Europe/London") AS Date_Complete,
   v.EngineerName AS Engineer, v.EngineerEmail AS Engineer_Email, st.Active AS Engineer_Active,
-  v.StartDate AS VisitDateTime, v.EndDate AS VisitEndDateTime, v.StatusDescription AS Visit_Status,
+  DATETIME(v.StartDate, "Europe/London") AS VisitDateTime, DATETIME(v.EndDate, "Europe/London") AS VisitEndDateTime, v.StatusDescription AS Visit_Status,
   j.VisitRevisitReason AS Revisit_Reason, j.SiteId AS Site_id, j.Id AS Job_Auto_Id, v.VisitId AS Visit_Id,
   j.NoOfVisits AS No_Of_Visits, j.HasMoreThanThreeVisits AS Visits_Capped_At_3,
   ROW_NUMBER() OVER (PARTITION BY j.Id ORDER BY v.StartDate) AS Visit_Order, j._ingested_at
@@ -156,7 +201,7 @@ SELECT
   n._VisitId       AS visit_id,
   n.NoteText       AS note_text,
   n.Author         AS author,
-  n.DateAdded      AS date_added,
+  DATETIME(n.DateAdded, "Europe/London") AS date_added,
   n.NoteVisibility AS visibility,
   j.JobNumber      AS job_number,
   j.CustomerName   AS customer,
@@ -231,9 +276,9 @@ SELECT
   j.CustomerName              AS Customer,
   j.OrderNumber               AS Order_Number,
   j.JobStatusDescription      AS Job_Status,
-  j.DateLogged                AS Date_Logged,
-  j.AppointmentDate           AS Estimated_Appointment,
-  j.DateComplete              AS DateComplete,
+  DATETIME(j.DateLogged, "Europe/London")      AS Date_Logged,
+  DATETIME(j.AppointmentDate, "Europe/London") AS Estimated_Appointment,
+  DATETIME(j.DateComplete, "Europe/London")    AS DateComplete,
   j.TypeDescription           AS Job_Type,
   j.CategoryDescription       AS Job_Category,
   IF(j.DateComplete IS NULL, "OPEN", "CLOSE") AS Open_Closed_Job,
@@ -299,11 +344,11 @@ SELECT
   TRIM(spo.SubContractorName)            AS Subcontractor_Name,
   spo.Status                             AS Status,
   j.PriorityDescription                  AS Subcontractor_Priority,
-  spo.DateRaised                         AS DateAllocated,          -- PO raised date (proxy for allocation)
+  DATETIME(spo.DateRaised, "Europe/London")          AS DateAllocated,          -- PO raised date (proxy for allocation)
   CAST(NULL AS STRING)                   AS Allocated_By,           -- needs JobSubcontractor (per-job)
   (j.TypeDescription = "Maintenance")    AS PPM_Allocation,
-  j.AppointmentDate                      AS Preferred_Appointment,
-  j.TargetCompletetionDate               AS Target_Completion,
+  DATETIME(j.AppointmentDate, "Europe/London")       AS Preferred_Appointment,
+  DATETIME(j.TargetCompletetionDate, "Europe/London") AS Target_Completion,
   j.Description                          AS Work_Description,
   CAST(NULL AS STRING)                   AS Work_Instructions,      -- needs JobSubcontractor (per-job)
   CAST(NULL AS NUMERIC)                  AS Total_Estimated_Value,  -- needs SubcontractorPO line items
@@ -320,9 +365,9 @@ WITH first_visits AS (
   SELECT
     j.Job_Number AS ID, j.Site, j.Priority,
     j.DateLogged AS Date_Logged, j.CompletedDate AS DateComplete,
-    MIN(DATETIME(v.VisitDateTime)) AS First_Visit,
-    COALESCE(MIN(DATETIME(v.VisitDateTime)),
-             IF(j.CompletedDate IS NULL, CURRENT_DATETIME(), DATETIME(j.CompletedDate))) AS Effective_End,
+    MIN(v.VisitDateTime) AS First_Visit,
+    COALESCE(MIN(v.VisitDateTime),
+             IF(j.CompletedDate IS NULL, CURRENT_DATETIME("Europe/London"), j.CompletedDate)) AS Effective_End,
     CASE
       WHEN j.Priority LIKE "%P1%" OR j.Priority LIKE "%Emergency%" THEN 2
       WHEN j.Priority LIKE "%24-hour%" OR j.Priority LIKE "%P3%" THEN 24
@@ -346,7 +391,7 @@ pause_hours AS (
   SELECT st.Job_ID,
     SUM(GREATEST(0, DATETIME_DIFF(
       LEAST(COALESCE(st.period_end, fv.Effective_End), fv.Effective_End),
-      GREATEST(st.period_start, DATETIME(fv.Date_Logged)), HOUR))) AS total_pause_hours
+      GREATEST(st.period_start, fv.Date_Logged), HOUR))) AS total_pause_hours
   FROM status_timeline st
   INNER JOIN first_visits fv ON st.Job_ID = fv.ID
   WHERE st.New_Job_Status IN ("Waiting on Submitter","Waiting on External Party","Waiting on Approval",
@@ -360,8 +405,8 @@ with_hours AS (
       CASE
         WHEN fv.Priority LIKE "%P1%" OR fv.Priority LIKE "%P2%" OR fv.Priority LIKE "%Emergency%"
              OR (fv.Priority LIKE "%4-hour%" AND fv.Priority NOT LIKE "%24-hour%")
-        THEN CAST(DATETIME_DIFF(fv.Effective_End, DATETIME(fv.Date_Logged), HOUR) AS FLOAT64)
-        ELSE `vmimporteddata.models.business_hours_elapsed`(DATETIME(fv.Date_Logged), fv.Effective_End)
+        THEN CAST(DATETIME_DIFF(fv.Effective_End, fv.Date_Logged, HOUR) AS FLOAT64)
+        ELSE `vmimporteddata.models.business_hours_elapsed`(fv.Date_Logged, fv.Effective_End)
       END - COALESCE(p.total_pause_hours, 0)
     ) AS Hours_to_Visit
   FROM first_visits fv LEFT JOIN pause_hours p ON fv.ID = p.Job_ID
@@ -388,6 +433,19 @@ SELECT
     EquipmentClass, ExternalProjectNumber, ImportedEndDate, ImportedStartDate, JobSpendLimit, JobTempSite,
     ProjectColor, ProjectMilestoneDate, ProjectMilestoneId, ProjectMilestoneName, ReportedFaultCode,
     ReportedSubFaultCode, SitePreferredEngineerName, SiteTypeDescription, SiteTypeId
+  ) REPLACE (
+    DATETIME(j.AppointmentDate, "Europe/London")        AS AppointmentDate,
+    DATETIME(j.ApprovedDate, "Europe/London")           AS ApprovedDate,
+    DATETIME(j.DateComplete, "Europe/London")           AS DateComplete,
+    DATETIME(j.DateJobAttended, "Europe/London")        AS DateJobAttended,
+    DATETIME(j.DateLogged, "Europe/London")             AS DateLogged,
+    DATETIME(j.NextContactDate, "Europe/London")        AS NextContactDate,
+    DATETIME(j.TargetAttendanceDate, "Europe/London")   AS TargetAttendanceDate,
+    DATETIME(j.TargetCompletetionDate, "Europe/London") AS TargetCompletetionDate,
+    DATETIME(j.UpdatedAt, "Europe/London")              AS UpdatedAt,
+    ARRAY(SELECT AS STRUCT v.* REPLACE (DATETIME(v.StartDate, "Europe/London") AS StartDate,
+                                        DATETIME(v.EndDate, "Europe/London")   AS EndDate)
+          FROM UNNEST(j.VisitsStatus) v WITH OFFSET o ORDER BY o) AS VisitsStatus
   ),
   CASE
     WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory") THEN "Statutory"
@@ -410,8 +468,8 @@ SELECT
   i.Id                       AS Invoice_Id,
   i.Type                     AS Invoice_Type_Id,
   (i.PPMContractId IS NOT NULL) AS Is_PPM_Invoice,
-  i.DateRaised               AS Invoice_Date,
-  i.PaymentDueDate           AS Payment_Due_Date,
+  DATETIME(i.DateRaised, "Europe/London")     AS Invoice_Date,
+  DATETIME(i.PaymentDueDate, "Europe/London") AS Payment_Due_Date,
   i.CustomerName             AS Customer,
   i.CustomerId               AS Customer_Id,
   i.SiteName                 AS Site,
@@ -502,7 +560,7 @@ SELECT
   SAFE_CAST(JSON_VALUE(e.line, "$.Id") AS INT64)                     AS line_id,
   JSON_VALUE(e.line, "$.Description")                                AS description,
   SAFE_CAST(JSON_VALUE(e.line, "$.Quantity") AS FLOAT64)             AS quantity,
-  SAFE.PARSE_DATETIME("%Y-%m-%dT%H:%M:%S", JSON_VALUE(e.line, "$.DateIncurred")) AS date_incurred,
+  DATETIME(SAFE.PARSE_TIMESTAMP("%Y-%m-%dT%H:%M:%S", JSON_VALUE(e.line, "$.DateIncurred")), "Europe/London") AS date_incurred,
   SAFE_CAST(JSON_VALUE(e.line, "$.TotalCostExcludingVat") AS FLOAT64) AS cost_excl_vat,
   SAFE_CAST(JSON_VALUE(e.line, "$.TotalSellExcludingVat") AS FLOAT64) AS sell_excl_vat,
   (JSON_VALUE(e.line, "$.HasBeenInvoiced") = "true")                 AS has_been_invoiced,
@@ -543,7 +601,7 @@ WITH incl AS (
 inv AS (  -- invoiced-to-date per job (ex VAT), for the quote-billed branch
   SELECT JobNumber              AS job_number,
          SUM(TotalExcludingVat) AS invoiced_net,
-         MAX(DATE(DateRaised))  AS last_invoiced
+         MAX(DATE(DateRaised, "Europe/London")) AS last_invoiced
   FROM `vmimporteddata.raw.invoices`
   WHERE JobNumber IS NOT NULL
   GROUP BY JobNumber
@@ -567,7 +625,7 @@ SELECT
   incl.total_sell               AS Total_Sell_Exc_Vat,
   j.OrderNumber                 AS Customer_Order_Number,
   j.Description                 AS Job_Description,
-  j.DateComplete                AS Date_Complete,
+  DATETIME(j.DateComplete, "Europe/London") AS Date_Complete,
   j.TypeDescription             AS Job_Type,
   (SELECT v.EngineerName FROM UNNEST(j.VisitsStatus) v
      WHERE v.EngineerName IS NOT NULL ORDER BY v.StartDate DESC LIMIT 1) AS Last_Engineer,
@@ -588,7 +646,7 @@ SELECT
   j.QuotedValue - COALESCE(inv.invoiced_net, 0) AS Total_Sell_Exc_Vat,
   j.OrderNumber                                 AS Customer_Order_Number,
   j.Description                                 AS Job_Description,
-  j.DateComplete                                AS Date_Complete,
+  DATETIME(j.DateComplete, "Europe/London")                 AS Date_Complete,
   j.TypeDescription                             AS Job_Type,
   (SELECT v.EngineerName FROM UNNEST(j.VisitsStatus) v
      WHERE v.EngineerName IS NOT NULL ORDER BY v.StartDate DESC LIMIT 1) AS Last_Engineer,

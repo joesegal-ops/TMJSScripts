@@ -9,6 +9,8 @@
 -- you want surfaced; look the column id up in `raw.monday_columns`.
 --
 --   bq --project_id=vmimporteddata query --use_legacy_sql=false < create_monday_views.sql
+--
+-- created_at / updated_at are output in UK local time (DATETIME, "Europe/London"); raw is UTC.
 
 -- ---------------------------------------------------------------- helpers
 
@@ -44,7 +46,7 @@ CREATE OR REPLACE VIEW `vmimporteddata.models.monday_item_values` AS
 SELECT
   i.board_id, i.board_name, i.item_id, i.item_name,
   i.group_title, i.state, i.parent_item_id,
-  i.created_at, i.updated_at,
+  DATETIME(i.created_at, "Europe/London") AS created_at, DATETIME(i.updated_at, "Europe/London") AS updated_at,
   cv.column_id, cv.title AS column_title, cv.type AS column_type,
   cv.text, cv.value,
   FORMAT('https://up-fm.monday.com/boards/%s/pulses/%s', i.board_id, i.item_id) AS item_url,
@@ -83,7 +85,7 @@ SELECT
   `vmimporteddata.models.monday_number`(column_values, 'numbers_mkmkrw8m') AS Cost_Est_exVAT,
   `vmimporteddata.models.monday_number`(column_values, 'numbers_mkmk43k6') AS Price_Est_exVAT,
   `vmimporteddata.models.monday_text`(column_values, 'long_text_mkxpzfx1') AS Notes_Private,
-  created_at, updated_at,
+  DATETIME(created_at, "Europe/London") AS created_at, DATETIME(updated_at, "Europe/London") AS updated_at,
   FORMAT('https://up-fm.monday.com/boards/%s/pulses/%s', board_id, item_id) AS item_url,
   _ingested_at
 FROM `vmimporteddata.raw.monday_items`
@@ -111,7 +113,7 @@ SELECT
   `vmimporteddata.models.monday_text`(column_values, 'people__1')          AS Support_PM,
   `vmimporteddata.models.monday_date`(column_values, 'date4')              AS Req_Due_Date,
   `vmimporteddata.models.monday_date`(column_values, 'date_mkmmk8jc')      AS Project_Inception,
-  created_at, updated_at,
+  DATETIME(created_at, "Europe/London") AS created_at, DATETIME(updated_at, "Europe/London") AS updated_at,
   FORMAT('https://up-fm.monday.com/boards/%s/pulses/%s', board_id, item_id) AS item_url,
   _ingested_at
 FROM `vmimporteddata.raw.monday_items`
@@ -146,7 +148,7 @@ SELECT
   SAFE_CAST(JSON_VALUE(`vmimporteddata.models.monday_value`(column_values, 'timeline__1'), '$.to')   AS DATE) AS Works_End,
   `vmimporteddata.models.monday_number`(column_values, 'numbers_mkmkrw8m') AS Cost_Est_exVAT,
   `vmimporteddata.models.monday_number`(column_values, 'numbers_mkmk43k6') AS Price_Est_exVAT,
-  created_at, updated_at,
+  DATETIME(created_at, "Europe/London") AS created_at, DATETIME(updated_at, "Europe/London") AS updated_at,
   FORMAT('https://up-fm.monday.com/boards/%s/pulses/%s', board_id, item_id) AS item_url,
   _ingested_at
 FROM `vmimporteddata.raw.monday_items`
@@ -174,7 +176,7 @@ SELECT
   `vmimporteddata.models.monday_text`(column_values, 'emailujhi0qha')      AS Contact_Email,
   `vmimporteddata.models.monday_text`(column_values, 'long_textgsrwymmp')  AS Additional_Information,
   `vmimporteddata.models.monday_text`(column_values, 'pulse_log_mky16syk') AS Date_Logged_Text,
-  created_at, updated_at,
+  DATETIME(created_at, "Europe/London") AS created_at, DATETIME(updated_at, "Europe/London") AS updated_at,
   FORMAT('https://up-fm.monday.com/boards/%s/pulses/%s', board_id, item_id) AS item_url,
   _ingested_at
 FROM `vmimporteddata.raw.monday_items`

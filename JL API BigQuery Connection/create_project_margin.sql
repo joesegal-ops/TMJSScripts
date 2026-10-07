@@ -49,7 +49,7 @@ inv AS (
   SELECT JobNumber AS job_number,
          SUM(TotalExcludingVat) AS invoiced,
          COUNT(*)               AS n_invoices,
-         MAX(DATE(DateRaised))  AS last_invoice_date
+         MAX(DATE(DateRaised, "Europe/London")) AS last_invoice_date
   FROM `vmimporteddata.raw.invoices`
   WHERE JobNumber IS NOT NULL AND JobNumber != ''
   GROUP BY JobNumber
@@ -70,8 +70,8 @@ SELECT
   qt.owner                                               AS Quote_Owner,
 
   -- ---------- dates (pick your month basis in Looker) ----------
-  DATE(qc.date_logged)                                   AS Quote_Date,
-  DATE(qc.approved_datetime)                             AS Approved_Date,
+  DATE(qc.date_logged, "Europe/London")                     AS Quote_Date,
+  DATE(qc.approved_datetime, "Europe/London")               AS Approved_Date,
   l.completed_date                                       AS Completed_Date,
   i.last_invoice_date                                    AS Last_Invoice_Date,
 
@@ -79,7 +79,7 @@ SELECT
   -- Time to quote, JobLogic's own clock: parent job raised -> quote raised. System-generated,
   -- so unlike Monday's PM-entered Request/Quoted pair it cannot be back-filled by hand.
   qc.parent_job_number                                   AS Parent_Job_Number,
-  DATE_DIFF(DATE(qc.date_logged), DATE(pj.Date_Logged), DAY)
+  DATE_DIFF(DATE(qc.date_logged, "Europe/London"), DATE(pj.Date_Logged), DAY)
                                                          AS Days_Job_To_Quote,
   -- Approval -> delivery. Depends on the INFERRED quote->job link; check Link_Confidence.
   l.days_approval_to_completion                          AS Days_Approval_To_Completion,

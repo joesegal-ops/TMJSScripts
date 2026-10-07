@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.15
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
+// @version      1.16
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -103,7 +103,7 @@
     // ===== end shared dock =====
 
     // Read from the metadata block so the on-screen version can never drift from @version.
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.15');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.16');
     const SCRIPT_ID = 'auto-deliver-pos';
     const SCRIPT_LABEL = '📦 Auto Deliver POs';
     const SCRIPT_COLOR = '#4c9f01';
@@ -562,6 +562,9 @@
     // cost x (1 + uplift), where uplift is the job's Selling Rate MaterialUplift (supplier
     // POs) or SubcontractorUplift (SPOs). Verified on RE0025984: SPO £20,000 cost ->
     // Subcontractor line 9.53% uplift, £21,906 sell, chargeable.
+    // Exception: a job with a QuotedValue (raised from a quote) is billed at the quote, so
+    // the line goes in non-chargeable - uplift -100%, sell £0, IsQuotedValue=true. Verified
+    // on PROJ0002522 / PROJ0002534. A "Non - Chargeable" selling rate also gives £0 sell.
     // It's an estimate: part-library sell prices or a manual edit can override the uplift.
 
     function parseMoney(v) {
@@ -617,7 +620,7 @@
         if (jobRateCache.has(jobId)) return jobRateCache.get(jobId);
         var html = await jlFetch('/Job/GetCosts?jobId=' + jobId + '&isReadOnly=False', { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } }, 'Job costs');
         var pm = extractJsObject(html, 'JobLinesPM') || {};
-        var rate = { rateId: pm.SellingRateId || null, rateName: pm.SellingRateDescription || '' };
+        var rate = { rateId: pm.SellingRateId || null, rateName: pm.SellingRateDescription || '', quotedValue: parseMoney(pm.QuotedValue) };
         jobRateCache.set(jobId, rate);
         return rate;
     }
@@ -635,7 +638,9 @@
     async function estimateSellImpact(po, job, spo) {
         var out = await getOutstandingPOCost(po.id, spo);
         var jobId = po.jobId || job.id;
-        var rate = jobId ? await getJobSellingRate(jobId) : { rateId: null, rateName: '' };
+        var rate = jobId ? await getJobSellingRate(jobId) : { rateId: null, rateName: '', quotedValue: 0 };
+        if (rate.quotedValue > 0) return { cost: out.cost, sell: 0, uplift: null, rateName: rate.rateName, lines: out.count, note: 'quoted job (' + fmtMoney(rate.quotedValue) + ') - goes in non-chargeable' };
+        if (/non\s*-?\s*chargeable/i.test(rate.rateName)) return { cost: out.cost, sell: 0, uplift: null, rateName: rate.rateName, lines: out.count, note: 'non-chargeable selling rate' };
         if (!rate.rateId) return { cost: out.cost, sell: null, uplift: null, rateName: '', lines: out.count };
         var uplifts = await getRateUplifts(rate.rateId);
         var uplift = spo ? uplifts.subcontractor : uplifts.material;
@@ -703,6 +708,7 @@
             var skippedNoJob = 0;
             var errors = 0;
             var impactCost = 0, impactSell = 0, impactUnknown = 0, impactInvoicedSell = 0, impactInvoicedJobs = 0;
+            var impactNonChargeable = 0, impactNonChargeableCost = 0;
 
             for (var i = 0; i < targetPOs.length; i++) {
                 if (!running) { log('Stopped by user.', '#f55'); break; }
@@ -743,14 +749,18 @@
                             var imp = await estimateSellImpact(po, job, spo);
                             var verb = dryRun ? 'would add' : 'adds';
                             impactCost += imp.cost;
-                            if (imp.sell == null) {
+                            if (imp.note) {
+                                impactNonChargeable++;
+                                impactNonChargeableCost += imp.cost;
+                                log('  Job sell ' + verb + ' £0.00 - cost ' + fmtMoney(imp.cost) + ', ' + imp.note, '#888');
+                            } else if (imp.sell == null) {
                                 impactUnknown++;
                                 log('  Job sell ' + verb + ' ? - cost ' + fmtMoney(imp.cost) + (imp.rateName ? ', no ' + (spo ? 'subcontractor' : 'material') + ' uplift on rate "' + imp.rateName + '"' : ', job has no selling rate'), '#fa0');
                             } else {
                                 impactSell += imp.sell;
                                 log('  Job sell ' + verb + ' ' + fmtMoney(imp.sell) + ' (cost ' + fmtMoney(imp.cost) + ' + ' + imp.uplift + '% ' + (spo ? 'subcontractor' : 'material') + ' uplift, rate "' + imp.rateName + '")', imp.sell > 0 ? '#ffd27f' : '#888');
                             }
-                            if (job.statusDescription.includes('invoiced') && imp.cost > 0) {
+                            if (job.statusDescription.includes('invoiced') && imp.sell !== 0 && imp.cost > 0) {
                                 impactInvoicedJobs++;
                                 impactInvoicedSell += imp.sell || 0;
                                 log('  ⚠ Job is already invoiced - this sell will sit uninvoiced on the job', '#f90');
@@ -797,6 +807,7 @@
             if (showImpact) {
                 log('Job cost ' + (dryRun ? 'that would be ' : '') + 'added: ' + fmtMoney(impactCost), '#ffd27f');
                 log('Job sell ' + (dryRun ? 'that would be ' : '') + 'added (est.): ' + fmtMoney(impactSell) + (impactUnknown ? '  (+ ' + impactUnknown + ' PO(s) with unknown uplift)' : ''), '#ffd27f');
+                if (impactNonChargeable) log('  ' + impactNonChargeable + ' PO(s) (cost ' + fmtMoney(impactNonChargeableCost) + ') go in non-chargeable - quoted jobs / non-chargeable rate, £0 sell', '#888');
                 if (impactInvoicedJobs) log('  of which on already-invoiced jobs: ' + fmtMoney(impactInvoicedSell) + ' across ' + impactInvoicedJobs + ' PO(s)', '#f90');
             }
             log('Job lookups saved by cache: ' + cacheSaves, '#888');
