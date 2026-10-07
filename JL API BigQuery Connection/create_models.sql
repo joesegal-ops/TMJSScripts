@@ -81,6 +81,44 @@ SELECT FormName AS form_name, FullFormName AS full_form_name, FormType AS form_t
   IsDynamicForm AS is_dynamic_form, UniqueId AS form_uid, _ingested_at
 FROM `vmimporteddata.raw.forms_logbook`;
 
+-- RFQ form -> quote sent turnaround. One row per quote raised on a job that carries an
+-- (HVAC) Request for Quotation form; form = earliest RFQ form on that job. Quote link is
+-- quotes.ParentJobAutoId = form job_id. The API has no sent timestamp, so quote_sent_at = first day the
+-- status CDC (raw.quote_status_events, daily) saw the quote in a sent-or-later status; later statuses
+-- count because a quote sent+approved within one day never shows as "sent" in a daily snapshot.
+-- The CDC seed batch (first run, ~2026-07-20) is excluded: those rows are first-seen, not transitions,
+-- so older quotes have NULL quote_sent_at. (2026-10-07)
+CREATE OR REPLACE VIEW `vmimporteddata.models.rfq_form_to_quote_sent` AS
+WITH rfq_form AS (
+  SELECT job_id, job_number, form_name, date_created AS form_created_at
+  FROM `vmimporteddata.models.forms_logbook`
+  WHERE job_id IS NOT NULL
+    AND LOWER(form_name) LIKE "%request for quotation%"   -- "0 HVAC ... - V5", "1 Request for Quotation - V3" etc.
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY date_created) = 1
+),
+seed AS (SELECT MIN(observed_at) AS seed_at FROM `vmimporteddata.raw.quote_status_events`),
+sent AS (
+  SELECT e.quote_id, MIN(e.observed_at) AS quote_sent_at
+  FROM `vmimporteddata.raw.quote_status_events` e, seed
+  WHERE e.new_status IN ("Quote Sent", "Approved", "Rejected", "Upgraded")   -- sent-or-later (not Outstanding/Expired)
+    AND DATE(e.observed_at) > DATE(seed.seed_at)
+  GROUP BY e.quote_id
+)
+SELECT
+  f.job_number, f.job_id, f.form_name, f.form_created_at,
+  q.Id AS quote_id, q.QuoteNumber AS quote_number, q.QuoteStatusDescription AS quote_status,
+  q.OwnerName AS quote_owner, q.CustomerName AS customer, q.SiteName AS site,
+  q.DateLogged AS quote_logged_at, s.quote_sent_at, q.ApprovedDatetime AS quote_approved_at,
+  DATE_DIFF(DATE(q.DateLogged),    DATE(f.form_created_at), DAY) AS days_form_to_quote_logged,
+  DATE_DIFF(DATE(s.quote_sent_at), DATE(f.form_created_at), DAY) AS days_form_to_quote_sent,
+  IF(s.quote_sent_at IS NULL, DATE_DIFF(CURRENT_DATE(), DATE(f.form_created_at), DAY), NULL)
+                                                                   AS days_form_awaiting_sent
+FROM rfq_form f
+JOIN (SELECT * FROM `vmimporteddata.raw.quotes`
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
+  ON q.ParentJobAutoId = f.job_id
+LEFT JOIN sent s ON s.quote_id = q.Id;
+
 CREATE OR REPLACE VIEW `vmimporteddata.models.all_jobs_report` AS
 SELECT
   JobNumber AS Job_Number, Description AS Job_Description, DateLogged, JobOwner AS Job_Owner,
