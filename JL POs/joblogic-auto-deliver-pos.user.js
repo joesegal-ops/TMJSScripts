@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.16
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
+// @version      1.17
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.17: optional Job/Action TSV - only process listed jobs, and set Non-Chargeable on SPO cost lines where asked; patient page loading (no longer stops at a slow page). v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -103,7 +103,7 @@
     // ===== end shared dock =====
 
     // Read from the metadata block so the on-screen version can never drift from @version.
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.16');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.17');
     const SCRIPT_ID = 'auto-deliver-pos';
     const SCRIPT_LABEL = '📦 Auto Deliver POs';
     const SCRIPT_COLOR = '#4c9f01';
@@ -220,6 +220,16 @@
         impactLabel.appendChild(impactCheck);
         impactLabel.appendChild(document.createTextNode(' Show job sell impact (slower)'));
         controlsDiv.appendChild(impactLabel);
+
+        const listLabel = document.createElement('div');
+        listLabel.style.cssText = 'margin-top:8px;font-size:11px;';
+        listLabel.textContent = 'Optional job list (paste TSV with header: Job, Action[, PO]). Action = Deliver or Non-Chargeable. When filled, ONLY these jobs are processed:';
+        const listArea = document.createElement('textarea');
+        listArea.id = 'jl-autodeliver-joblist';
+        listArea.placeholder = 'Job\tAction\nR0000095\tNon-Chargeable\nRE0012747\tDeliver';
+        listArea.style.cssText = 'width:100%;box-sizing:border-box;height:70px;margin-top:4px;background:#111;color:#eee;border:1px solid #444;border-radius:4px;font-family:monospace;font-size:11px;padding:4px;';
+        controlsDiv.appendChild(listLabel);
+        controlsDiv.appendChild(listArea);
 
         logArea = document.createElement('div');
         logArea.style.cssText = 'flex:1;overflow-y:auto;max-height:50vh;background:#111;padding:8px;border-radius:4px;white-space:pre-wrap;line-height:1.5;';
@@ -338,18 +348,27 @@
         var totalCount = paging.totalCount || 0;
         log('Found ' + totalCount + ' POs across ' + totalPages + ' pages', '#0af');
 
+        var skippedPages = [];
         for (var page = 1; page <= totalPages && running; page++) {
             setProgress('Collecting POs: page ' + page + '/' + totalPages + ' (' + allPOs.length + ' so far)');
 
-            if (page > 1) {
+            // Joblogic sometimes takes well over 5s to swap a page in. Re-click and poll
+            // up to 3 times (15s each) before giving up on the page - and then skip it
+            // rather than abandoning every page after it.
+            var loaded = page === 1;
+            for (var attempt = 0; !loaded && attempt < 3 && running; attempt++) {
+                if (attempt > 0) log('Page ' + page + ' slow to load - retry ' + attempt + '/2...', '#fa0');
                 paging.onPageClick(page);
-                var waited = 0;
-                while (waited < 5000) {
+                for (var waited = 0; waited < 15000 && running; waited += 500) {
                     await sleep(500);
-                    waited += 500;
                     var check = getPOsFromDOM();
-                    if (check.length > 0 && !seen[check[0].id]) break;
+                    if (check.length > 0 && !seen[check[0].id]) { loaded = true; break; }
                 }
+            }
+            if (!loaded) {
+                log('Page ' + page + '/' + totalPages + ': could not load - SKIPPED (its POs are not in this run)', '#f55');
+                skippedPages.push(page);
+                continue;
             }
 
             var pagePOs = getPOsFromDOM();
@@ -366,27 +385,8 @@
             });
 
             log('Page ' + page + '/' + totalPages + ': ' + newCount + ' rows, ' + allPOs.length + ' target POs so far');
-
-            if (newCount === 0 && page < totalPages) {
-                log('Retrying page ' + page + '...', '#fa0');
-                paging.onPageClick(page);
-                await sleep(3000);
-                pagePOs = getPOsFromDOM();
-                pagePOs.forEach(function (po) {
-                    if (!seen[po.id]) {
-                        seen[po.id] = true;
-                        newCount++;
-                        if (po.deliveryStatus === 'not delivered' || (!skipPartial && po.deliveryStatus === 'partially delivered')) {
-                            allPOs.push(po);
-                        }
-                    }
-                });
-                if (newCount === 0) {
-                    log('Still no new rows, stopping collection', '#888');
-                    break;
-                }
-            }
         }
+        if (skippedPages.length) log('WARNING: pages skipped because they would not load: ' + skippedPages.join(', ') + ' - re-run to pick them up', '#f55');
 
         paging.onPageClick(1);
         return allPOs;
@@ -648,6 +648,97 @@
         return { cost: out.cost, sell: Math.round(out.cost * (1 + uplift / 100) * 100) / 100, uplift: uplift, rateName: rate.rateName, lines: out.count };
     }
 
+    // --- JOB LIST (TSV) ---
+    // Header row required. Columns found by name: Job (required), Action (required),
+    // PO (optional - the 8-char id prefix from the sell-impact export, narrows to that PO).
+    // Action: anything containing "non" -> set Non-Chargeable; deliver/complete/chargeable/yes
+    // -> normal; skip/no/blank -> leave alone.
+    function parseJobList(text) {
+        var lines = String(text || '').split(/\r?\n/).filter(function (l) { return l.trim(); });
+        if (!lines.length) return null;
+        var head = lines[0].split('\t').map(function (h) { return h.trim().toLowerCase(); });
+        var jc = head.indexOf('job'), ac = head.indexOf('action'), pc = head.indexOf('po');
+        if (jc < 0 || ac < 0) throw new Error('Job list needs a header row with "Job" and "Action" columns (tab-separated)');
+        var entries = [], bad = [];
+        lines.slice(1).forEach(function (l, n) {
+            var c = l.split('\t');
+            var job = (c[jc] || '').trim().toUpperCase();
+            var a = (c[ac] || '').trim().toLowerCase();
+            if (!job) return;
+            var action = /non/.test(a) ? 'nonchg' : /deliver|complete|chargeable|yes|^y$|ok/.test(a) ? 'deliver' : /skip|^no$|^n$|^$/.test(a) ? 'skip' : null;
+            if (!action) { bad.push('row ' + (n + 2) + ' "' + a + '"'); return; }
+            entries.push({ job: job, action: action, po: pc >= 0 ? (c[pc] || '').trim().toLowerCase() : '' , matched: 0 });
+        });
+        return { entries: entries, bad: bad };
+    }
+
+    function findListEntry(list, po) {
+        var job = (po.jobNo || '').toUpperCase();
+        for (var i = 0; i < list.entries.length; i++) {
+            var e = list.entries[i];
+            if (e.job === job && (!e.po || po.id.toLowerCase().indexOf(e.po) === 0)) return e;
+        }
+        return null;
+    }
+
+    // --- SET SPO COST LINES NON-CHARGEABLE ---
+    // Same request the job Costs tab "Edit Subcontractor Cost" form sends when Chargeable
+    // type = Non-Chargeable. Body rebuilt from GetEditSubcontractorCostMetadata; verified
+    // field-for-field against the form's own payload on Test site job RE0025984. Only
+    // IsChargeable / PriceCalculationType / Uplift / SellPerHour differ from a plain save.
+    function parseJlDateTime(s) {
+        var m = String(s || '').match(/(\d+)\/(\d+)\/(\d+)\s+(\d+):(\d+)/);
+        return m ? new Date(+m[3], m[2] - 1, +m[1], +m[4], +m[5]) : null;
+    }
+
+    function buildSubcontractorCostBody(md) {
+        var a = parseJlDateTime(md.DateIncurred), e = parseJlDateTime(md.EndDate);
+        var mins = (a && e) ? Math.round((e - a) / 60000) : 60;
+        var f = function (n) { return (Number(n) || 0).toFixed(2); };
+        return {
+            Id: md.Id, CostPerUnit: '0.00', CostPerHour: f(md.CostPerHour), Uplift: '0.00', SellPerUnit: '0.00', SellPerHour: '0.00',
+            TaxCodeId: md.TaxCodeId, TaxCodeValue: md.TaxCodeValue, TaxCodeDescription: md.TaxCodeDescription,
+            IsChargeable: false, PriceCalculationType: '0',
+            Description: md.Description, CreatePayBandAllowed: md.CreatePayBandAllowed,
+            SubcontractorId: md.SubcontractorId, SubcontractorName: md.SubcontractorName,
+            Hours: Math.floor(mins / 60), Minutes: mins % 60, DateIncurred: md.DateIncurred, EndDate: md.EndDate,
+            HasQuote: md.HasQuote, ItemId: md.ItemId || 0, JobLineOption: 7,
+            QuotedValueTaxCodeId: md.QuotedValueTaxCodeId, QuotedValueTaxCodeDescription: md.QuotedValueTaxCodeDescription,
+            CurrencySymbol: md.CurrencySymbol, AssignType: md.AssignType, DepotId: null, StoreId: null, Discount: '0.00',
+            TagIds: md.TagIds || [], Status: 'Required', LimitedSORAccess: false, SellingRateId: null,
+            IsManuallyModified: null, ModifiedFields: null, JobId: md.JobId
+        };
+    }
+
+    async function getSPOLines(poId) {
+        var json = JSON.parse(await jlFetch('/SubContractorPO/GetLineItemsJson?purchaseOrderId=' + poId, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } }, 'SPO lines'));
+        return json.AdditionalData || [];
+    }
+
+    // Returns how many job cost lines were switched to Non-Chargeable.
+    async function setSPOLinesNonChargeable(poId, lineIds, token) {
+        var lines = (await getSPOLines(poId)).filter(function (l) { return lineIds.indexOf(l.Id) !== -1; });
+        var changed = 0;
+        for (var i = 0; i < lines.length; i++) {
+            var l = lines[i];
+            if (!l.JobLineId) throw new Error('SPO line "' + (l.Description || '').trim() + '" has no job cost line after completion');
+            var mdUrl = '/api/JobCost/GetEditSubcontractorCostMetadata?id=' + l.JobLineId + '&jobId=' + l.JobId;
+            var md = JSON.parse(await jlFetch(mdUrl, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } }, 'Cost line')).AdditionalData;
+            if (!md || md.Id !== l.JobLineId || md.JobId !== l.JobId) throw new Error('cost line ' + l.JobLineId + ' metadata did not match');
+            if (md.IsChargeable === false) continue; // already non-chargeable (e.g. quoted job)
+            var text = await jlFetch('/api/JobLine/SaveSubcontractorCost', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/json', '__RequestVerificationToken': token },
+                body: JSON.stringify(buildSubcontractorCostBody(md))
+            }, 'SaveSubcontractorCost');
+            var res = (function () { try { return JSON.parse(text); } catch (e) { return {}; } })();
+            if (res.success === false) throw new Error(res.Message || (res.errors || []).join(', ') || 'cost line save failed');
+            changed++;
+        }
+        return changed;
+    }
+
     // --- MAIN PROCESS ---
 
     async function startProcess() {
@@ -661,6 +752,9 @@
         var spo = isSubcontractorPage();
         var doneLabel = spo ? 'Completed' : 'Fully Delivered';
         var showImpact = document.getElementById('jl-autodeliver-sell-impact').checked;
+        var jobList = null;
+        try { jobList = parseJobList(document.getElementById('jl-autodeliver-joblist').value); }
+        catch (e) { log('ERROR: ' + e.message, '#f55'); running = false; startBtn.style.display = 'inline-block'; stopBtn.style.display = 'none'; return; }
         var skipPartial = document.getElementById('jl-autodeliver-skip-partial').checked;
         jobStatusCache = new Map();
         lastRequestAt = 0;
@@ -676,6 +770,13 @@
         log('Request pacing: 1 per ' + MIN_REQUEST_INTERVAL + 'ms (~' + Math.round(60000 / MIN_REQUEST_INTERVAL) + '/min) to stay under the gateway rate limit', '#888');
         log('Skip partially delivered: ' + skipPartial, '#888');
         log('Page: ' + (spo ? 'Subcontractor POs (will mark as Completed)' : 'Supplier POs (will mark as Fully Delivered)'), '#888');
+        if (jobList) {
+            var cnt = { deliver: 0, nonchg: 0, skip: 0 };
+            jobList.entries.forEach(function (e) { cnt[e.action]++; });
+            log('Job list: ' + jobList.entries.length + ' row(s) - ' + cnt.deliver + ' Deliver, ' + cnt.nonchg + ' Non-Chargeable, ' + cnt.skip + ' Skip. Only listed jobs will be processed.', '#0af');
+            if (jobList.bad.length) log('  Unrecognised Action values (ignored): ' + jobList.bad.join('; '), '#fa0');
+            if (cnt.nonchg && !spo) log('  Non-Chargeable is only supported on the Subcontractor PO page - those rows will be skipped here', '#fa0');
+        }
 
         var token = getCSRFToken();
         if (!token) {
@@ -701,6 +802,20 @@
                 return;
             }
 
+            if (jobList) {
+                var before = targetPOs.length;
+                targetPOs = targetPOs.filter(function (po) {
+                    var e = findListEntry(jobList, po);
+                    if (!e) return false;
+                    e.matched++;
+                    po.listAction = e.action;
+                    return e.action !== 'skip';
+                });
+                log('Job list matched ' + targetPOs.length + ' of ' + before + ' target POs', '#0af');
+                var unmatched = jobList.entries.filter(function (e) { return !e.matched && e.action !== 'skip'; });
+                if (unmatched.length) log('  Not found among outstanding POs (' + unmatched.length + '): ' + unmatched.map(function (e) { return e.job + (e.po ? '/' + e.po : ''); }).join(', '), '#fa0');
+            }
+
             // Step 2: Process each PO
             var processed = 0;
             var delivered = 0;
@@ -709,6 +824,7 @@
             var errors = 0;
             var impactCost = 0, impactSell = 0, impactUnknown = 0, impactInvoicedSell = 0, impactInvoicedJobs = 0;
             var impactNonChargeable = 0, impactNonChargeableCost = 0;
+            var nonChgSet = 0, nonChgPOs = 0;
 
             for (var i = 0; i < targetPOs.length; i++) {
                 if (!running) { log('Stopped by user.', '#f55'); break; }
@@ -741,12 +857,19 @@
                         continue;
                     }
 
-                    log('PO ' + po.id.substring(0, 8) + '... -> ' + po.jobNo + ' [' + job.statusDescription + '] - ' + (spo ? 'completion' : 'delivery') + ': ' + po.rawStatus, '#aaf');
+                    var wantNonChg = po.listAction === 'nonchg';
+                    if (wantNonChg && !spo) {
+                        log('PO -> ' + po.jobNo + ' - Non-Chargeable requested but only supported for subcontractor POs, skipping', '#fa0');
+                        continue;
+                    }
+
+                    log('PO ' + po.id.substring(0, 8) + '... -> ' + po.jobNo + ' [' + job.statusDescription + '] - ' + (spo ? 'completion' : 'delivery') + ': ' + po.rawStatus + (wantNonChg ? '  [list: Non-Chargeable]' : po.listAction ? '  [list: Deliver]' : ''), '#aaf');
 
                     // Must run before delivering - afterwards the lines are no longer outstanding.
                     if (showImpact) {
                         try {
                             var imp = await estimateSellImpact(po, job, spo);
+                            if (wantNonChg && !imp.note) imp = { cost: imp.cost, sell: 0, note: 'set Non-Chargeable from your job list' };
                             var verb = dryRun ? 'would add' : 'adds';
                             impactCost += imp.cost;
                             if (imp.note) {
@@ -774,16 +897,30 @@
 
                     if (!dryRun) {
                         try {
+                            // Remember which lines this completion covers, so only those get flipped.
+                            var outstandingIds = wantNonChg ? (await getSPOLines(po.id)).filter(function (l) { return l.IsRequired && !l.Completed; }).map(function (l) { return l.Id; }) : [];
                             if (spo) await markSPOCompleted(po.id, token);
                             else await markPODelivered(po.id, token);
                             log('  Marked as ' + doneLabel, '#0fa');
                             delivered++;
+                            if (wantNonChg) {
+                                try {
+                                    var n = await setSPOLinesNonChargeable(po.id, outstandingIds, token);
+                                    nonChgSet += n; nonChgPOs++;
+                                    log('  Set ' + n + ' job cost line(s) to Non-Chargeable' + (n < outstandingIds.length ? ' (' + (outstandingIds.length - n) + ' already non-chargeable)' : ''), '#0fa');
+                                } catch (e) {
+                                    if (e.message === 'stopped') throw e;
+                                    log('  ERROR setting Non-Chargeable (PO IS completed - fix the cost line by hand): ' + e.message, '#f55');
+                                    errors++;
+                                }
+                            }
                         } catch (e) {
                             log('  ERROR delivering: ' + e.message, '#f55');
                             errors++;
                         }
                     } else {
-                        log('  [DRY RUN] Would mark as ' + doneLabel, '#ff0');
+                        log('  [DRY RUN] Would mark as ' + doneLabel + (wantNonChg ? ' and set its job cost line(s) Non-Chargeable' : ''), '#ff0');
+                        if (wantNonChg) nonChgPOs++;
                         delivered++;
                     }
 
@@ -804,6 +941,7 @@
             log('POs skipped (job still open): ' + skippedJobOpen, '#888');
             log('POs skipped (no job/not found): ' + skippedNoJob, '#888');
             log('Errors: ' + errors, errors > 0 ? '#f55' : '#0fa');
+            if (jobList) log('POs ' + (dryRun ? 'that would be ' : '') + 'set Non-Chargeable from job list: ' + nonChgPOs + (dryRun ? '' : ' (' + nonChgSet + ' cost line(s) changed)'), '#0af');
             if (showImpact) {
                 log('Job cost ' + (dryRun ? 'that would be ' : '') + 'added: ' + fmtMoney(impactCost), '#ffd27f');
                 log('Job sell ' + (dryRun ? 'that would be ' : '') + 'added (est.): ' + fmtMoney(impactSell) + (impactUnknown ? '  (+ ' + impactUnknown + ' PO(s) with unknown uplift)' : ''), '#ffd27f');
