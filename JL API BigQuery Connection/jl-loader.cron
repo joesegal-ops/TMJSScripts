@@ -52,8 +52,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 0 9 * * 0   root flock -n /tmp/jl_quote_costs.lock /opt/jl-loader/jl-run.sh quote_costs-full /opt/jl-loader/run_quote_costs.sh full
 # Quote status CDC -> raw.quote_status_events (feeds date_rejected; no API field for it) - daily 03:10
 10 3 * * *   root /opt/jl-loader/jl-run.sh quote_cdc /opt/jl-loader/run_quote_cdc.sh
-# Reference/dimension data - daily 03:00
-0 3 * * * root /opt/jl-loader/jl-run.sh tier-customer /opt/jl-loader/run_tier.sh "Customer/GetAll:customers,Site/GetAll:sites,Staff/GetAll:staff,Supplier/GetAll:suppliers,Subcontractor/GetAll:subcontractors,Asset/GetAll:assets,Part/GetAll:parts,Expense/GetAll:expenses"
+# Reference/dimension data - daily 03:00 (ppm_contracts added 2026-10-08)
+0 3 * * * root /opt/jl-loader/jl-run.sh tier-customer /opt/jl-loader/run_tier.sh "Customer/GetAll:customers,Site/GetAll:sites,Staff/GetAll:staff,Supplier/GetAll:suppliers,Subcontractor/GetAll:subcontractors,Asset/GetAll:assets,Part/GetAll:parts,Expense/GetAll:expenses,PPMContract/GetAll:ppm_contracts"
 # Timesheets - daily 04:00 (full history, weekly-chunked)
 0 4 * * * root /opt/jl-loader/jl-run.sh tier-timesheet /opt/jl-loader/run_tier.sh "Timesheet/GetAll:timesheets"
 # Status audit sync US->EU daily 04:30 (feeds sla_analysis pause-hours; no API source)

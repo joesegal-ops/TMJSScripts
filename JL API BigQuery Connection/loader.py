@@ -79,6 +79,7 @@ DEFAULT_ENTITIES = [
     "FormsLogbook/getall:forms_logbook",
     "purchaseorder/getall:purchase_orders",
     "SubcontractorPurchaseOrder/GetAll:subcontractor_purchase_orders",
+    "PPMContract/GetAll:ppm_contracts",
 ]
 # Visit/GetAll is per-job (needs a job auto-id) -> handled by load_visits.py, not this list.
 # Timesheet/GetAll needs StartDate+EndDate in <=7-day windows (CHUNKED_WEEKLY, run explicitly).
@@ -89,6 +90,9 @@ ENTITIES = [e for e in env("JL_ENTITIES", ",".join(DEFAULT_ENTITIES)).split(",")
 PER_ENTITY_BODY = {
     "purchaseorder/getall": {"DateRaised": START_DATE},
     "SubcontractorPurchaseOrder/GetAll": {"StartDateRaised": START_DATE, "EndDateRaised": END_DATE},
+    # Ask for completed + cancelled contracts too (full history). NB no Tags field on this endpoint —
+    # contract tags (StatutoryPPM etc.) only exist in the web app; see raw.ppm_contract_tags.
+    "PPMContract/GetAll": {"IncludeCompleted": True, "IncludeCancelled": True},
     "Job/getall": {
         "IncludeReactiveJobs": True, "IncludePPMJobs": True, "IncludeInactive": True,
         "OnlyIncludePrimaryJobTrade": True, "IncludeTags": True, "IncludeContacts": True,

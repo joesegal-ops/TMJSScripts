@@ -425,7 +425,18 @@ FROM with_hours;
 -- (no exact "Critical" tag exists yet) but is future-proof. One row per job.
 -- NB the EXCEPT list is a point-in-time snapshot of all-empty columns; if a previously-empty column starts
 -- getting populated it will stay hidden until removed from this list (re-run the null-count check to refresh).
+-- Is_Subcontracted (2026-10-07): TRUE if a subcontractor is allocated on the job (raw.jobs.Subcontractors)
+-- OR the job has a non-cancelled subcontractor PO. Both are needed: ~650 jobs carry a subcontractor with
+-- no PO, and ~190 have a live PO but no subcontractor left on the job. Subcontractor_Names unions both.
 CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category` AS
+WITH spo AS (
+  SELECT JobNumber,
+         ARRAY_AGG(DISTINCT TRIM(SubContractorName) IGNORE NULLS) AS spo_names,
+         COUNT(DISTINCT PONumber)                                  AS spo_count
+  FROM `vmimporteddata.raw.subcontractor_purchase_orders`
+  WHERE JobNumber IS NOT NULL AND IFNULL(Status, "") != "Cancelled"
+  GROUP BY JobNumber
+)
 SELECT
   j.* EXCEPT (
     ActualFaultCode, ActualSubFaultCode, AssetFrequency, AttributeDescriptions, AxaAuthorisationCode,
@@ -451,14 +462,61 @@ SELECT
     WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory") THEN "Statutory"
     WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "critical")  THEN "Critical"
     ELSE "Non-Statutory"
-  END AS Statutory_Category
-FROM `vmimporteddata.raw.jobs` j;
+  END AS Statutory_Category,
+  (ARRAY_LENGTH(j.Subcontractors) > 0 OR spo.JobNumber IS NOT NULL) AS Is_Subcontracted,
+  (SELECT STRING_AGG(DISTINCT n, ", " ORDER BY n)
+     FROM UNNEST(ARRAY_CONCAT(IFNULL(j.Subcontractors, []), IFNULL(spo.spo_names, []))) n
+    WHERE TRIM(n) != "")                                             AS Subcontractor_Names,
+  IFNULL(spo.spo_count, 0)                                           AS Subcontractor_PO_Count
+FROM `vmimporteddata.raw.jobs` j
+LEFT JOIN spo ON spo.JobNumber = j.JobNumber;
 
 -- Neko Health UK Limited slice of job_statutory_category (for a Neko-specific report). (2026-07-22)
 CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category_neko` AS
 SELECT *
 FROM `vmimporteddata.models.job_statutory_category`
 WHERE CustomerName = "Neko Health UK Limited";
+
+-- v2 of job_statutory_category (2026-10-08). Same rows/columns as v1 (v1 left untouched), but Statutory_Category
+-- also looks at the PPM CONTRACT's tags and the job Description, because PPM jobs usually carry no job tags —
+-- e.g. PM0000137/157 has no tags but its contract PM0000137 is tagged "StatutoryPPM" and the description says
+-- "STATUTORY - Must be completed". Precedence: Statutory (any source) > Critical (job or contract tag) > Non-Statutory.
+--   * Contract tags come from raw.ppm_contract_tags (contract number = JobNumber prefix before "/"). The public API's
+--     PPMContract/GetAll has no tags, so that table comes from the web app's /api/PPMContract/SearchPPMContract,
+--     refreshed nightly ~01:00 by the Mac scheduled task "refresh-ppm-contract-tags" (pull_ppm_contract_tags.js
+--     + load_ppm_contract_tags.py) — NOT the VM. Contract tag "Non Statutory" is deliberately not matched.
+--     Contract details without tags: raw.ppm_contracts (VM, nightly 03:00 via PPMContract/GetAll).
+--   * Description: whole word "statutory", ignoring "non-statutory"/"non statutory".
+-- Statutory_Source / Critical_Source list every source that matched (e.g. "Contract Tag, Description").
+CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category_v2` AS
+WITH flagged AS (
+  SELECT
+    v.* EXCEPT (Statutory_Category),
+    ct.Tags AS Contract_Tags,
+    EXISTS (SELECT 1 FROM UNNEST(SPLIT(v.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory")     AS stat_job_tag,
+    EXISTS (SELECT 1 FROM UNNEST(ct.TagList) t WHERE LOWER(TRIM(t)) = "statutoryppm")          AS stat_contract_tag,
+    REGEXP_CONTAINS(REGEXP_REPLACE(LOWER(IFNULL(v.Description, "")), r"non[\s-]*statutory", ""),
+                    r"\bstatutory\b")                                                           AS stat_description,
+    EXISTS (SELECT 1 FROM UNNEST(SPLIT(v.Tags, ",")) t WHERE LOWER(TRIM(t)) = "critical")      AS crit_job_tag,
+    EXISTS (SELECT 1 FROM UNNEST(ct.TagList) t WHERE LOWER(TRIM(t)) = "critical")              AS crit_contract_tag
+  FROM `vmimporteddata.models.job_statutory_category` v
+  LEFT JOIN `vmimporteddata.raw.ppm_contract_tags` ct
+    ON ct.PPMContractNumber = REGEXP_EXTRACT(v.JobNumber, r"^(PM\d+)/")
+)
+SELECT
+  f.* EXCEPT (stat_job_tag, stat_contract_tag, stat_description, crit_job_tag, crit_contract_tag),
+  CASE
+    WHEN stat_job_tag OR stat_contract_tag OR stat_description THEN "Statutory"
+    WHEN crit_job_tag OR crit_contract_tag                     THEN "Critical"
+    ELSE "Non-Statutory"
+  END AS Statutory_Category,
+  ARRAY_TO_STRING(ARRAY(SELECT s FROM UNNEST([
+    IF(stat_job_tag, "Job Tag", NULL), IF(stat_contract_tag, "Contract Tag", NULL),
+    IF(stat_description, "Description", NULL)]) s WHERE s IS NOT NULL), ", ")   AS Statutory_Source,
+  ARRAY_TO_STRING(ARRAY(SELECT s FROM UNNEST([
+    IF(crit_job_tag, "Job Tag", NULL), IF(crit_contract_tag, "Contract Tag", NULL)]) s
+    WHERE s IS NOT NULL), ", ")                                                 AS Critical_Source
+FROM flagged f;
 
 -- Invoice header + Job Type/Category/Status (one row per invoice). SELL side only (no cost on invoices).
 -- Job fields NULL for batch/PPM/credit invoices with no single-job link (~880). (2026-07-22)
@@ -669,3 +727,45 @@ FROM `vmimporteddata.models.cost_line_items` cli
 WHERE cli.job_id IN (
   SELECT Id FROM `vmimporteddata.raw.jobs` WHERE CustomerName = "Neko Health UK Limited"
 );
+
+-- PPM contracts with a Compliance_Rating (Statutory / Critical / Non-Statutory). (2026-10-08)
+-- Contract details: raw.ppm_contracts (VM, nightly 03:00). Tags: raw.ppm_contract_tags (Mac task, nightly ~01:00).
+-- Same rules as job_statutory_category_v2 so a contract and its jobs agree. Precedence Statutory > Critical:
+--   Statutory  = contract tag "StatutoryPPM", OR any of its jobs is Statutory in v2 (job tag / description)
+--   Critical   = contract tag "Critical", OR any of its jobs is Critical in v2
+--   PPM Contract = contract tag "PPM Contract" — checked FIRST, overrides the others (added 2026-10-08)
+-- Contract tag "Non Statutory" is not matched. Compliance_Source lists every rule that fired.
+CREATE OR REPLACE VIEW `vmimporteddata.models.ppm_contracts` AS
+WITH jobs AS (
+  SELECT REGEXP_EXTRACT(JobNumber, r"^(PM\d+)/") AS PPMContractNumber,
+         LOGICAL_OR(Statutory_Category = "Statutory") AS any_stat_job,
+         LOGICAL_OR(Statutory_Category = "Critical")  AS any_crit_job,
+         COUNT(*)                                     AS Job_Count
+  FROM `vmimporteddata.models.job_statutory_category_v2`
+  WHERE STARTS_WITH(JobNumber, "PM")
+  GROUP BY 1
+), f AS (
+  SELECT c.*,
+         t.Tags AS Contract_Tags,
+         IFNULL(j.Job_Count, 0) AS Job_Count,
+         "StatutoryPPM" IN UNNEST(IFNULL(t.TagList, [])) AS stat_tag,
+         "Critical"     IN UNNEST(IFNULL(t.TagList, [])) AS crit_tag,
+         "PPM Contract" IN UNNEST(IFNULL(t.TagList, [])) AS ppm_tag,
+         IFNULL(j.any_stat_job, FALSE) AS stat_job,
+         IFNULL(j.any_crit_job, FALSE) AS crit_job
+  FROM `vmimporteddata.raw.ppm_contracts` c
+  LEFT JOIN `vmimporteddata.raw.ppm_contract_tags` t USING (PPMContractNumber)
+  LEFT JOIN jobs j USING (PPMContractNumber)
+)
+SELECT
+  f.* EXCEPT (stat_tag, crit_tag, ppm_tag, stat_job, crit_job),
+  CASE WHEN ppm_tag              THEN "PPM Contract"
+       WHEN stat_tag OR stat_job THEN "Statutory"
+       WHEN crit_tag OR crit_job THEN "Critical"
+       ELSE "Non-Statutory" END AS Compliance_Rating,
+  ARRAY_TO_STRING(ARRAY(SELECT s FROM UNNEST([
+    IF(ppm_tag, "Contract Tag: PPM Contract", NULL),
+    IF(stat_tag, "Contract Tag: StatutoryPPM", NULL), IF(stat_job, "Job(s) Statutory", NULL),
+    IF(crit_tag, "Contract Tag: Critical", NULL),     IF(crit_job, "Job(s) Critical", NULL)]) s
+    WHERE s IS NOT NULL), ", ") AS Compliance_Source
+FROM f;
