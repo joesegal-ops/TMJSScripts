@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - PPM Update Contracts (Tags + Plan Reference)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  Paste a TSV of PPM Contract Number / tag(s) to add / new Plan Reference. Preview shows current vs new; Apply saves each contract through its own Joblogic edit form (opened in a popup) so every other field is preserved, then re-reads the contract to verify. Collapses into the shared JL dock.
+// @version      1.1.0
+// @description  Paste a TSV of PPM Contract Number / tag(s) to add / new Plan Reference. Preview shows current vs new; Apply saves each contract via Joblogic's own EditDetail call (no popup) — the full contract record is rebuilt from the contract page so every other field is preserved — then re-reads the contract to verify nothing else changed. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -12,9 +12,6 @@
 
 (function () {
     'use strict';
-
-    // Don't build the panel inside the worker popup this script drives.
-    if (window.name === 'jl-ppm-update-worker') return;
 
 
     // ===== Shared JL userscript launcher dock (identical in every script) =====
@@ -103,17 +100,15 @@
     }
     // ===== end shared dock =====
 
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const SCRIPT_ID = 'ppm-update-contracts';
     const SCRIPT_LABEL = '🏷️ PPM Update Contracts';
     const SCRIPT_COLOR = '#1f7a5c';
-    const SCRIPT_DESC = 'Paste a TSV: PPM Contract Number <tab> tag(s) to add <tab> new Plan Reference. Preview shows current vs new values; Apply saves each contract through its own Joblogic edit form (in a popup window) and re-reads it to verify. Tags are only ADDED (existing tags kept); a blank Plan Reference leaves it unchanged.';
+    const SCRIPT_DESC = 'Paste a TSV: PPM Contract Number <tab> tag(s) to add <tab> new Plan Reference. Preview shows current vs new values; Apply saves each contract via Joblogic\'s own EditDetail call and re-reads it to verify nothing else changed. Tags are only ADDED (existing tags kept); a blank Plan Reference leaves it unchanged.';
 
     // Throttle to stay under the Joblogic (Azure) WAF rate limit.
     const DELAY_BETWEEN_CONTRACTS = 1400;
-    const PAGE_READY_TIMEOUT = 45000;
     const SAVE_TIMEOUT = 30000;
-    const WORKER_NAME = 'jl-ppm-update-worker';
 
     // --- STATE ---
     let panel, logArea, tsvInput, previewBtn, runBtn, stopBtn, progressText;
@@ -173,95 +168,162 @@
     }
 
     // =======================================================================
-    // Worker popup: drive the real contract detail page so the save is byte-for-byte what the UI sends
-    // (Description, selling rates, currency etc. are only populated by the page's own scripts —
-    // rebuilding the form from raw HTML would blank them). Iframes are refused (X-Frame-Options).
+    // Direct save (no popup)
+    // /api/PPMContract/EditDetail REPLACES the whole contract header with whatever is posted — any field left out
+    // is blanked. So we rebuild the complete form the detail page's own Save would send, from the contract's
+    // server-side model embedded in /PPMContract/Detail, change only Tags / Plan Reference, and post it with
+    // Joblogic's own JL_SERVICES.post (same options as the Save button, so the encoding is identical).
     // =======================================================================
-    async function waitForDetailPage(win, cid) {
-        const t0 = Date.now();
-        while (Date.now() - t0 < PAGE_READY_TIMEOUT) {
-            if (!running) throw new Error('stopped');
-            if (win.closed) throw new Error('worker window was closed');
-            try {
-                if (win.location.pathname.toLowerCase().indexOf(cid.toLowerCase()) >= 0 && win.document.readyState === 'complete' && win.$) {
-                    const form = win.$('#editDetail');
-                    const ms = win.$('#Job_TagIds').data('kendoMultiSelect');
-                    const names = form.length ? form.serializeArray().map(x => x.name) : [];
-                    // 'Labour' etc. are rendered by a Vue component after load — wait for them so they are not posted blank.
-                    if (form.length && ms && form.find('.jlMakeEditAble-Edit').length && typeof win.serializeForm === 'function' &&
-                        win.$('#PlanReference').length && names.indexOf('Labour') >= 0) {
-                        return { form, ms };
-                    }
-                }
-            } catch (e) { /* mid-navigation: cross-document access can throw briefly */ }
-            await sleep(300);
+    // Pull the contract's full server-side model (the JSON the detail page boots from) out of /PPMContract/Detail HTML.
+    function extractContractModel(html) {
+        const balanced = (s, i) => {
+            let depth = 0, inStr = false, esc = false;
+            for (let j = i; j < s.length; j++) {
+                const ch = s[j];
+                if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+                if (ch === '"') inStr = true;
+                else if (ch === '{') depth++;
+                else if (ch === '}') { depth--; if (!depth) return s.slice(i, j + 1); }
+            }
+            return null;
+        };
+        let idx = -1;
+        while ((idx = html.indexOf('"CreateTagAllowed"', idx + 1)) >= 0) {
+            let start = idx;
+            for (let hop = 0; hop < 4 && start > 0; hop++) {
+                let depth = 0; start--;
+                for (; start >= 0; start--) { const ch = html[start]; if (ch === '}') depth++; else if (ch === '{') { if (!depth) break; depth--; } }
+                if (start < 0) break;
+                try {
+                    const o = JSON.parse(balanced(html, start));
+                    if (o && 'PlanReference' in o && 'Labour' in o && 'TagIds' in o && 'PPMSellingRateId' in o) return o;
+                } catch (e) { /* not this brace */ }
+            }
         }
-        throw new Error('contract page did not finish loading');
+        return null;
     }
 
-    async function applyToContract(win, item) {
-        win.location.href = '/PPMContract/Detail/' + item.cid;
-        await sleep(1200);
-        const { form, ms } = await waitForDetailPage(win, item.cid);
-        await sleep(800); // let late Vue/Kendo bindings settle
+    // Rebuild exactly what the detail page's own Save sends (serializeForm($('#editDetail')) in edit mode).
+    // Verified field-for-field against the live page's serializeForm on a sample of contracts.
+    function buildEditDetailParams(m, html) {
+        const s = v => (v == null ? '' : String(v));
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const form = doc.querySelector('#editDetail');
+        const checked = form && form.querySelector('input[name="EngineerType"][checked]');
+        const today = (() => { const d = new Date(); return String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + d.getFullYear(); })();
+        const multi = String(!!m.IsEnabledMultipleCurrencies);
+        const tagIds = (m.TagIds || []).slice();
+        const p = {
+            Id: s(m.Id),
+            NoBillingContractValue: s(m.NoBillingContractValue),
+            AssignType: s(m.AssignType),
+            PlanReference: s(m.PlanReference),
+            Description_area: s(m.Description),
+            Description: s(m.Description),
+            JobCategoryId_input: s(m.JobCategoryDescription),
+            JobCategoryId: s(m.JobCategoryId),
+            AccountManagerId_input: s(m.AccountManager),
+            AccountManagerId: s(m.AccountManagerId),
+            TagIds: tagIds,
+            CustomerOrderNumber: s(m.CustomerOrderNumber),
+            StartDate: s(m.StartDate),
+            EndDate: s(m.EndDate),
+            'jl-switch-isenabledmultiplecurrencies': multi,
+            IsEnabledMultipleCurrencies: multi,
+            BaseCurrencyName: s(m.BaseCurrencyName),
+            BaseCurrencyCode: s(m.BaseCurrencyCode),
+            ConversionRate: s(m.ConversionRate),
+            'jl-select-currency': '[]',
+            ToCurrencyCode: s(m.ToCurrencyCode),
+            ToCurrencyName: s(m.ToCurrencyName),
+            ExchangeRateDate: today, // the currency widget always posts today's date on single-currency contracts
+            PreferredCurrencyId: s(m.PreferredCurrencyId),
+            PPMSellingRateId_input: s(m.PPMSellingRateDescription),
+            PPMSellingRateId: s(m.PPMSellingRateId),
+            EngineerType: checked ? checked.value : 'Engineer',
+            DefaultEngineerId_input: s(m.DefaultEngineerName),
+            DefaultEngineerId: s(m.DefaultEngineerId),
+            DefaultEngineerTeamId_input: s(m.DefaultEngineerTeamName),
+            DefaultEngineerTeamId: s(m.DefaultEngineerTeamId),
+            DefaultSubcontractorId_input: s(m.DefaultSubcontractorName),
+            DefaultSubcontractorId: s(m.DefaultSubcontractorId),
+            Labour: s(m.Labour), Material: s(m.Material), Overtime: s(m.Overtime), Expenses: s(m.Expenses),
+            Travel: s(m.Travel), Callout: s(m.Callout), Mileage: s(m.Mileage), Subcontractor: s(m.Subcontractor)
+        };
+        if (!tagIds.length) delete p.TagIds; // the live form omits TagIds entirely when there are none
+        return p;
+    }
 
-        // Open edit mode exactly as the page's own Save does.
-        const panelOpen = (() => { const e = form.find('#savePanel'); return !e.length || e.hasClass('open'); })();
-        if (!panelOpen) form.find('.jlMakeEditAble-Edit').trigger('click');
-        await sleep(600);
+    // Joblogic page globals (JL_SERVICES, canonicalize) are top-level consts/functions of the page's own scripts.
+    function pageGlobal(name) {
+        const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+        try { return w.eval('typeof ' + name + ' !== "undefined" ? ' + name + ' : null'); } catch (e) { return null; }
+    }
 
-        // Tags: add to the existing selection (never remove).
-        if (item.addTags.length) {
-            await ms.dataSource.read();
-            const ids = ms.value().slice();
-            for (const t of item.addTags) {
-                if (!ms.dataSource.data().some(x => x.Id === t.Id)) throw new Error('tag "' + t.Title + '" not offered by the contract tag picker');
-                if (ids.indexOf(t.Id) < 0) ids.push(t.Id);
-            }
-            ms.value(ids);
-            ms.trigger('change');
-        }
+    async function loadContractModel(cid) {
+        const r = await fetchWithRetry('/PPMContract/Detail/' + cid, { headers: { 'Accept': 'text/html' } });
+        if (!r.ok) throw new Error('contract page HTTP ' + r.status);
+        const html = await r.text();
+        const m = extractContractModel(html);
+        if (!m) throw new Error('could not read the contract details from its page');
+        if (String(m.Id || '').toLowerCase() !== cid.toLowerCase()) throw new Error('contract page returned a different contract');
+        return { m, html };
+    }
 
-        // Plan Reference
-        if (item.newPlanRef) {
-            const el = win.$('#PlanReference')[0];
-            const setter = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, 'value').set;
-            setter.call(el, item.newPlanRef);
-            el.dispatchEvent(new win.Event('input', { bubbles: true }));
-            el.dispatchEvent(new win.Event('change', { bubbles: true }));
-        }
+    // Why a contract can't be updated this way (or '' if it can).
+    function blockedReason(m) {
+        if (m.IsCancelled) return 'contract is cancelled (read-only in Joblogic)';
+        if (m.EditPPMContractAllowed === false) return 'Joblogic does not allow editing this contract';
+        if (m.IsEnabledMultipleCurrencies) return 'multi-currency contract — not supported by this script, edit it manually';
+        return '';
+    }
 
-        const params = win.serializeForm(form);
+    // Fields that must be identical before vs after a save (everything we post except what we meant to change).
+    const UNCHANGED_FIELDS = ['Description', 'JobCategoryId', 'AccountManagerId', 'CustomerOrderNumber', 'StartDate', 'EndDate',
+        'PPMSellingRateId', 'AssignType', 'NoBillingContractValue', 'BaseCurrencyCode', 'PreferredCurrencyId',
+        'DefaultEngineerId', 'DefaultEngineerTeamId', 'DefaultSubcontractorId',
+        'Labour', 'Material', 'Overtime', 'Expenses', 'Travel', 'Callout', 'Mileage', 'Subcontractor'];
 
-        // Safety checks before posting anything.
-        if (String(params.Id || '').toLowerCase() !== item.cid.toLowerCase()) throw new Error('form Id ' + params.Id + ' != contract — not saved');
-        if (normText(params.Description) !== normText(item.description)) throw new Error('Description in form does not match the contract (page not fully loaded?) — not saved');
-        const sentTags = [].concat(params.TagIds || []);
-        for (const t of item.addTags) if (sentTags.indexOf(t.Id) < 0) throw new Error('tag "' + t.Title + '" missing from form data — not saved');
-        if (item.newPlanRef && params.PlanReference !== item.newPlanRef) throw new Error('Plan Reference did not take in the form — not saved');
+    async function applyToContract(item) {
+        const svc = pageGlobal('JL_SERVICES'), canon = pageGlobal('canonicalize');
+        if (!svc || typeof svc.post !== 'function') throw new Error('Joblogic page services not found — reload the page and try again');
 
-        // POST /api/PPMContract/EditDetail with the page's own service + options (same call as its Save button).
-        const svc = win.eval('JL_SERVICES');
-        const resp = await new Promise((resolve, reject) => {
-            const to = setTimeout(() => reject(new Error('save timed out (check the popup for a Joblogic error)')), SAVE_TIMEOUT);
-            svc.post({
-                url: win.canonicalize('/api/PPMContract/EditDetail'),
-                params,
-                options: { isBodyData: true, isJsonToFormData: true, isAjaxFormPostWithCallback: true },
-                success: e => { clearTimeout(to); resolve(e); }
-            });
+        const { m, html } = await loadContractModel(item.cid);
+        const blocked = blockedReason(m);
+        if (blocked) throw new Error(blocked + ' — not saved');
+
+        const params = buildEditDetailParams(m, html);
+        const tagIds = (m.TagIds || []).slice();
+        item.addTags.forEach(t => { if (tagIds.indexOf(t.Id) < 0) tagIds.push(t.Id); });
+        // Same shape the form produces: omitted when none, a string for one, an array for several.
+        if (!tagIds.length) delete params.TagIds;
+        else params.TagIds = tagIds.length === 1 ? tagIds[0] : tagIds;
+        if (item.newPlanRef) params.PlanReference = item.newPlanRef;
+
+        // NB: NOT isAjaxFormPostWithCallback — that makes Joblogic follow the response's redirectUrl, which reloads
+        // the page this script is running on and kills the batch. Same encoding (isJsonToFormData), raw response back.
+        let resp = null;
+        const posted = svc.post({
+            url: canon ? canon('/api/PPMContract/EditDetail') : '/api/PPMContract/EditDetail',
+            params,
+            options: { isBodyData: true, isJsonToFormData: true },
+            success: e => { resp = e; }
         });
-        if (resp && resp.success === false) throw new Error('Joblogic rejected the save: ' + (resp.Message || JSON.stringify(resp.errors || resp).slice(0, 200)));
+        await Promise.race([posted, sleep(SAVE_TIMEOUT)]);
+        if (!resp) throw new Error('no response from Joblogic (HTTP error or timeout) — check the contract');
+        if (resp.success === false) throw new Error('Joblogic rejected the save: ' + (resp.Message || JSON.stringify(resp.errors || resp).slice(0, 200)));
 
-        // Verify by re-reading (Joblogic can return success and silently not save).
+        // Verify by re-reading the full record (Joblogic can return success and silently not save).
         await sleep(800);
-        const after = await findContract(item.number);
-        if (!after) throw new Error('saved, but could not re-read the contract to verify');
-        const afterTags = splitTags(after.Tags).map(normTag);
-        const missing = item.addTags.filter(t => afterTags.indexOf(normTag(t.Title)) < 0).map(t => t.Title);
+        const { m: after } = await loadContractModel(item.cid);
+        const afterIds = after.TagIds || [];
+        const missing = item.addTags.filter(t => afterIds.indexOf(t.Id) < 0).map(t => t.Title);
         if (missing.length) throw new Error('save returned OK but tag(s) not on contract: ' + missing.join(', '));
+        const lost = (m.TagIds || []).filter(id => afterIds.indexOf(id) < 0);
+        if (lost.length) throw new Error('WARNING: ' + lost.length + ' existing tag(s) disappeared — check this contract');
         if (item.newPlanRef && normText(after.PlanReference) !== normText(item.newPlanRef)) throw new Error('save returned OK but Plan Reference is "' + after.PlanReference + '"');
-        if (normText(after.Description) !== normText(item.description)) throw new Error('WARNING: Description changed after save — check this contract');
+        const changed = UNCHANGED_FIELDS.filter(k => normText(m[k]) !== normText(after[k]));
+        if (changed.length) throw new Error('WARNING: other fields changed after save (' + changed.map(k => k + ': "' + normText(m[k]) + '" → "' + normText(after[k]) + '"').join('; ') + ') — check this contract');
         return after;
     }
 
@@ -292,7 +354,8 @@
         rules.innerHTML = 'Columns (tab-separated, paste from Sheets/Excel): <b>PPM Contract Number</b> · <b>Tag(s) to add</b> · <b>Plan Reference</b><br>' +
             '• Tags are <b>added</b> — existing tags are kept. Several tags: separate with commas. Tags must already exist in Joblogic.<br>' +
             '• Blank Plan Reference = leave unchanged. A header row is ignored.<br>' +
-            '• Apply opens a <b>popup window</b> and saves each contract through its own edit form (allow popups for go.joblogic.com). Don\'t close it while running.';
+            '• Apply saves via Joblogic\'s own contract-edit call, keeping every other field, then re-reads each contract to check only the intended fields changed.<br>' +
+            '• Cancelled, locked and multi-currency contracts are skipped.';
 
         const lbl = document.createElement('div');
         lbl.style.cssText = 'color:#aaa;margin-bottom:4px;';
@@ -412,6 +475,11 @@
             catch (e) { log('✗ ' + row.number + ' — lookup failed: ' + e.message, '#f55'); stats.errors++; continue; }
             if (!c) { log('✗ ' + row.number + ' — no PPM contract with that number.', '#f55'); stats.errors++; continue; }
 
+            let blocked = '';
+            try { blocked = blockedReason((await loadContractModel(c.UniqueId)).m); }
+            catch (e) { log('✗ ' + row.number + ' — ' + e.message, '#f55'); stats.errors++; continue; }
+            if (blocked) { log('✗ ' + c.PPMContractNumber + ' — ' + blocked, '#f55'); stats.errors++; continue; }
+
             const curTags = splitTags(c.Tags);
             const addTags = row.tags.map(t => tagByNorm.get(normTag(t))).filter(t => !curTags.some(ct => normTag(ct) === normTag(t.Title)));
             const newPlanRef = row.planRef && normText(row.planRef) !== normText(c.PlanReference) ? row.planRef : '';
@@ -447,14 +515,11 @@
     // =======================================================================
     function confirmAndApply() {
         if (!plan || !plan.length) { alert('Run Preview first.'); return; }
-        if (!confirm('Update ' + plan.length + ' PPM contract(s)?\n\nA popup window will open and step through each contract. Keep it open until finished.')) return;
-        // Open the worker synchronously inside the click so the popup blocker allows it.
-        const win = window.open('about:blank', WORKER_NAME, 'width=1200,height=850');
-        if (!win) { alert('The popup was blocked. Allow popups for go.joblogic.com and click Apply again.'); return; }
-        applyPlan(win);
+        if (!confirm('Update ' + plan.length + ' PPM contract(s)?')) return;
+        applyPlan();
     }
 
-    async function applyPlan(win) {
+    async function applyPlan() {
         setBusy(true);
         logArea.innerHTML = '';
         log('=== APPLYING ===', '#9f9');
@@ -466,8 +531,8 @@
             const item = plan[i];
             setProgress('Updating ' + (i + 1) + '/' + plan.length + ': ' + item.number);
             try {
-                const after = await applyToContract(win, item);
-                log('✓ ' + item.number + '  tags: ' + (after.Tags || '(none)') + (item.newPlanRef ? '  · plan ref: ' + after.PlanReference : ''), '#0fa');
+                const after = await applyToContract(item);
+                log('✓ ' + item.number + '  tags: ' + ((after.Tags || []).map(t => t.Title).join(', ') || '(none)') + (item.newPlanRef ? '  · plan ref: ' + after.PlanReference : ''), '#0fa');
                 stats.ok++;
             } catch (e) {
                 log('✗ ' + item.number + ' — ' + (e.message || e), '#f55');
@@ -475,7 +540,6 @@
             }
             await sleep(DELAY_BETWEEN_CONTRACTS);
         }
-        try { if (!win.closed) win.close(); } catch (e) {}
 
         log('');
         log('===== SUMMARY =====', '#0af');
