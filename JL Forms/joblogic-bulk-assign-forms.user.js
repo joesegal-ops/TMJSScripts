@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Assign Forms to Jobs
 // @namespace    com.joesegal.joblogic
-// @version      1.1.0
-// @description  Floating panel: paste a tab-separated table of [Job Number, Form Name, Shown On] and bulk-assign (or bulk-remove) each form to/from its job via the CompanyForm API. On assign, "Required on Visit" is always set true. Works from any go.joblogic.com page (jobs are resolved by number).
+// @version      1.2.0
+// @description  Floating panel: paste a tab-separated table of [Job Number, Form Name, Shown On, Req. Visit, Req. Asset] and bulk-assign (or bulk-remove) each form to/from its job via the CompanyForm API. "Required on Visit" / "Required on Asset" come from panel defaults, overridable per row. Works from any go.joblogic.com page (jobs are resolved by number).
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -102,7 +102,7 @@
     const SCRIPT_ID = 'bulk-assign-forms';
     const SCRIPT_LABEL = '🗂️ Bulk Assign Forms';
     const SCRIPT_COLOR = '#0b7285';
-    const SCRIPT_DESC = 'Paste a tab-separated table — Job Number | Form Name | Shown On (one stage per row, blank = no stage). Each form is assigned to its job with "Required on Visit" set on. Works from any Joblogic page.';
+    const SCRIPT_DESC = 'Paste a tab-separated table — Job Number | Form Name | Shown On | Req. Visit | Req. Asset (last three optional). Required on Visit / Asset default to the panel checkboxes; Y/N in a row overrides. Works from any Joblogic page.';
 
     // --- "Shown On" stage -> visit-status TypeId (from the Joblogic form rule component) ---
     const SHOW_ON = {
@@ -165,6 +165,8 @@
     }
 
     // Resolve a form name to its FormUniqueGuid (exact, case-insensitive; else sole match).
+    // ShowInFormsList / ShowInAssetsList say which "Required on" toggles apply to the form.
+    const formOut = f => ({ guid: f.FormUniqueGuid, name: f.FormName, visitForm: f.ShowInFormsList !== false, assetForm: f.ShowInAssetsList === true });
     const _formCache = new Map();
     async function resolveForm(name) {
         const key = name.toLowerCase();
@@ -178,9 +180,9 @@
             out = { error: 'no form matching "' + name + '"' };
         } else {
             const exact = forms.filter(f => (f.FormName || '').toLowerCase() === key);
-            if (exact.length === 1) out = { guid: exact[0].FormUniqueGuid, name: exact[0].FormName };
+            if (exact.length === 1) out = formOut(exact[0]);
             else if (exact.length > 1) out = { error: 'multiple forms named "' + name + '" (' + exact.length + ')' };
-            else if (forms.length === 1) out = { guid: forms[0].FormUniqueGuid, name: forms[0].FormName };
+            else if (forms.length === 1) out = formOut(forms[0]);
             else out = { error: forms.length + ' forms match "' + name + '" but none exactly — use the exact form name' };
         }
         _formCache.set(key, out);
@@ -188,15 +190,32 @@
     }
 
     // Assign a form to a job + set its Show On rules and Required-on-Visit flag (one call).
-    async function assignFormRule(jobId, formGuid, showOnTypeIds, isRequired) {
+    // AddFormRuleByJobId ignores isRequiredOnAsset, so when that's wanted we follow up with
+    // ChangeFormRuleById on the created rule (verified live).
+    async function assignFormRule(jobId, formGuid, showOnTypeIds, isRequired, isRequiredOnAsset) {
+        const showOnRules = showOnTypeIds.join(',');   // '' when no stage
         const res = await jlPostForm('/companyform/AddFormRuleByJobId', {
             jobId: jobId,
             formUniqueGuid: formGuid,
-            showOnRules: showOnTypeIds.join(','),   // '' when no stage
+            showOnRules: showOnRules,
             isRequired: isRequired ? 'true' : 'false'
         });
         const ok = res.j?.success === true;
-        return { ok, message: res.j?.Message || (ok ? 'OK' : ('HTTP ' + res.status)) };
+        if (!ok) return { ok, message: res.j?.Message || ('HTTP ' + res.status) };
+        if (!isRequiredOnAsset) return { ok, message: res.j?.Message || 'OK' };
+
+        const created = res.j?.AdditionalData?.CreatedForm;
+        if (!created?.Id) return { ok: false, message: 'added, but no rule id returned — set Required on Asset manually' };
+        const ch = await jlPostForm('/companyform/ChangeFormRuleById', {
+            jobId: jobId,
+            showOnRules: showOnRules,
+            defaultCompanyFormId: created.DefaultCompanyFormId || '',
+            companyFormId: created.Id,
+            isRequired: isRequired ? 'true' : 'false',
+            isRequiredOnAsset: 'true'
+        });
+        if (ch.j?.success === true) return { ok, message: ch.j?.Message || 'OK' };
+        return { ok: false, message: 'added, but Required on Asset failed: ' + (ch.j?.Message || ('HTTP ' + ch.status)) };
     }
 
     // Find the form rules already assigned to a job that match a form name (exact, case-insensitive).
@@ -236,7 +255,16 @@
         return { ids, labels };
     }
 
-    function parseTable(text, withStages) {
+    // Y/N cell -> true/false; blank -> fallback (panel default).
+    function parseFlag(cell, fallback) {
+        const v = (cell || '').trim().toLowerCase();
+        if (!v) return { value: fallback };
+        if (/^(y|yes|true|1|on|x|✓|✔)$/.test(v)) return { value: true };
+        if (/^(n|no|false|0|off)$/.test(v)) return { value: false };
+        return { error: 'bad Y/N value "' + cell.trim() + '"' };
+    }
+
+    function parseTable(text, withStages, defaults) {
         const rows = [];
         text.split(/\r?\n/).forEach((line, i) => {
             if (!line.trim()) return;
@@ -244,6 +272,8 @@
             const jobNo = (cols[0] || '').trim();
             const formName = (cols[1] || '').trim();
             const shownOnCell = (cols[2] || '').trim();
+            const reqVisitCell = (cols[3] || '').trim();
+            const reqAssetCell = (cols[4] || '').trim();
             // Skip an obvious header row.
             if (i === 0 && /^job/i.test(jobNo) && /form/i.test(formName)) return;
             if (!jobNo && !formName) return;
@@ -252,8 +282,12 @@
             else if (!formName) row.error = 'missing form name';
             else if (withStages) {
                 const st = parseStages(shownOnCell);
+                const rv = parseFlag(reqVisitCell, defaults.reqVisit);
+                const ra = parseFlag(reqAssetCell, defaults.reqAsset);
                 if (st.error) row.error = st.error;
-                else { row.stageIds = st.ids; row.stageLabels = st.labels; }
+                else if (rv.error) row.error = 'Req. Visit: ' + rv.error;
+                else if (ra.error) row.error = 'Req. Asset: ' + ra.error;
+                else { row.stageIds = st.ids; row.stageLabels = st.labels; row.reqVisit = rv.value; row.reqAsset = ra.value; }
             }
             rows.push(row);
         });
@@ -303,11 +337,25 @@
 
         const help = document.createElement('div');
         help.style.cssText = 'color:#9fb6c4;font-size:11px;line-height:1.45;margin-bottom:8px;';
-        help.innerHTML = 'Paste 3 <b>tab-separated</b> columns (copy straight from a spreadsheet):<br>' +
-            '<code style="color:#7fd">Job Number&nbsp;⇥&nbsp;Form Name&nbsp;⇥&nbsp;Shown On</code><br>' +
-            'One stage per row. Stages: ' + SHOW_ON_LABELS.join(', ') + '. ' +
-            'Leave <i>Shown On</i> blank for no stage. <b>Required on Visit</b> is always set on.';
         panel.append(help);
+
+        // Defaults for Required on Visit / Asset (assign mode only).
+        const reqWrap = document.createElement('div');
+        reqWrap.style.cssText = 'display:flex;gap:16px;margin-bottom:8px;font-size:12px;';
+        const mkReq = (label, checked) => {
+            const l = document.createElement('label');
+            l.style.cssText = 'display:flex;align-items:center;gap:5px;cursor:pointer;';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox'; cb.checked = checked;
+            cb.addEventListener('change', () => refreshPreview());
+            l.append(cb, document.createTextNode(label));
+            reqWrap.append(l);
+            return cb;
+        };
+        const reqVisitCb = mkReq('Required on Visit', true);
+        const reqAssetCb = mkReq('Required on Asset', false);
+        panel.append(reqWrap);
+        const defaults = () => ({ reqVisit: reqVisitCb.checked, reqAsset: reqAssetCb.checked });
 
         const ta = document.createElement('textarea');
         ta.placeholder = 'AT0000001\tEmergency Light Testing Certificate\tComplete';
@@ -331,17 +379,17 @@
         document.body.append(root);
         jlRegisterPanel(root, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
 
-        const ASSIGN_HELP = 'Paste 3 <b>tab-separated</b> columns (copy straight from a spreadsheet):<br>' +
-            '<code style="color:#7fd">Job Number&nbsp;⇥&nbsp;Form Name&nbsp;⇥&nbsp;Shown On</code><br>' +
-            'One stage per row. Stages: ' + SHOW_ON_LABELS.join(', ') + '. ' +
-            'Leave <i>Shown On</i> blank for no stage. <b>Required on Visit</b> is always set on.';
+        const ASSIGN_HELP = 'Paste <b>tab-separated</b> columns (copy straight from a spreadsheet):<br>' +
+            '<code style="color:#7fd">Job Number&nbsp;⇥&nbsp;Form Name&nbsp;⇥&nbsp;Shown On&nbsp;⇥&nbsp;Req. Visit&nbsp;⇥&nbsp;Req. Asset</code><br>' +
+            'Stages: ' + SHOW_ON_LABELS.join(', ') + ' (blank = no stage). ' +
+            '<i>Req. Visit</i> / <i>Req. Asset</i> are optional Y/N — blank uses the checkboxes below.';
         const REMOVE_HELP = 'Paste 2 <b>tab-separated</b> columns (copy straight from a spreadsheet):<br>' +
             '<code style="color:#f9a">Job Number&nbsp;⇥&nbsp;Form Name</code><br>' +
             'Each form matching the name (exactly, case-insensitive) is <b>removed</b> from its job. ' +
-            'A <i>Shown On</i> column, if present, is ignored.';
+            'Any further columns are ignored.';
 
         const refreshPreview = () => {
-            const rows = parseTable(ta.value, mode === 'assign');
+            const rows = parseTable(ta.value, mode === 'assign', defaults());
             const bad = rows.filter(r => r.error).length;
             preview.textContent = rows.length
                 ? `${rows.length} row(s)` + (bad ? ` — ${bad} with errors (will be skipped)` : ' — all parse OK')
@@ -357,6 +405,7 @@
                 b.style.color = on ? '#fff' : '#9fb6c4';
                 b.style.borderColor = on ? (m === 'remove' ? '#c0392b' : '#0a8') : '#333';
             });
+            reqWrap.style.display = m === 'remove' ? 'none' : 'flex';
             if (m === 'remove') {
                 help.innerHTML = REMOVE_HELP;
                 ta.placeholder = 'AT0000001\tEmergency Light Testing Certificate';
@@ -373,7 +422,7 @@
 
         btn.addEventListener('click', async () => {
             const removing = mode === 'remove';
-            const rows = parseTable(ta.value, !removing);
+            const rows = parseTable(ta.value, !removing, defaults());
             if (!rows.length) { status.textContent = 'Nothing to process — paste some rows first.'; return; }
             btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = removing ? 'Removing…' : 'Assigning…';
             const log = [];
@@ -401,9 +450,15 @@
                     } else {
                         const form = await resolveForm(row.formName);
                         if (form.error) { log.push(`✗ ${tag} — ${form.error}`); fail++; write(); continue; }
-                        const res = await assignFormRule(job.id, form.guid, row.stageIds, true);
+                        // Only set a "Required on" flag the form actually supports (JL hides the toggle otherwise).
+                        const notes = [];
+                        let reqVisit = row.reqVisit, reqAsset = row.reqAsset;
+                        if (reqVisit && !form.visitForm) { reqVisit = false; notes.push('not a visit form — Req. Visit skipped'); }
+                        if (reqAsset && !form.assetForm) { reqAsset = false; notes.push('not an asset form — Req. Asset skipped'); }
+                        const res = await assignFormRule(job.id, form.guid, row.stageIds, reqVisit, reqAsset);
                         const stageTxt = row.stageLabels.length ? row.stageLabels.join('+') : 'no stage';
-                        if (res.ok) { log.push(`✓ ${tag} → ${stageTxt}, required`); ok++; }
+                        const reqTxt = [reqVisit && 'req. visit', reqAsset && 'req. asset'].filter(Boolean).join(' + ') || 'not required';
+                        if (res.ok) { log.push(`✓ ${tag} → ${stageTxt}, ${reqTxt}` + (notes.length ? ` (${notes.join('; ')})` : '')); ok++; }
                         else { log.push(`✗ ${tag} — ${res.message}`); fail++; }
                     }
                 } catch (e) {
