@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Assign Forms to Jobs
 // @namespace    com.joesegal.joblogic
-// @version      1.2.0
+// @version      1.2.1
 // @description  Floating panel: paste a tab-separated table of [Job Number, Form Name, Shown On, Req. Visit, Req. Asset] and bulk-assign (or bulk-remove) each form to/from its job via the CompanyForm API. "Required on Visit" / "Required on Asset" come from panel defaults, overridable per row. Works from any go.joblogic.com page (jobs are resolved by number).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -189,33 +189,53 @@
         return out;
     }
 
+    // JL puts failure text in errors[] (Message is null), e.g. "A rule already exists for this form."
+    const jlError = res => (res.j?.errors || []).join('; ') || res.j?.Message || ('HTTP ' + res.status);
+
+    // Set Show On + Required on Visit/Asset on an existing rule.
+    async function changeFormRule(jobId, rule, showOnRules, isRequired, isRequiredOnAsset) {
+        const res = await jlPostForm('/companyform/ChangeFormRuleById', {
+            jobId: jobId,
+            showOnRules: showOnRules,
+            defaultCompanyFormId: rule.DefaultCompanyFormId || '',
+            companyFormId: rule.Id,
+            isRequired: isRequired ? 'true' : 'false',
+            isRequiredOnAsset: isRequiredOnAsset ? 'true' : 'false'
+        });
+        return { ok: res.j?.success === true, message: res.j?.success === true ? 'OK' : jlError(res) };
+    }
+
     // Assign a form to a job + set its Show On rules and Required-on-Visit flag (one call).
     // AddFormRuleByJobId ignores isRequiredOnAsset, so when that's wanted we follow up with
-    // ChangeFormRuleById on the created rule (verified live).
-    async function assignFormRule(jobId, formGuid, showOnTypeIds, isRequired, isRequiredOnAsset) {
+    // ChangeFormRuleById on the created rule (verified live). If the form is already on the
+    // job, JL rejects the add — update the existing rule(s) instead.
+    async function assignFormRule(jobId, form, showOnTypeIds, isRequired, isRequiredOnAsset) {
         const showOnRules = showOnTypeIds.join(',');   // '' when no stage
         const res = await jlPostForm('/companyform/AddFormRuleByJobId', {
             jobId: jobId,
-            formUniqueGuid: formGuid,
+            formUniqueGuid: form.guid,
             showOnRules: showOnRules,
             isRequired: isRequired ? 'true' : 'false'
         });
-        const ok = res.j?.success === true;
-        if (!ok) return { ok, message: res.j?.Message || ('HTTP ' + res.status) };
-        if (!isRequiredOnAsset) return { ok, message: res.j?.Message || 'OK' };
+        if (res.j?.success !== true) {
+            if (!/already exists/i.test(jlError(res))) return { ok: false, message: jlError(res) };
+            const existing = await findAssignedForms(jobId, form.name);
+            if (!existing.length) return { ok: false, message: jlError(res) };
+            const errs = [];
+            for (const rule of existing) {
+                const ch = await changeFormRule(jobId, rule, showOnRules, isRequired, isRequiredOnAsset);
+                if (!ch.ok) errs.push(ch.message);
+            }
+            if (errs.length) return { ok: false, message: 'already assigned; update failed: ' + errs.join('; ') };
+            return { ok: true, updated: true };
+        }
+        if (!isRequiredOnAsset) return { ok: true };
 
         const created = res.j?.AdditionalData?.CreatedForm;
         if (!created?.Id) return { ok: false, message: 'added, but no rule id returned — set Required on Asset manually' };
-        const ch = await jlPostForm('/companyform/ChangeFormRuleById', {
-            jobId: jobId,
-            showOnRules: showOnRules,
-            defaultCompanyFormId: created.DefaultCompanyFormId || '',
-            companyFormId: created.Id,
-            isRequired: isRequired ? 'true' : 'false',
-            isRequiredOnAsset: 'true'
-        });
-        if (ch.j?.success === true) return { ok, message: ch.j?.Message || 'OK' };
-        return { ok: false, message: 'added, but Required on Asset failed: ' + (ch.j?.Message || ('HTTP ' + ch.status)) };
+        const ch = await changeFormRule(jobId, created, showOnRules, isRequired, true);
+        if (ch.ok) return { ok: true };
+        return { ok: false, message: 'added, but Required on Asset failed: ' + ch.message };
     }
 
     // Find the form rules already assigned to a job that match a form name (exact, case-insensitive).
@@ -235,7 +255,7 @@
         else fields.companyFormId = rule.Id;
         const res = await jlPostForm('/companyform/RemoveFormRuleById', fields);
         const ok = res.j?.success === true;
-        return { ok, message: res.j?.Message || (ok ? 'OK' : ('HTTP ' + res.status)) };
+        return { ok, message: ok ? 'OK' : jlError(res) };
     }
 
     // =======================================================================
@@ -455,10 +475,10 @@
                         let reqVisit = row.reqVisit, reqAsset = row.reqAsset;
                         if (reqVisit && !form.visitForm) { reqVisit = false; notes.push('not a visit form — Req. Visit skipped'); }
                         if (reqAsset && !form.assetForm) { reqAsset = false; notes.push('not an asset form — Req. Asset skipped'); }
-                        const res = await assignFormRule(job.id, form.guid, row.stageIds, reqVisit, reqAsset);
+                        const res = await assignFormRule(job.id, form, row.stageIds, reqVisit, reqAsset);
                         const stageTxt = row.stageLabels.length ? row.stageLabels.join('+') : 'no stage';
                         const reqTxt = [reqVisit && 'req. visit', reqAsset && 'req. asset'].filter(Boolean).join(' + ') || 'not required';
-                        if (res.ok) { log.push(`✓ ${tag} → ${stageTxt}, ${reqTxt}` + (notes.length ? ` (${notes.join('; ')})` : '')); ok++; }
+                        if (res.ok) { log.push(`✓ ${tag} → ${res.updated ? 'updated existing: ' : ''}${stageTxt}, ${reqTxt}` + (notes.length ? ` (${notes.join('; ')})` : '')); ok++; }
                         else { log.push(`✗ ${tag} — ${res.message}`); fail++; }
                     }
                 } catch (e) {
