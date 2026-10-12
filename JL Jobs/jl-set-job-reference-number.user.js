@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Set Job Reference Number
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Paste a two-column TSV/CSV of Job Number + Reference Number. The script resolves each job and writes column 2 into the job's Reference Number field (CustomReference) via the API. Preview with Dry Run, optional "only if empty" guard, skips jobs that already hold that value. Collapses into the shared JL dock.
+// @version      2.0
+// @description  Paste (or load) a two-column TSV/CSV of Job Number + value and write column 2 into each job's Reference Number OR Job Ref 1 field. Built for big lists (35k+): indexes every job up front (instant dry run, skips already-correct/frozen/missing jobs), paces under the Azure WAF limit, resumes after Stop/reload, and exports a results CSV with previous values. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -99,37 +99,101 @@
     }
     // ===== end shared dock =====
 
-    const VERSION = '1.0';
+    const VERSION = '2.0';
     const SCRIPT_ID = 'set-job-reference-number';
-    const SCRIPT_LABEL = '🔖 Set Job Reference Number';
+    const SCRIPT_LABEL = '🔖 Set Job Reference / Job Ref 1';
     const SCRIPT_COLOR = '#5a3b6b';
-    const SCRIPT_DESC = 'Paste a two-column TSV/CSV of Job Number + Reference Number. Writes column 2 into each job\'s Reference Number field. Paste, then Start.';
+    const SCRIPT_DESC = 'Paste or load a two-column TSV/CSV of Job Number + value. Writes column 2 into each job\'s Reference Number or Job Ref 1 field. Dry Run first (instant), then Start. Progress is saved — Stop/reload and Start again to resume.';
 
     // --- CONFIG ---
-    const DELAY_BETWEEN_JOBS = 400;   // pause between per-job EditDetail calls
-    const SEARCH_PAGE_SIZE = 50;      // results per SearchJsonData lookup
+    // go.joblogic.com sits behind an Azure WAF that rate-limits per IP (~100 req/min,
+    // shared by every JL tab). 1400 ms between ANY two requests is the proven safe pace.
+    const MIN_INTERVAL = 1400;
+    const MAX_INTERVAL = 4000;
+    const WAF_BACKOFF = [1500, 3000, 6000, 12000, 20000];
+    const INDEX_PAGE_SIZE = 2000;     // SearchJsonData honours big pages — 54k jobs ≈ 28 calls
+    const LOG_MAX_LINES = 400;        // keep the DOM light on 35k-row runs
+    const STORE_ROWS = 'jl-setjobref-rows-v2';
+    const STORE_PROGRESS = 'jl-setjobref-progress-v2';
 
-    // The job detail field labelled "Reference Number" is CustomReference
-    // (rendered as #LJCustomReference, data-vv-as="Reference Number").
-    // "Customer Order Number" is OrderNumber and "Job Ref 1" is
-    // JobUserReferenceFieldValue — neither is touched here.
-    const TARGET_FIELD = 'CustomReference';
+    // Job detail labels → EditDetail field names (Vue renders #LJ<Field>, data-vv-as=<label>).
+    // Both are also columns on the SearchJsonData grid rows, which is what makes the index work.
+    const FIELDS = {
+        JobUserReferenceFieldValue: 'Job Ref 1',
+        CustomReference: 'Reference Number'
+    };
 
     // Column header aliases (case-insensitive; underscores normalised to spaces)
-    const JOB_HEADERS = ['job', 'job no', 'job no.', 'job number', 'jobno', 'jobnumber', 'job ref', 'job reference', 'number', 'id', 'job id'];
-    const REF_HEADERS = ['reference', 'ref', 'reference number', 'reference no', 'reference no.', 'ref no', 'ref number', 'custom reference', 'customreference', 'our reference', 'your reference', 'value'];
+    const JOB_HEADERS = ['job', 'job no', 'job no.', 'job number', 'jobno', 'jobnumber', 'job reference', 'number', 'id', 'job id'];
+    const REF_HEADERS = ['reference', 'ref', 'reference number', 'reference no', 'reference no.', 'ref no', 'ref number', 'custom reference', 'customreference', 'our reference', 'your reference', 'value',
+        'job ref 1', 'job ref1', 'jobref1', 'ref 1', 'ref1', 'job ref', 'jobuserreferencefieldvalue'];
+
+    // Row status codes (persisted per row)
+    const ST = { SET: 'set', SAME: 'same', NOT_EMPTY: 'not empty', FROZEN: 'frozen', NOT_FOUND: 'not found', AMBIGUOUS: 'ambiguous', ERROR: 'error' };
 
     // --- STATE ---
-    let panel, logArea, startBtn, stopBtn, pasteBtn, progressText, dryCheck, emptyOnlyCheck;
+    let panel, logArea, startBtn, dryBtn, stopBtn, pasteBtn, csvBtn, discardBtn, progressText, fieldSelect, emptyOnlyCheck;
     let running = false;
-    let jobsInput = [];    // [{jobRef, ref}]
+    let run = null;   // { rows: [[jobRef, value]], field, emptyOnly, status: [{s, p, m}|null], loadedAt }
 
-    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const norm = (s) => String(s || '').toLowerCase().trim();
+    class SessionError extends Error {}
+
+    // =======================================================================
+    // Timers — Chrome throttles chained setTimeout in hidden tabs to ~1/min,
+    // which would stall a multi-hour run. Worker timers aren't throttled that way.
+    // =======================================================================
+    let timerWorker = null;
+    const timerPending = {};
+    let timerSeq = 0;
+    try {
+        const blob = new Blob(['onmessage=e=>setTimeout(()=>postMessage(e.data.id),e.data.ms)'], { type: 'text/javascript' });
+        timerWorker = new Worker(URL.createObjectURL(blob));
+        timerWorker.onmessage = (e) => { const r = timerPending[e.data]; delete timerPending[e.data]; if (r) r(); };
+        timerWorker.onerror = () => { timerWorker = null; Object.keys(timerPending).forEach(k => { timerPending[k](); delete timerPending[k]; }); };
+    } catch (e) { timerWorker = null; }
+    function sleep(ms) {
+        if (!timerWorker) return new Promise(r => setTimeout(r, ms));
+        return new Promise(r => { const id = ++timerSeq; timerPending[id] = r; timerWorker.postMessage({ id, ms }); });
+    }
+    async function sleepInterruptible(ms) {
+        const end = Date.now() + ms;
+        while (running && Date.now() < end) await sleep(Math.min(500, end - Date.now()));
+    }
+
+    // =======================================================================
+    // Persistence (localStorage — rows saved once, progress after every job)
+    // =======================================================================
+    function saveRows() {
+        try {
+            localStorage.setItem(STORE_ROWS, JSON.stringify({ rows: run.rows, field: run.field, emptyOnly: run.emptyOnly, loadedAt: run.loadedAt }));
+            return true;
+        } catch (e) { return false; }
+    }
+    function saveProgress() {
+        try { localStorage.setItem(STORE_PROGRESS, JSON.stringify(run.status)); } catch (e) {}
+    }
+    function loadRun() {
+        try {
+            const r = JSON.parse(localStorage.getItem(STORE_ROWS) || 'null');
+            if (!r || !Array.isArray(r.rows) || !r.rows.length) return null;
+            let status = [];
+            try { status = JSON.parse(localStorage.getItem(STORE_PROGRESS) || '[]') || []; } catch (e) {}
+            if (status.length !== r.rows.length) status = new Array(r.rows.length).fill(null);
+            return { rows: r.rows, field: r.field in FIELDS ? r.field : 'JobUserReferenceFieldValue', emptyOnly: !!r.emptyOnly, loadedAt: r.loadedAt, status };
+        } catch (e) { return null; }
+    }
+    function clearRun() {
+        try { localStorage.removeItem(STORE_ROWS); localStorage.removeItem(STORE_PROGRESS); } catch (e) {}
+        run = null;
+    }
+    const pendingCount = () => run ? run.status.reduce((n, s) => n + ((!s || s.s === ST.ERROR) ? 1 : 0), 0) : 0;
 
     // =======================================================================
     // UI
     // =======================================================================
+    const btnCss = (bg) => `background:${bg};color:#fff;border:none;padding:8px 14px;border-radius:4px;cursor:pointer;`;
+
     function createUI() {
         if (document.getElementById('jl-jobref-panel')) return;
 
@@ -137,13 +201,13 @@
         panel.id = 'jl-jobref-panel';
 
         const container = document.createElement('div');
-        container.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99999;background:#1a1a2e;color:#eee;border-radius:8px;padding:16px;width:600px;max-height:88vh;display:flex;flex-direction:column;font-family:monospace;font-size:12px;box-shadow:0 4px 20px rgba(0,0,0,0.5);';
+        container.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99999;background:#1a1a2e;color:#eee;border-radius:8px;padding:16px;width:640px;max-height:88vh;display:flex;flex-direction:column;font-family:monospace;font-size:12px;box-shadow:0 4px 20px rgba(0,0,0,0.5);';
 
         const header = document.createElement('div');
         header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;';
         const title = document.createElement('strong');
         title.style.fontSize = '14px';
-        title.innerHTML = 'Set Job Reference Number <span style="font-weight:400;color:#8a8ab5;font-size:11px;">v' + VERSION + '</span>';
+        title.innerHTML = 'Set Job Reference / Job Ref 1 <span style="font-weight:400;color:#8a8ab5;font-size:11px;">v' + VERSION + '</span>';
         const closeBtn = document.createElement('button');
         closeBtn.style.cssText = 'background:none;border:none;color:#eee;font-size:18px;cursor:pointer;';
         closeBtn.textContent = '✕';
@@ -158,55 +222,95 @@
         progressText.textContent = 'Paste a list to begin.';
         progressDiv.appendChild(progressText);
 
-        const controlsDiv = document.createElement('div');
-        controlsDiv.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;';
-
-        pasteBtn = document.createElement('button');
-        pasteBtn.style.cssText = 'background:#08a;color:#fff;border:none;padding:8px 14px;border-radius:4px;cursor:pointer;';
-        pasteBtn.textContent = 'Paste List';
-        pasteBtn.addEventListener('click', openPasteDialog);
-
-        startBtn = document.createElement('button');
-        startBtn.style.cssText = 'background:#0a8;color:#fff;border:none;padding:8px 14px;border-radius:4px;cursor:pointer;';
-        startBtn.textContent = 'Start';
-        startBtn.disabled = true;
-        startBtn.addEventListener('click', startProcess);
-
-        stopBtn = document.createElement('button');
-        stopBtn.style.cssText = 'background:#a22;color:#fff;border:none;padding:8px 14px;border-radius:4px;cursor:pointer;display:none;';
-        stopBtn.textContent = 'Stop';
-        stopBtn.addEventListener('click', () => { running = false; });
-
+        const optsDiv = document.createElement('div');
+        optsDiv.style.cssText = 'display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;';
+        const fieldLabel = document.createElement('label');
+        fieldLabel.textContent = 'Write into: ';
+        fieldSelect = document.createElement('select');
+        fieldSelect.style.cssText = 'background:#0a0a1a;color:#eee;border:1px solid #444;border-radius:4px;padding:4px;';
+        Object.keys(FIELDS).forEach(k => {
+            const o = document.createElement('option');
+            o.value = k; o.textContent = FIELDS[k];
+            fieldSelect.appendChild(o);
+        });
+        fieldLabel.appendChild(fieldSelect);
         const emptyLabel = document.createElement('label');
         emptyLabel.style.cssText = 'cursor:pointer;';
         emptyOnlyCheck = document.createElement('input');
         emptyOnlyCheck.type = 'checkbox';
         emptyLabel.appendChild(emptyOnlyCheck);
         emptyLabel.appendChild(document.createTextNode(' Only if empty'));
-        emptyLabel.title = 'Leave jobs that already have a Reference Number untouched instead of overwriting them.';
+        emptyLabel.title = 'Leave jobs that already hold a value in the chosen field untouched instead of overwriting them.';
+        const onOptChange = () => {
+            if (!run || running) return;
+            run.field = fieldSelect.value;
+            run.emptyOnly = emptyOnlyCheck.checked;
+            // Changing the target invalidates prior per-row results.
+            run.status = new Array(run.rows.length).fill(null);
+            saveRows(); saveProgress();
+            refreshButtons();
+            setProgress(`${run.rows.length} jobs loaded → ${FIELDS[run.field]}. Dry Run to preview, Start to write.`);
+        };
+        fieldSelect.addEventListener('change', onOptChange);
+        emptyOnlyCheck.addEventListener('change', onOptChange);
+        optsDiv.appendChild(fieldLabel);
+        optsDiv.appendChild(emptyLabel);
 
-        const dryLabel = document.createElement('label');
-        dryLabel.style.cssText = 'cursor:pointer;';
-        dryCheck = document.createElement('input');
-        dryCheck.type = 'checkbox';
-        dryLabel.appendChild(dryCheck);
-        dryLabel.appendChild(document.createTextNode(' Dry Run'));
+        const controlsDiv = document.createElement('div');
+        controlsDiv.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;';
 
-        controlsDiv.appendChild(pasteBtn);
-        controlsDiv.appendChild(startBtn);
-        controlsDiv.appendChild(stopBtn);
-        controlsDiv.appendChild(emptyLabel);
-        controlsDiv.appendChild(dryLabel);
+        pasteBtn = document.createElement('button');
+        pasteBtn.style.cssText = btnCss('#08a');
+        pasteBtn.textContent = 'Paste / Load List';
+        pasteBtn.addEventListener('click', openPasteDialog);
+
+        dryBtn = document.createElement('button');
+        dryBtn.style.cssText = btnCss('#a80');
+        dryBtn.textContent = 'Dry Run';
+        dryBtn.addEventListener('click', () => startProcess(true));
+
+        startBtn = document.createElement('button');
+        startBtn.style.cssText = btnCss('#0a8');
+        startBtn.textContent = 'Start';
+        startBtn.addEventListener('click', () => startProcess(false));
+
+        stopBtn = document.createElement('button');
+        stopBtn.style.cssText = btnCss('#a22') + 'display:none;';
+        stopBtn.textContent = 'Stop';
+        stopBtn.addEventListener('click', () => { running = false; stopBtn.textContent = 'Stopping…'; });
+
+        csvBtn = document.createElement('button');
+        csvBtn.style.cssText = btnCss('#456');
+        csvBtn.textContent = 'Results CSV';
+        csvBtn.title = 'Download every row with its result and the field\'s previous value.';
+        csvBtn.addEventListener('click', downloadCsv);
+
+        discardBtn = document.createElement('button');
+        discardBtn.style.cssText = btnCss('#633');
+        discardBtn.textContent = 'Discard';
+        discardBtn.title = 'Forget the loaded list and saved progress.';
+        discardBtn.addEventListener('click', () => {
+            if (!confirm('Discard the loaded list and all saved progress?')) return;
+            clearRun();
+            logArea.innerHTML = '';
+            setProgress('Paste a list to begin.');
+            refreshButtons();
+        });
+
+        [pasteBtn, dryBtn, startBtn, stopBtn, csvBtn, discardBtn].forEach(b => controlsDiv.appendChild(b));
 
         const help = document.createElement('div');
         help.style.cssText = 'font-size:11px;color:#888;margin-bottom:10px;';
-        help.textContent = 'Two columns: Job Number, Reference Number. Header row optional. Column 2 replaces the job\'s Reference Number field — any existing value is overwritten and logged, unless "Only if empty" is ticked.';
+        help.textContent = 'Two columns: Job Number, value. Header row optional. Dry Run reads every job once (~1 min) and reports what would change — no writes. '
+            + 'Start writes ~1 job / 3 s (WAF limit), so 35k jobs ≈ a day: leave this tab open, close other Joblogic tabs, and keep the machine awake. '
+            + 'Progress is saved after every job — Stop or reload, then Start again to carry on. Errored rows are retried on the next Start.';
 
         logArea = document.createElement('div');
-        logArea.style.cssText = 'flex:1;overflow-y:auto;background:#0a0a1a;padding:8px;border-radius:4px;max-height:60vh;';
+        logArea.style.cssText = 'flex:1;overflow-y:auto;background:#0a0a1a;padding:8px;border-radius:4px;max-height:55vh;';
 
         container.appendChild(header);
         container.appendChild(progressDiv);
+        container.appendChild(optsDiv);
         container.appendChild(controlsDiv);
         container.appendChild(help);
         container.appendChild(logArea);
@@ -214,6 +318,30 @@
         document.body.appendChild(panel);
 
         jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
+
+        run = loadRun();
+        if (run) {
+            fieldSelect.value = run.field;
+            emptyOnlyCheck.checked = run.emptyOnly;
+            const left = pendingCount();
+            setProgress(`Saved list: ${run.rows.length} jobs → ${FIELDS[run.field]} · ${run.rows.length - left} done · ${left} to go. Start to resume.`);
+        }
+        refreshButtons();
+    }
+
+    function refreshButtons() {
+        const has = !!run;
+        dryBtn.disabled = startBtn.disabled = !has || running;
+        csvBtn.disabled = discardBtn.disabled = !has || running;
+        pasteBtn.disabled = fieldSelect.disabled = emptyOnlyCheck.disabled = running;
+        [dryBtn, startBtn, csvBtn, discardBtn, pasteBtn].forEach(b => { b.style.opacity = b.disabled ? '0.45' : '1'; });
+        dryBtn.style.display = startBtn.style.display = running ? 'none' : 'inline-block';
+        stopBtn.style.display = running ? 'inline-block' : 'none';
+        stopBtn.textContent = 'Stop';
+        if (has && !running) {
+            const done = run.status.some(s => s && s.s !== ST.ERROR);
+            startBtn.textContent = done ? `Resume (${pendingCount()} left)` : 'Start';
+        }
     }
 
     function log(msg, color) {
@@ -223,16 +351,17 @@
         line.style.wordBreak = 'break-word';
         line.textContent = msg;
         logArea.appendChild(line);
+        while (logArea.childElementCount > LOG_MAX_LINES) logArea.removeChild(logArea.firstChild);
         logArea.scrollTop = logArea.scrollHeight;
     }
     const setProgress = (msg) => { progressText.textContent = msg; };
 
     // =======================================================================
-    // Input parsing → [{jobRef, ref}]  (last value wins if a job repeats)
+    // Input parsing → [[jobRef, value]]  (last value wins if a job repeats)
     // =======================================================================
     function parseInput(text) {
         const rawLines = text.split(/\r?\n|\r/).map(l => l.replace(/\s+$/, '')).filter(l => l.trim());
-        if (!rawLines.length) return { jobs: [], error: 'Empty input' };
+        if (!rawLines.length) return { rows: [], error: 'Empty input' };
 
         // Detect the delimiter from the raw paste, not from rawLines[0] — a first
         // row with an empty second cell loses its trailing tab above.
@@ -276,31 +405,35 @@
         }
 
         const order = [];
-        const map = {}; // upperJobRef -> {jobRef, ref}
+        const map = {}; // upperJobRef -> [jobRef, value]
+        let dupes = 0;
         for (let i = dataStart; i < allRows.length; i++) {
             const r = allRows[i];
             const jobRef = (r[jobCol] || '').trim();
-            const ref = (r[refCol] || '').trim();
-            if (!jobRef || !ref) continue;
+            const val = (r[refCol] || '').trim();
+            if (!jobRef || !val) continue;
             const key = jobRef.toUpperCase();
-            if (!map[key]) { map[key] = { jobRef, ref }; order.push(key); }
-            else map[key].ref = ref;   // duplicate job number — last row wins
+            if (!map[key]) { map[key] = [jobRef, val]; order.push(key); }
+            else { map[key][1] = val; dupes++; }   // duplicate job number — last row wins
         }
-        return { jobs: order.map(k => map[k]) };
+        return { rows: order.map(k => map[k]), dupes };
     }
 
     // =======================================================================
-    // Paste dialog
+    // Paste / load dialog
     // =======================================================================
     function openPasteDialog() {
+        if (run && pendingCount() < run.rows.length && !confirm('A list with saved progress is loaded. Replace it?')) return;
+
         const overlay = document.createElement('div');
         overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100000;display:flex;align-items:center;justify-content:center;';
         overlay.innerHTML = `
-            <div style="background:#fff;color:#111;border-radius:8px;width:580px;max-width:94vw;box-shadow:0 10px 40px rgba(0,0,0,.4);overflow:hidden;font-family:system-ui,sans-serif;">
-                <div style="padding:12px 16px;background:#111827;color:#f9fafb;font-weight:600;">Paste list — Job Number, Reference Number</div>
+            <div style="background:#fff;color:#111;border-radius:8px;width:600px;max-width:94vw;box-shadow:0 10px 40px rgba(0,0,0,.4);overflow:hidden;font-family:system-ui,sans-serif;">
+                <div style="padding:12px 16px;background:#111827;color:#f9fafb;font-weight:600;">Paste list — Job Number, value</div>
                 <div style="padding:14px 16px;">
-                    <textarea id="jl-jobref-ta" style="width:100%;height:220px;font:13px monospace;padding:8px;border:1px solid #d1d5db;border-radius:4px;box-sizing:border-box;" placeholder="Paste from Google Sheets (tab-separated) or comma CSV:&#10;RE0017205	WO-44821&#10;PM0000897/001	ACME/2026/117&#10;RE0017310	SR-9932"></textarea>
-                    <div style="color:#6b7280;font-size:12px;margin-top:6px;">Tab-separated (Google Sheets paste) or comma CSV. Header row optional. Column 1 = job number, column 2 = the Reference Number to set.</div>
+                    <div style="margin-bottom:8px;font-size:13px;">Load a .tsv/.csv file: <input type="file" id="jl-jobref-file" accept=".tsv,.csv,.txt,text/plain,text/csv,text/tab-separated-values"></div>
+                    <textarea id="jl-jobref-ta" style="width:100%;height:220px;font:13px monospace;padding:8px;border:1px solid #d1d5db;border-radius:4px;box-sizing:border-box;" placeholder="…or paste from Google Sheets (tab-separated) / comma CSV:&#10;RE0017205	WO-44821&#10;PM0000897/001	ACME/2026/117&#10;RE0017310	SR-9932"></textarea>
+                    <div style="color:#6b7280;font-size:12px;margin-top:6px;">Header row optional. Column 1 = job number, column 2 = the value to write (into the field picked in the panel).</div>
                     <div id="jl-jobref-count" style="color:#2563eb;font-size:12px;margin-top:6px;font-weight:600;">0 jobs detected</div>
                     <div style="text-align:right;margin-top:10px;">
                         <button id="jl-jobref-cancel" style="background:#9ca3af;color:#fff;border:0;border-radius:4px;padding:7px 14px;cursor:pointer;margin-right:6px;">Cancel</button>
@@ -312,82 +445,166 @@
 
         const ta = overlay.querySelector('#jl-jobref-ta');
         const countEl = overlay.querySelector('#jl-jobref-count');
-
-        ta.addEventListener('input', () => {
-            const { jobs: j } = parseInput(ta.value);
-            countEl.textContent = `${j.length} job${j.length === 1 ? '' : 's'} detected`;
+        let countTimer = null;
+        const recount = () => {
+            clearTimeout(countTimer);
+            countTimer = setTimeout(() => {
+                const { rows, dupes } = parseInput(ta.value);
+                countEl.textContent = `${rows.length} job${rows.length === 1 ? '' : 's'} detected` + (dupes ? ` (${dupes} duplicate job numbers — last value wins)` : '');
+            }, 250);
+        };
+        ta.addEventListener('input', recount);
+        overlay.querySelector('#jl-jobref-file').addEventListener('change', (e) => {
+            const f = e.target.files && e.target.files[0];
+            if (!f) return;
+            f.text().then(t => { ta.value = t; recount(); });
         });
 
         overlay.querySelector('#jl-jobref-cancel').onclick = () => overlay.remove();
         overlay.querySelector('#jl-jobref-ok').onclick = () => {
-            const { jobs: parsed, error } = parseInput(ta.value);
+            const { rows, error, dupes } = parseInput(ta.value);
             overlay.remove();
-            if (error || !parsed.length) {
+            if (error || !rows.length) {
                 setProgress('No valid rows found. Check the format.');
-                startBtn.disabled = true;
                 return;
             }
-            jobsInput = parsed;
+            run = { rows, field: fieldSelect.value, emptyOnly: emptyOnlyCheck.checked, status: new Array(rows.length).fill(null), loadedAt: new Date().toISOString() };
             logArea.innerHTML = '';
-            log(`Loaded ${jobsInput.length} job${jobsInput.length === 1 ? '' : 's'}:`, '#0af');
-            jobsInput.slice(0, 8).forEach(j => log(`  ${j.jobRef}  →  "${j.ref}"`, '#ccc'));
-            if (jobsInput.length > 8) log(`  … and ${jobsInput.length - 8} more`, '#888');
-            setProgress(`${jobsInput.length} jobs ready. Click Start.`);
-            startBtn.disabled = false;
+            if (!saveRows()) log('Warning: list too big to save in browser storage — progress will NOT survive a reload. Split the list if you need resume.', '#fa0');
+            saveProgress();
+            log(`Loaded ${rows.length} job${rows.length === 1 ? '' : 's'}${dupes ? ` (${dupes} duplicate rows collapsed)` : ''}:`, '#0af');
+            rows.slice(0, 8).forEach(([j, v]) => log(`  ${j}  →  "${v}"`, '#ccc'));
+            if (rows.length > 8) log(`  … and ${rows.length - 8} more`, '#888');
+            setProgress(`${rows.length} jobs loaded → ${FIELDS[run.field]}. Dry Run to preview, Start to write.`);
+            refreshButtons();
         };
         overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
         setTimeout(() => ta.focus(), 50);
     }
 
     // =======================================================================
-    // API helpers
+    // Paced fetch with Azure WAF retry
     // =======================================================================
+    let lastRequestAt = 0;
+    let currentInterval = MIN_INTERVAL;
+    let okStreak = 0;
+
+    async function throttle() {
+        const wait = lastRequestAt + currentInterval - Date.now();
+        if (wait > 0) await sleep(wait);
+        lastRequestAt = Date.now();
+    }
+
+    async function isWafBlock(resp) {
+        if (![403, 429, 503].includes(resp.status)) return false;
+        if (/Azure-Application-Gateway/i.test(resp.headers.get('server') || '')) return true;
+        return /text\/html/i.test(resp.headers.get('content-type') || '');
+    }
+
+    const isLoginUrl = (u) => /\/Account\/|\/login|identity\./i.test(u || '');
+
+    async function jlFetch(url, opts = {}) {
+        for (let attempt = 0; ; attempt++) {
+            await throttle();
+            let resp;
+            try {
+                resp = await fetch(url, Object.assign({ credentials: 'same-origin' }, opts));
+            } catch (e) {
+                if (attempt < WAF_BACKOFF.length && running) { await sleepInterruptible(WAF_BACKOFF[attempt]); continue; }
+                throw e;
+            }
+            if (resp.redirected && isLoginUrl(resp.url)) throw new SessionError('Logged out of Joblogic');
+            if (await isWafBlock(resp)) {
+                okStreak = 0;
+                currentInterval = Math.min(MAX_INTERVAL, currentInterval + 200);
+                if (attempt < WAF_BACKOFF.length && running) {
+                    setProgressNote(`rate-limited — retry in ${WAF_BACKOFF[attempt] / 1000}s (pace now ${currentInterval} ms)`);
+                    await sleepInterruptible(WAF_BACKOFF[attempt]);
+                    continue;
+                }
+                throw new Error('Rate-limited by Azure WAF (403) — gave up after retries');
+            }
+            // Ease back toward the floor after a clean stretch.
+            if (++okStreak >= 60 && currentInterval > MIN_INTERVAL) { currentInterval = Math.max(MIN_INTERVAL, currentInterval - 100); okStreak = 0; }
+            return resp;
+        }
+    }
+
+    let progressNote = '';
+    let renderProgress = () => {};
+    function setProgressNote(n) { progressNote = n; renderProgress(); }
+
     function getCsrf(doc = document) {
         const el = doc.querySelector('input[name="__RequestVerificationToken"]');
         return el ? el.value : '';
     }
 
-    async function fetchText(url) {
-        const resp = await fetch(url, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
-        if (!resp.ok) throw new Error('HTTP ' + resp.status + ' on ' + url);
-        return resp.text();
+    // =======================================================================
+    // Index: every job in one sweep → { JOBNUMBER: {id, cur, frozen} | {ambiguous} }
+    // =======================================================================
+    async function buildIndex(field) {
+        const index = new Map();
+        let page = 1, seen = 0, total = Infinity;
+        while (seen < total) {
+            if (!running) throw new Error('Stopped');
+            setProgress(`Indexing jobs… ${seen}${isFinite(total) ? '/' + total : ''}`);
+            const resp = await jlFetch('/api/Job/SearchJsonData', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    '__RequestVerificationToken': getCsrf()
+                },
+                body: JSON.stringify({
+                    SearchTerm: '', SelectedTab: 'All',
+                    PageSize: INDEX_PAGE_SIZE, PageIndex: page,
+                    EngineerType: 0,
+                    IncludePPMJobs: true, IncludeReactiveJobs: true,
+                    StatusIds: '',
+                    StartLoggedDate: '', EndLoggedDate: '',
+                    StartDate: '', EndDate: '',
+                    StartCompleteDate: '', EndCompleteDate: '',
+                    StartNextContactDate: '', EndNextContactDate: ''
+                })
+            });
+            if (!resp.ok) throw new Error('Index search HTTP ' + resp.status);
+            const ct = resp.headers.get('content-type') || '';
+            if (!/json/i.test(ct)) throw new SessionError('Job search returned a non-JSON page — logged out?');
+            const data = await resp.json();
+            if (data.success === false) throw new Error('Index search failed: ' + (data.errors || []).join('; '));
+            const ad = data.AdditionalData || {};
+            const jobs = ad.Jobs || [];
+            total = ad.TotalCount || 0;
+            for (const j of jobs) {
+                const key = String(j.JobNumber || '').trim().toUpperCase();
+                if (!key) continue;
+                const entry = { id: j.Id, cur: j[field] == null ? '' : String(j[field]), frozen: !!j.IsFrozen };
+                if (index.has(key) && index.get(key).id !== j.Id) index.set(key, { ambiguous: true });
+                else index.set(key, entry);
+            }
+            seen += jobs.length;
+            if (!jobs.length) break;
+            page++;
+        }
+        log(`Indexed ${index.size} jobs (TotalCount ${total}).`, '#0af');
+        return index;
     }
 
-    // Resolve a single job number → { id, number }. Exact JobNumber match.
-    async function findJob(jobRef) {
-        const token = getCsrf();
-        const resp = await fetch('/api/Job/SearchJsonData', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Requested-With': 'XMLHttpRequest',
-                '__RequestVerificationToken': token
-            },
-            body: JSON.stringify({
-                SearchTerm: jobRef,
-                PageSize: SEARCH_PAGE_SIZE, PageIndex: 1,
-                EngineerType: 0,
-                IncludePPMJobs: true, IncludeReactiveJobs: true,
-                StatusIds: '',
-                StartLoggedDate: '', EndLoggedDate: '',
-                StartDate: '', EndDate: '',
-                StartCompleteDate: '', EndCompleteDate: '',
-                StartNextContactDate: '', EndNextContactDate: ''
-            })
-        });
-        if (!resp.ok) throw new Error('Search HTTP ' + resp.status);
-        const data = await resp.json();
-        const ad = data.AdditionalData || {};
-        const jobs = ad.Jobs || data.Data || [];
-        const want = norm(jobRef);
-        const exact = jobs.filter(j => norm(j.JobNumber || j.ReferenceNumber) === want);
-        if (exact.length > 1) return { id: exact[0].Id || exact[0].JobId, number: exact[0].JobNumber, ambiguous: exact.length };
-        if (exact.length === 1) return { id: exact[0].Id || exact[0].JobId, number: exact[0].JobNumber };
-        return null;
+    // Classify a row against the index without touching the job.
+    function preclassify(row, index, emptyOnly) {
+        const [jobRef, val] = row;
+        const hit = index.get(jobRef.trim().toUpperCase());
+        if (!hit) return { s: ST.NOT_FOUND };
+        if (hit.ambiguous) return { s: ST.AMBIGUOUS };
+        if (hit.cur.trim() === val.trim()) return { s: ST.SAME, p: hit.cur };
+        if (emptyOnly && hit.cur.trim()) return { s: ST.NOT_EMPTY, p: hit.cur };
+        if (hit.frozen) return { s: ST.FROZEN, p: hit.cur };
+        return null; // needs a write
     }
 
-    // Pull embedded job-state JSON from the detail page HTML
+    // =======================================================================
+    // Per-job write: GET detail → full form POST to EditDetail
+    // =======================================================================
     function extractJobState(html, internalId) {
         const anchor = `"Id":${internalId}`;
         const i = html.indexOf(anchor);
@@ -416,23 +633,24 @@
         return JSON.parse(html.slice(start, end));
     }
 
-    // POST full form to /api/Job/EditDetail with the new Reference Number.
-    async function setReferenceNumber(internalId, newRef, opts, _retry = 0) {
-        const { dryRun, emptyOnly } = opts;
-        const html = await fetchText('/Job/Detail/' + internalId);
+    async function writeField(internalId, field, newVal, emptyOnly, _retry = 0) {
+        const detailResp = await jlFetch('/Job/Detail/' + internalId, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+        if (!detailResp.ok) throw new Error('Detail HTTP ' + detailResp.status);
+        const html = await detailResp.text();
+        if (html.indexOf(`"Id":${internalId}`) < 0 && /name="Password"|Account\/Login/i.test(html)) throw new SessionError('Logged out of Joblogic');
         const job = extractJobState(html, internalId);
 
-        const current = job[TARGET_FIELD] == null ? '' : String(job[TARGET_FIELD]);
-        if (current.trim() === newRef.trim()) return { unchanged: true, current };
-        if (emptyOnly && current.trim()) return { skippedNotEmpty: true, current };
-
-        if (dryRun) return { dry: true, current, next: newRef };
+        // Re-check against live state — the index may be minutes/hours old.
+        const current = job[field] == null ? '' : String(job[field]);
+        if (current.trim() === newVal.trim()) return { s: ST.SAME, p: current };
+        if (emptyOnly && current.trim()) return { s: ST.NOT_EMPTY, p: current };
 
         const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
         const csrfToken = tokenMatch ? tokenMatch[1] : '';
 
+        const v = (k) => (k === field ? newVal : job[k]);
         const entries = [];
-        const push = (k, v) => entries.push([k, v == null ? '' : String(v)]);
+        const push = (k, val) => entries.push([k, val == null ? '' : String(val)]);
 
         push('Id', job.Id);
         push('AssignedToUserId', job.AssignedToUserId);
@@ -462,10 +680,10 @@
         push('JobCategoryId', job.JobCategoryId);
         push('PriorityId', job.PriorityId);
         push('OrderNumber', job.OrderNumber);
-        push('CustomReference', newRef); // ← the change ("Reference Number")
+        push('CustomReference', v('CustomReference'));                       // "Reference Number"
         push('IsRequireApproval', job.IsRequireApproval);
         push('CompletionTimeSinceOnSite', job.CompletionTimeSinceOnSite);
-        push('JobUserReferenceFieldValue', job.JobUserReferenceFieldValue);
+        push('JobUserReferenceFieldValue', v('JobUserReferenceFieldValue')); // "Job Ref 1"
         push('JobUserReferenceDropdownListValue', job.JobUserReferenceDropdownListValue);
         push('CustomerContractId', job.CustomerContractId);
         push('ProjectNumber', job.ProjectNumber);
@@ -483,7 +701,7 @@
         push('CustomerId', job.CustomerId);
         push('IsAssociatedCustomer', job.IsAssociatedCustomer);
 
-        const body = entries.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+        const body = entries.map(([k, val]) => `${encodeURIComponent(k)}=${encodeURIComponent(val)}`).join('&');
 
         const headers = {
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -492,9 +710,8 @@
         };
         if (csrfToken) headers['__RequestVerificationToken'] = csrfToken;
 
-        const resp = await fetch('/api/Job/EditDetail', {
+        const resp = await jlFetch('/api/Job/EditDetail', {
             method: 'POST',
-            credentials: 'same-origin',
             referrer: `${location.origin}/Job/Detail/${internalId}`,
             referrerPolicy: 'unsafe-url',
             headers,
@@ -503,8 +720,8 @@
         const respText = await resp.text().catch(() => '');
         if (!resp.ok) {
             if (resp.status === 400 && _retry < 1) {
-                await sleep(2500);
-                return setReferenceNumber(internalId, newRef, opts, _retry + 1);
+                await sleepInterruptible(2500);
+                return writeField(internalId, field, newVal, emptyOnly, _retry + 1);
             }
             throw new Error(`EditDetail HTTP ${resp.status}: ${respText.slice(0, 300)}`);
         }
@@ -515,110 +732,180 @@
                 ? json.errors.join('; ')
                 : (json.Message || respText.slice(0, 200));
             // Frozen (locked / period-locked) jobs can't be edited — report, don't error.
-            if (/frozen/i.test(errMsg)) return { frozen: true, current };
+            if (/frozen/i.test(errMsg)) return { s: ST.FROZEN, p: current };
             throw new Error(errMsg);
         }
-        return { current, next: newRef };
+        return { s: ST.SET, p: current };
     }
 
     // =======================================================================
-    // Main loop
+    // Main
     // =======================================================================
-    async function startProcess() {
-        if (running || !jobsInput.length) return;
+    const fmtDur = (ms) => {
+        const m = Math.round(ms / 60000);
+        return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+    };
+
+    function tallyOf(status) {
+        const t = {};
+        status.forEach(s => { if (s) t[s.s] = (t[s.s] || 0) + 1; });
+        return t;
+    }
+    function tallyText(t) {
+        const p = [`✓ ${t[ST.SET] || 0} set`];
+        if (t[ST.SAME])      p.push(`↷ ${t[ST.SAME]} same`);
+        if (t[ST.NOT_EMPTY]) p.push(`⊘ ${t[ST.NOT_EMPTY]} not empty`);
+        if (t[ST.FROZEN])    p.push(`❄ ${t[ST.FROZEN]} frozen`);
+        if (t[ST.NOT_FOUND]) p.push(`? ${t[ST.NOT_FOUND]} not found`);
+        if (t[ST.AMBIGUOUS]) p.push(`≠ ${t[ST.AMBIGUOUS]} ambiguous`);
+        if (t[ST.ERROR])     p.push(`⚠ ${t[ST.ERROR]} err`);
+        return p.join('  ·  ');
+    }
+
+    async function startProcess(dryRun) {
+        if (running || !run) return;
         running = true;
-        startBtn.style.display = 'none';
-        stopBtn.style.display = 'inline-block';
+        refreshButtons();
         logArea.innerHTML = '';
+        progressNote = '';
 
-        const dryRun = dryCheck.checked;
-        const emptyOnly = emptyOnlyCheck.checked;
-        log(dryRun ? 'DRY RUN — no changes will be made' : 'LIVE MODE — Reference Numbers will be written', dryRun ? '#ff0' : '#f55');
-        log(emptyOnly ? 'Only if empty — jobs with an existing Reference Number are left alone.' : 'Existing Reference Numbers WILL be overwritten (old value logged).', emptyOnly ? '#888' : '#fa0');
+        const field = run.field;
+        const label = FIELDS[field];
+        const emptyOnly = run.emptyOnly;
+        log(dryRun ? `DRY RUN — ${label}: nothing will be written` : `LIVE — writing ${label}`, dryRun ? '#ff0' : '#f55');
+        log(emptyOnly ? `Only if empty — jobs that already have a ${label} are left alone.` : `Existing ${label} values WILL be overwritten (old value kept in the Results CSV).`, emptyOnly ? '#888' : '#fa0');
 
-        const stats = { set: 0, unchanged: 0, notEmpty: 0, frozen: 0, notFound: 0, errors: 0 };
-        const failed = [];
+        try {
+            const index = await buildIndex(field);
 
-        // Persistent progress line: job position + live running tally + what's happening now.
-        let curJob = 0;
-        const total = jobsInput.length;
-        const tally = () => {
-            const p = [`✓ ${stats.set} set`];
-            if (stats.unchanged) p.push(`↷ ${stats.unchanged} same`);
-            if (stats.notEmpty)  p.push(`⊘ ${stats.notEmpty} not empty`);
-            if (stats.frozen)    p.push(`❄ ${stats.frozen} frozen`);
-            if (stats.notFound)  p.push(`? ${stats.notFound} not found`);
-            if (stats.errors)    p.push(`⚠ ${stats.errors} err`);
-            return p.join('  ·  ');
-        };
-        const showProgress = (now) => setProgress(`Job ${curJob}/${total}${now ? '  ·  ' + now : ''}  ·  ${tally()}`);
+            // Rows still to do: never attempted, or errored last time.
+            const todo = [];
+            const statusForPreview = run.status.slice();
+            run.rows.forEach((row, i) => {
+                const prev = run.status[i];
+                if (prev && prev.s !== ST.ERROR) return;
+                const pre = preclassify(row, index, emptyOnly);
+                if (pre) statusForPreview[i] = pre;
+                else { statusForPreview[i] = null; todo.push(i); }
+            });
 
-        for (let i = 0; i < jobsInput.length; i++) {
-            if (!running) { log('Stopped by user.', '#f55'); break; }
-            const { jobRef, ref } = jobsInput[i];
-            curJob = i + 1;
-
-            log(`--- [${i + 1}/${total}] ${jobRef}  →  "${ref}" ---`, '#fff');
-            showProgress(`${jobRef} — finding job`);
-
-            try {
-                const found = await findJob(jobRef);
-                if (!found) {
-                    log('  Not found', '#f55');
-                    stats.notFound++;
-                    failed.push(`${jobRef} (not found)`);
-                    showProgress();
-                    continue;
+            if (dryRun) {
+                const t = tallyOf(statusForPreview);
+                const overwrites = todo.filter(i => index.get(run.rows[i][0].trim().toUpperCase()).cur.trim());
+                log('');
+                log('===== DRY RUN SUMMARY =====', '#0af');
+                log(`Rows in list:                 ${run.rows.length}`);
+                const doneBefore = run.status.filter(s => s && s.s !== ST.ERROR).length;
+                if (doneBefore) log(`Already done in earlier runs: ${doneBefore}`, '#888');
+                log(`Would write:                  ${todo.length}  (${todo.length - overwrites.length} currently empty, ${overwrites.length} overwrite an existing value)`, '#0fa');
+                log(`Already correct (skip):       ${t[ST.SAME] || 0}`, '#888');
+                if (emptyOnly) log(`Has a value (skip):           ${t[ST.NOT_EMPTY] || 0}`, '#888');
+                log(`Frozen (skip):                ${t[ST.FROZEN] || 0}`, t[ST.FROZEN] ? '#fa0' : '#888');
+                log(`Job number not found:         ${t[ST.NOT_FOUND] || 0}`, t[ST.NOT_FOUND] ? '#f55' : '#888');
+                if (t[ST.AMBIGUOUS]) log(`Job number matches >1 job:    ${t[ST.AMBIGUOUS]}`, '#f55');
+                log(`Estimated live run time:      ~${fmtDur(todo.length * 2 * MIN_INTERVAL)}  (2 calls per job at ${MIN_INTERVAL} ms)`, '#0af');
+                if (overwrites.length) {
+                    log('');
+                    log(`Overwrites (first ${Math.min(30, overwrites.length)}):`, '#fa0');
+                    overwrites.slice(0, 30).forEach(i => log(`  ${run.rows[i][0]}: "${index.get(run.rows[i][0].trim().toUpperCase()).cur}" → "${run.rows[i][1]}"`, '#fc8'));
                 }
-                if (found.ambiguous) log(`  Warning: ${found.ambiguous} exact matches — using the first (id=${found.id})`, '#fa0');
-
-                showProgress(`${jobRef} — setting reference`);
-                const res = await setReferenceNumber(found.id, ref, { dryRun, emptyOnly });
-                if (res.unchanged) {
-                    log(`  already "${res.current}" — skipped`, '#888');
-                    stats.unchanged++;
-                } else if (res.skippedNotEmpty) {
-                    log(`  has "${res.current}" — skipped (only if empty)`, '#fa0');
-                    stats.notEmpty++;
-                } else if (res.frozen) {
-                    log(`  frozen — cannot edit, skipped`, '#fa0');
-                    stats.frozen++;
-                    failed.push(`${jobRef} (frozen)`);
-                } else if (res.dry) {
-                    log(`  [DRY] "${res.current}" → "${res.next}"`, '#ff0');
-                    stats.set++;
-                } else {
-                    log(`  set ✓  "${res.current}" → "${res.next}"`, '#0fa');
-                    stats.set++;
+                const nf = run.rows.filter((r, i) => statusForPreview[i] && statusForPreview[i].s === ST.NOT_FOUND);
+                if (nf.length) {
+                    log('');
+                    log(`Not found (first ${Math.min(30, nf.length)}):`, '#f55');
+                    nf.slice(0, 30).forEach(r => log('  ' + r[0], '#f99'));
                 }
-            } catch (e) {
-                log(`  ERROR ${e.message}`, '#f55');
-                stats.errors++;
-                failed.push(`${jobRef} (${e.message})`);
+                setProgress(`Dry run: ${todo.length} to write · ${tallyText(t)}`);
+                return;
             }
-            showProgress();
-            await sleep(DELAY_BETWEEN_JOBS);
-        }
 
-        log('');
-        log('===== SUMMARY =====', '#0af');
-        log(`Jobs processed:   ${curJob}`, '#0fa');
-        log(`Reference set:    ${stats.set}`, '#0fa');
-        log(`Already correct:  ${stats.unchanged}`, stats.unchanged ? '#fa0' : '#888');
-        log(`Skipped (filled): ${stats.notEmpty}`, stats.notEmpty ? '#fa0' : '#888');
-        log(`Frozen (skipped): ${stats.frozen}`, stats.frozen ? '#fa0' : '#888');
-        log(`Not found:        ${stats.notFound}`, stats.notFound ? '#fa0' : '#888');
-        log(`Errors:           ${stats.errors}`, stats.errors ? '#f55' : '#888');
-        if (failed.length) {
+            // Commit the pre-classified skips so they appear in the CSV and aren't re-checked.
+            const newlySkipped = [];
+            run.rows.forEach((row, i) => {
+                if (statusForPreview[i] && (!run.status[i] || run.status[i].s === ST.ERROR)) { run.status[i] = statusForPreview[i]; newlySkipped.push(statusForPreview[i]); }
+            });
+            saveProgress();
+            log(`${todo.length} jobs to write  ·  ${newlySkipped.length} skipped from the index (${tallyText(tallyOf(newlySkipped)).replace(/^✓ 0 set(  ·  )?/, '') || '—'})`, '#0af');
+
+            const startedAt = Date.now();
+            let n = 0;
+            let current = '';
+            renderProgress = () => {
+                const elapsed = Date.now() - startedAt;
+                const eta = n ? fmtDur(elapsed / n * (todo.length - n)) : '…';
+                setProgress(`${n}/${todo.length} written · ETA ${eta}${current ? ' · ' + current : ''}${progressNote ? ' · ' + progressNote : ''}  ||  ${tallyText(tallyOf(run.status))}`);
+            };
+
+            for (const i of todo) {
+                if (!running) { log('Stopped — progress saved. Start again to resume.', '#f55'); break; }
+                const [jobRef, val] = run.rows[i];
+                const hit = index.get(jobRef.trim().toUpperCase());
+                current = jobRef; progressNote = '';
+                renderProgress();
+                try {
+                    const res = await writeField(hit.id, field, val, emptyOnly);
+                    run.status[i] = res;
+                    if (res.s === ST.SET) log(`${jobRef}  "${res.p}" → "${val}"  ✓`, '#0fa');
+                    else if (res.s === ST.SAME) log(`${jobRef}  already "${res.p}"`, '#888');
+                    else if (res.s === ST.NOT_EMPTY) log(`${jobRef}  has "${res.p}" — skipped (only if empty)`, '#fa0');
+                    else if (res.s === ST.FROZEN) log(`${jobRef}  frozen — skipped`, '#fa0');
+                } catch (e) {
+                    if (e instanceof SessionError) {
+                        log(`${e.message} — stopped at ${jobRef}. Log back in, reload, and Start to resume.`, '#f55');
+                        running = false;
+                        break;
+                    }
+                    if (!running) { log('Stopped — progress saved. Start again to resume.', '#f55'); break; }
+                    run.status[i] = { s: ST.ERROR, m: e.message };
+                    log(`${jobRef}  ERROR ${e.message}`, '#f55');
+                }
+                n++;
+                saveProgress();
+                renderProgress();
+            }
+
+            current = '';
+            const t = tallyOf(run.status);
+            const left = pendingCount();
             log('');
-            log('Not updated:', '#f55');
-            failed.forEach(f => log('  ' + f, '#f99'));
+            log('===== SUMMARY =====', '#0af');
+            log(`Written this session: ${n}  ·  elapsed ${fmtDur(Date.now() - startedAt)}`, '#0fa');
+            log(`Whole list (${run.rows.length}): ${tallyText(t)}`, '#0fa');
+            if (left) log(`${left} rows still to do (not reached or errored) — Start again to resume/retry.`, '#fa0');
+            log('Use "Results CSV" for the full per-row outcome with previous values.', '#888');
+            setProgress(`${left ? 'Paused' : 'Done'} — ${tallyText(t)}${left ? ` · ${left} left` : ''}`);
+        } catch (e) {
+            log(`ERROR ${e.message}`, '#f55');
+            setProgress(e instanceof SessionError ? 'Logged out — log in, reload, Start to resume.' : `Error: ${e.message}`);
+        } finally {
+            running = false;
+            renderProgress = () => {};
+            refreshButtons();
         }
-        setProgress(`Done — ${curJob}/${total} jobs  ·  ${tally()}`);
+    }
 
-        running = false;
-        startBtn.style.display = 'inline-block';
-        stopBtn.style.display = 'none';
+    // =======================================================================
+    // Results CSV
+    // =======================================================================
+    function downloadCsv() {
+        if (!run) return;
+        const q = (s) => {
+            const str = s == null ? '' : String(s);
+            return /[",\r\n]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
+        };
+        const label = FIELDS[run.field];
+        const lines = [['Job Number', 'New ' + label, 'Previous ' + label, 'Result', 'Error'].map(q).join(',')];
+        run.rows.forEach(([j, v], i) => {
+            const s = run.status[i];
+            lines.push([j, v, s ? s.p : '', s ? s.s : 'pending', s && s.m ? s.m : ''].map(q).join(','));
+        });
+        const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `jl-${run.field === 'CustomReference' ? 'reference-number' : 'job-ref-1'}-results-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
     }
 
     // --- BOOT ---
