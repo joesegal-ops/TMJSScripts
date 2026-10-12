@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Assign Forms to Jobs
 // @namespace    com.joesegal.joblogic
-// @version      1.2.2
+// @version      1.3.0
 // @description  Floating panel: paste a tab-separated table of [Job Number, Form Name, Shown On, Req. Visit, Req. Asset] and bulk-assign (or bulk-remove) each form to/from its job via the CompanyForm API. "Required on Visit" / "Required on Asset" come from panel defaults, overridable per row. Works from any go.joblogic.com page (jobs are resolved by number).
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -122,25 +122,63 @@
     // =======================================================================
     const jlCsrfToken = () => document.querySelector('input[name="__RequestVerificationToken"]')?.value || '';
 
+    // go.joblogic.com sits behind an Azure App Gateway WAF that rate-limits per IP: bulk runs
+    // go clean for ~40 requests then start getting HTML 403s. 1400ms (~43/min) is the measured
+    // safe pace; it's a token bucket, so retry soon and escalate gently.
+    const MIN_REQUEST_INTERVAL = 1400;
+    const WAF_BACKOFF_MS = [1500, 3000, 6000, 12000, 20000];
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    let lastRequestAt = 0;
+    let currentInterval = MIN_REQUEST_INTERVAL;   // self-corrects upward if we still get blocked
+    let onWafRetry = null;                        // (pauseMs, intervalMs) => void, set by the run
+
+    async function throttle() {
+        const wait = currentInterval - (Date.now() - lastRequestAt);
+        if (wait > 0) await sleep(wait);
+        lastRequestAt = Date.now();
+    }
+
+    // Gateway block = HTML 403/429/503 from Azure (retryable). A JSON 403 from Joblogic is real.
+    function isWafBlock(r, txt) {
+        if (r.status !== 403 && r.status !== 429 && r.status !== 503) return false;
+        if (/Application-Gateway/i.test(r.headers.get('server') || '')) return true;
+        return /text\/html/i.test(r.headers.get('content-type') || '') || /403 Forbidden/i.test(txt || '');
+    }
+
+    // fetch + throttle + retry on WAF blocks. Returns { ok, status, j, txt }.
+    async function jlFetch(url, opts) {
+        for (let attempt = 0; ; attempt++) {
+            await throttle();
+            const r = await fetch(url, opts);
+            const txt = await r.text().catch(() => '');
+            if (!r.ok && isWafBlock(r, txt) && attempt < WAF_BACKOFF_MS.length) {
+                const pause = WAF_BACKOFF_MS[attempt];
+                if (currentInterval < 4000) currentInterval += 200;
+                onWafRetry?.(pause, currentInterval);
+                await sleep(pause);
+                continue;
+            }
+            let j = null; try { j = JSON.parse(txt); } catch (e) {}
+            return { ok: r.ok, status: r.status, j, txt };
+        }
+    }
+
     // POST form-data with the CSRF token (matches JL_SERVICES.post isJsonToFormData).
     async function jlPostForm(url, fields) {
         const fd = new FormData();
         Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
-        const r = await fetch(url, {
+        return jlFetch(url, {
             method: 'POST', credentials: 'same-origin',
             headers: { '__RequestVerificationToken': jlCsrfToken(), 'X-Requested-With': 'XMLHttpRequest' },
             body: fd
         });
-        const txt = await r.text();
-        let j = null; try { j = JSON.parse(txt); } catch (e) {}
-        return { ok: r.ok, status: r.status, j, txt };
     }
 
     // Resolve a job number / reference to its internal job id.
     const _jobCache = new Map();
     async function resolveJob(ref) {
         if (_jobCache.has(ref)) return _jobCache.get(ref);
-        const r = await fetch('/api/Job/SearchJsonData', {
+        const r = await jlFetch('/api/Job/SearchJsonData', {
             method: 'POST', credentials: 'same-origin',
             headers: {
                 'Content-Type': 'application/json',
@@ -154,8 +192,8 @@
                 StartCompleteDate: '', EndCompleteDate: '', StartNextContactDate: '', EndNextContactDate: ''
             })
         });
-        if (!r.ok) throw new Error('Job search HTTP ' + r.status);
-        const d = await r.json();
+        if (!r.ok || !r.j) throw new Error('Job search HTTP ' + r.status);
+        const d = r.j;
         const jobs = d.AdditionalData?.Jobs || d.Data || [];
         const match = jobs.find(j => (j.JobNumber === ref || j.ReferenceNumber === ref)) || (jobs.length === 1 ? jobs[0] : null);
         if (!match) { _jobCache.set(ref, null); return null; }
@@ -455,7 +493,13 @@
             btn.disabled = true; btn.style.opacity = '0.6'; btn.textContent = removing ? 'Removing…' : 'Assigning…';
             const log = [];
             const write = () => { status.textContent = log.join('\n'); status.scrollTop = status.scrollHeight; };
-            let done = 0, ok = 0, fail = 0;
+            let done = 0, ok = 0, fail = 0, wafBlocks = 0;
+            currentInterval = MIN_REQUEST_INTERVAL;
+            onWafRetry = (pause, interval) => {
+                wafBlocks++;
+                log.push(`   … rate limited by gateway — retrying in ${pause / 1000}s (pacing now ${interval}ms)`);
+                write();
+            };
 
             for (const row of rows) {
                 done++;
@@ -494,7 +538,9 @@
                 }
                 write();
             }
-            log.push(`\nDone: ${ok} ${removing ? 'removed' : 'assigned'}, ${fail} failed.`);
+            onWafRetry = null;
+            log.push(`\nDone: ${ok} ${removing ? 'removed' : 'assigned'}, ${fail} failed.` +
+                (wafBlocks ? ` (${wafBlocks} rate-limit retries)` : ''));
             write();
             btn.disabled = false; btn.style.opacity = '1'; btn.textContent = removing ? 'Remove Forms' : 'Assign Forms';
         });
