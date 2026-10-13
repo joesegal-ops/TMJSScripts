@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL - Create 6-Month PPM Contracts + Floor Visits
 // @namespace    https://up-fm.com/joblogic
-// @version      1.0.0
+// @version      1.0.1
 // @description  Paste a 4-column TSV (Site, Start Date, No. Days, No. Floors) and pick an initiation date. For each row it creates a No-Billing PPM Contract on that Site running for 6 months from the initiation date, then adds one visit per floor starting on the row's Start Date and lasting No. Days. Preview (dry-run) first. Safe to re-run — existing contracts are reused and only missing floor visits are added.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
@@ -129,7 +129,7 @@
   const SCRIPT_ID = 'ppm-create-6month-contracts-floor-visits';
   const SCRIPT_LABEL = '🏗️ 6-Month PPMs + Floor Visits';
   const SCRIPT_COLOR = '#1b7a3a';
-  const SCRIPT_VERSION = 'v1.0.0';
+  const SCRIPT_VERSION = 'v1.0.1';
   const SCRIPT_DESC = 'Paste 4 columns (Site, Start Date, No. Days, No. Floors) and set the initiation date. Each row becomes a No-Billing PPM Contract on that Site for 6 months from the initiation date, with one visit per floor starting on the Start Date and lasting No. Days (unassigned). Click Preview first (nothing is changed), then Create all. Safe to re-run — existing contracts (same plan ref + site + start) are reused and only missing floor visits are added.';
 
   // ----------------------------------------------------------------------------
@@ -355,6 +355,17 @@
     return jlFetch(CFG.createUrl, { method: 'POST', body: fd }, false);
   }
 
+  // Create response carries the new contract GUID — as a bare string in AdditionalData,
+  // or wrapped in an object; accept any GUID-looking value we can find.
+  const GUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  function guidFromCreate(d) {
+    const ad = d.AdditionalData != null ? d.AdditionalData : d.additionalData;
+    const cands = [ad, ad && ad.Id, ad && ad.UniqueId, ad && ad.PPMContractId, ad && ad.Guid, d.Id, d.redirectUrl, d.RedirectUrl];
+    for (const c of cands) { const m = typeof c === 'string' && c.match(GUID_RE); if (m && !/^0{8}-/.test(m[0])) return m[0]; }
+    const m = JSON.stringify(d).match(GUID_RE);
+    return m && !/^0{8}-/.test(m[0]) ? m[0] : null;
+  }
+
   const normRef = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
 
   async function searchContracts(term) {
@@ -566,10 +577,18 @@
           } else {
             for (let attempt = 0; attempt <= CFG.createRetries && !guid; attempt++) {
               const res = await postCreate(job);
-              if (res.data && res.data.success) { guid = res.data.AdditionalData; break; }
-              // A WAF 403 can hide a real create — check before retrying.
-              existing = await findExisting(job);
+              const ok = !!(res.data && (res.data.success || res.data.Success));
+              guid = ok ? guidFromCreate(res.data) : null;
+              if (guid) break;
+              // Success without a readable id, or a WAF 403 that may hide a real create —
+              // find it by search (give the index a moment to catch up) before any retry.
+              for (let look = 0; look < 3 && !existing; look++) {
+                if (look) await sleep(2000);
+                existing = await findExisting(job);
+              }
               if (existing) { guid = existing.UniqueId; break; }
+              // Joblogic said success but we can't find it — never re-post (would duplicate).
+              if (ok) throw new Error('Created, but could not resolve the new contract id — re-run to add visits. Response: ' + (res.raw || '').slice(0, 200));
               if (attempt < CFG.createRetries && (res.waf || !res.data)) {
                 log('… ' + tag + ' — HTTP ' + res.status + ' (rate-limited); retrying', 'warn');
                 await sleep(CFG.wafBackoffMs[Math.min(attempt + 1, CFG.wafBackoffMs.length - 1)]);
