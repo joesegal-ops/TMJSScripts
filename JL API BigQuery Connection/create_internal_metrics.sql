@@ -39,6 +39,17 @@
 -- least one completed visit; Fixed = done in exactly ONE completed visit. Jobs closed with no completed visit
 -- (remote fixes, admin closures, ~6%) are left out of both. First_Time_Fix_Pct = Fixed / Jobs (0-1).
 --
+-- PROJECTS (2026-10-13; UK quotes whose job_type in models.quote_tracking is "Project"; SE quotes carry no type)
+--   Time_To_Quote_*        days from the PARENT job being logged to the quote being raised, by quote date. Only quotes
+--                          raised against a job (~64%); negative gaps (back-dated entry) dropped.
+--   Approval_To_Delivery_* days from quote approval to completion of the job it was upgraded into, by COMPLETION date.
+--                          The quote->job link is inferred (reporting.quote_to_job_completion): "low" confidence links
+--                          and negative durations (work finished before formal approval) are dropped.
+--   *_Total / *_Count give the average (*_Avg = Total / Count, so it can be re-averaged across segments); *_Median
+--   is per row only — it cannot be combined across segments.
+--   Quote_Conversion_Pct   of project quotes raised in the period (not cancelled), the share Won (status Approved/
+--                          Upgraded). Like PPM compliance, a month's figure rises as its outstanding quotes are decided.
+--
 -- BACKLOG (snapshot, NOT a flow): open "tickets" at the period's As_Of date (period end, or today for the current
 -- period) older than 30 / 60 / 100 days since logged. Tickets = every job except PPM (PM...) and Project jobs.
 -- Open at As_Of = logged on/before As_Of and not closed by then. Closed = status Completed/Invoiced/Costed/
@@ -85,6 +96,18 @@ jobs AS (
          (SELECT COUNTIF(v.StatusDescription = "Complete") FROM UNNEST(j.VisitsStatus) v)
   FROM `vmimporteddata.sweden_models.job_statutory_category` j
 ),
+project_quotes AS (  -- UK quotes typed "Project", with their site's area and parent job's logged date
+  SELECT q.Id AS quote_id, q.CustomerName, sa.Area,
+         DATE(q.DateLogged, "Europe/London") AS quote_date,
+         DATE(pj.DateLogged, "Europe/London") AS parent_logged_date,
+         (qt.status IN ("Approved", "Upgraded") OR IFNULL(qt.is_upgraded, FALSE)) AS is_won
+  FROM (SELECT * FROM `vmimporteddata.raw.quotes`
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
+  JOIN `vmimporteddata.models.quote_tracking` qt ON qt.quote_id = q.Id
+  LEFT JOIN site_area sa ON sa.SiteId = q.SiteId
+  LEFT JOIN `vmimporteddata.raw.jobs` pj ON pj.Id = q.ParentJobAutoId
+  WHERE qt.job_type = "Project" AND NOT IFNULL(q.IsCancelled, FALSE)
+),
 quote_jobs AS (  -- UK jobs that came from a quote
   SELECT upgraded_job_number AS JobNumber FROM `vmimporteddata.reporting.quote_to_job_completion`
   UNION DISTINCT
@@ -127,6 +150,23 @@ facts AS (
   FROM (SELECT * FROM `vmimporteddata.sweden_raw.quotes`
         QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
   WHERE NOT IFNULL(q.IsCancelled, FALSE)
+
+  UNION ALL  -- projects: time to quote (parent job logged -> quote raised), by quote date
+  SELECT "UK", CustomerName, Area, "ttq", quote_date, NULL, NULL, NULL,
+         DATE_DIFF(quote_date, parent_logged_date, DAY)
+  FROM project_quotes
+  WHERE parent_logged_date IS NOT NULL AND quote_date >= parent_logged_date
+
+  UNION ALL  -- projects: conversion (amount = 1 if won), by quote date
+  SELECT "UK", CustomerName, Area, "conv", quote_date, NULL, NULL, NULL, IF(is_won, 1, 0)
+  FROM project_quotes
+
+  UNION ALL  -- projects: quote approval -> upgraded job completed, by completion date
+  SELECT "UK", pq.CustomerName, pq.Area, "deliv", d.completed_date, NULL, NULL, NULL,
+         d.days_approval_to_completion
+  FROM `vmimporteddata.reporting.quote_to_job_completion` d
+  JOIN project_quotes pq ON pq.quote_id = d.quote_id
+  WHERE d.is_complete AND d.days_approval_to_completion >= 0 AND d.link_confidence != "low"
 
   UNION ALL  -- invoices (UK only — no SE invoice table), split by whether the job came from a quote
   SELECT "UK", i.CustomerName, COALESCE(j.Area, sa.Area),
@@ -174,6 +214,14 @@ flow AS (
     COUNTIF(f.kind = "ppm" AND f.category = "Non-Statutory" AND f.done_date IS NOT NULL) AS Non_Statutory_PPM_On_Time,
     COUNTIF(f.kind = "ftf")                         AS First_Time_Fix_Jobs,
     SUM(IF(f.kind = "ftf", f.amount, NULL))         AS First_Time_Fix_Fixed,
+    SUM(IF(f.kind = "ttq", f.amount, NULL))         AS Time_To_Quote_Total,
+    COUNTIF(f.kind = "ttq")                         AS Time_To_Quote_Count,
+    APPROX_QUANTILES(IF(f.kind = "ttq", f.amount, NULL), 2)[OFFSET(1)]   AS Time_To_Quote_Median,
+    SUM(IF(f.kind = "deliv", f.amount, NULL))       AS Approval_To_Delivery_Total,
+    COUNTIF(f.kind = "deliv")                       AS Approval_To_Delivery_Count,
+    APPROX_QUANTILES(IF(f.kind = "deliv", f.amount, NULL), 2)[OFFSET(1)] AS Approval_To_Delivery_Median,
+    COUNTIF(f.kind = "conv")                        AS Quote_Conversion_Quotes,
+    SUM(IF(f.kind = "conv", f.amount, NULL))        AS Quote_Conversion_Won,
     COUNTIF(f.kind = "quote")                       AS Quotes_Raised,
     SUM(IF(f.kind = "quote",      f.amount, NULL))  AS Quoted_Value,
     SUM(IF(f.kind = "inv_quote",  f.amount, NULL))  AS Invoiced_From_Quotes,
@@ -217,6 +265,18 @@ SELECT
   IFNULL(f.First_Time_Fix_Jobs, 0)                      AS First_Time_Fix_Jobs,
   CAST(IFNULL(f.First_Time_Fix_Fixed, 0) AS INT64)      AS First_Time_Fix_Fixed,
   SAFE_DIVIDE(f.First_Time_Fix_Fixed, f.First_Time_Fix_Jobs)        AS First_Time_Fix_Pct,
+  -- projects (UK project quotes)
+  IFNULL(f.Time_To_Quote_Total, 0)                      AS Time_To_Quote_Total,
+  IFNULL(f.Time_To_Quote_Count, 0)                      AS Time_To_Quote_Count,
+  ROUND(SAFE_DIVIDE(f.Time_To_Quote_Total, f.Time_To_Quote_Count), 1)               AS Time_To_Quote_Avg,
+  f.Time_To_Quote_Median                                AS Time_To_Quote_Median,
+  IFNULL(f.Approval_To_Delivery_Total, 0)               AS Approval_To_Delivery_Total,
+  IFNULL(f.Approval_To_Delivery_Count, 0)               AS Approval_To_Delivery_Count,
+  ROUND(SAFE_DIVIDE(f.Approval_To_Delivery_Total, f.Approval_To_Delivery_Count), 1) AS Approval_To_Delivery_Avg,
+  f.Approval_To_Delivery_Median                         AS Approval_To_Delivery_Median,
+  IFNULL(f.Quote_Conversion_Quotes, 0)                  AS Quote_Conversion_Quotes,
+  CAST(IFNULL(f.Quote_Conversion_Won, 0) AS INT64)      AS Quote_Conversion_Won,
+  SAFE_DIVIDE(f.Quote_Conversion_Won, f.Quote_Conversion_Quotes)                    AS Quote_Conversion_Pct,
   -- money (ex VAT, in Currency)
   IFNULL(f.Quotes_Raised, 0)                            AS Quotes_Raised,
   ROUND(IFNULL(f.Quoted_Value, 0), 2)                   AS Quoted_Value,

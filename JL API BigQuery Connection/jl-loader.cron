@@ -66,6 +66,11 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 40 5 * * * root /opt/jl-loader/jl-run.sh tier_se-quote /opt/jl-loader/run_tier_se.sh "Quote/GetAll:quotes,FormsLogbook/getall:forms_logbook"
 50 5 * * * root /opt/jl-loader/jl-run.sh tier_se-purchaseorder /opt/jl-loader/run_tier_se.sh "purchaseorder/getall:purchase_orders,SubcontractorPurchaseOrder/GetAll:subcontractor_purchase_orders"
 0 6 * * *  root /opt/jl-loader/jl-run.sh tier_se-timesheet /opt/jl-loader/run_tier_se.sh "Timesheet/GetAll:timesheets"
+# SE invoices + job costs (added 2026-10-13 for the Neko AB dashboard). Slots avoid UK runs: the API client
+# is shared, so two loaders at once would breach the 100/min cap.
+5 */3 * * * root /opt/jl-loader/jl-run.sh incremental_se-invoices /opt/jl-loader/run_incremental_se.sh invoices
+45 6 * * 0  root /opt/jl-loader/jl-run.sh incremental_se-invoices-backfill /opt/jl-loader/run_incremental_se.sh invoices backfill
+30 6 * * *  root /opt/jl-loader/jl-run.sh job_costs_se-incr /opt/jl-loader/run_job_costs_se.sh incr
 
 # Job costs (per-job cost/sell): daily incr 02:30, after the nightly jobs full. Added 2026-08-25.
 30 2 * * * root /opt/jl-loader/jl-run.sh job_costs-incr /opt/jl-loader/run_job_costs.sh incr

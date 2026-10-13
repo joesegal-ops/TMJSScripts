@@ -117,7 +117,13 @@ SELECT
     WHERE s IS NOT NULL), ", ")                                                 AS Critical_Source
 FROM flagged f;
 
+-- TotalJobCost/Sell from sweden_raw.job_costs (run_job_costs_se.sh, daily 06:30; added 2026-10-13).
 CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.all_in_job` AS
+WITH job_cost AS (  -- one row per job; QUALIFY guards against upsert dupes
+  SELECT job_id, total_cost_exvat, total_sell_exvat
+  FROM `vmimporteddata.sweden_raw.job_costs`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY _ingested_at DESC) = 1
+)
 SELECT
   j.JobNumber AS ID, j.SiteName AS Site, j.Area AS Area, j.SitePostcode AS Post_Code,
   CAST(j.Telephone AS STRING) AS Telephone, j.Contact AS Contact, j.Description AS Description,
@@ -129,7 +135,8 @@ SELECT
   j.CustomerCustomReference AS Custom_Reference, j.ReportedFaultCode AS Reported_Fault_Code,
   j.ReportedSubFaultCode AS Reported_Sub_Fault_Code, j.ActualFaultCode AS Actual_Fault_Code,
   j.ActualSubFaultCode AS Actual_Sub_Fault_Code,
-  CAST(NULL AS NUMERIC) AS TotalJobCost, CAST(NULL AS NUMERIC) AS TotalJobSell,
+  CAST(ROUND(jc.total_cost_exvat, 2) AS NUMERIC) AS TotalJobCost,  -- ex-VAT, sweden_raw.job_costs
+  CAST(ROUND(jc.total_sell_exvat, 2) AS NUMERIC) AS TotalJobSell,  -- ex-VAT, sweden_raw.job_costs
   CAST(NULL AS NUMERIC) AS TotalQuoteCost, CAST(NULL AS NUMERIC) AS TotalQuoteSell,
   CAST(NULL AS NUMERIC) AS PurchaseOrderAdjustment,
   j.PriorityDescription AS Priority,
@@ -141,7 +148,8 @@ SELECT
   j.Tags AS Job_Tags,
   CAST(NULL AS BOOL) AS Service_Job, CAST(NULL AS STRING) AS Service_Description,
   j.Id AS Job_Auto_Id, j._ingested_at
-FROM `vmimporteddata.sweden_raw.jobs` j;
+FROM `vmimporteddata.sweden_raw.jobs` j
+LEFT JOIN job_cost jc ON jc.job_id = j.Id;
 
 CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.avg_visits_per_job` AS
 WITH visits_per_job AS (
@@ -227,3 +235,122 @@ SELECT
   CAST(NULL AS STRING)   AS Last_Note_Type,
   j._ingested_at
 FROM `vmimporteddata.sweden_raw.jobs` j;
+
+-- ============================================================================
+-- Invoice-side views for the Neko AB dashboard copy (added 2026-10-13). Source = sweden_raw.invoices
+-- (run_incremental_se.sh invoices: every 3h + Sunday backfill). SE billing is mostly monthly PPM
+-- CONTRACT invoices (JobNumber = contract no. e.g. PM0000003, no JobId) -- these carry Is_PPM_Invoice.
+-- Customer Grouped (Type 2) invoices have no job link: the per-job split needs
+-- load_grouped_invoice_lines.py, which isn't deployed for either company. So they appear in
+-- invoices_enriched (no job fields) but NOT in pending_costs.
+-- ============================================================================
+
+-- Port of UK models.invoices_enriched (one row per invoice, SELL side only). Bind as invoices_enriched_neko.
+CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.invoices_enriched` AS
+SELECT
+  i.InvoiceNumber            AS Invoice_Number,
+  i.Id                       AS Invoice_Id,
+  i.Type                     AS Invoice_Type_Id,
+  (i.PPMContractId IS NOT NULL) AS Is_PPM_Invoice,
+  DATETIME(i.DateRaised, "Europe/Stockholm")     AS Invoice_Date,
+  DATETIME(i.PaymentDueDate, "Europe/Stockholm") AS Payment_Due_Date,
+  i.CustomerName             AS Customer,
+  i.CustomerId               AS Customer_Id,
+  i.SiteName                 AS Site,
+  i.SiteId                   AS Site_Id,
+  i.SitePostCode             AS Site_Postcode,
+  i.OrderNumber              AS Order_Number,
+  i.Description              AS Description,
+  i.JobDescription           AS Job_Description,
+  i.TotalExcludingVat        AS Total_Excl_VAT,
+  i.TotalVatAmount           AS Total_VAT,
+  i.TotalIncludingVat        AS Total_Incl_VAT,
+  i.GrandTotal               AS Grand_Total,
+  i.GlobalDiscount           AS Global_Discount,
+  i.IsCredit                 AS Is_Credit,
+  i.CreditReason             AS Credit_Reason,
+  i.IsDraft                  AS Is_Draft,
+  i.Tags                     AS Invoice_Tags,
+  i.JobNumber                AS Job_Number,
+  i.JobId                    AS Job_Id,
+  j.TypeDescription          AS Job_Type,
+  j.CategoryDescription      AS Job_Category,
+  j.JobStatusDescription     AS Job_Status,
+  j.JobTrade                 AS Job_Trade,
+  i.PPMContractId            AS PPM_Contract_Id,
+  i.UniqueId                 AS Invoice_Uid,
+  i._ingested_at
+FROM `vmimporteddata.sweden_raw.invoices` i
+LEFT JOIN `vmimporteddata.sweden_raw.jobs` j ON j.Id = i.JobId;
+
+-- Rebuild of the legacy importdata-494110.JobLogic.Pending_Costs_clean shape (the old emailed JL job-list
+-- export) so the dashboard copy's "Invoiced by Job Type" charts rebind. One row per job; invoice columns
+-- = that job's own (Type 0) non-draft invoices, ex-VAT (legacy Invoice_Value is ex-VAT -- checked against
+-- UK raw.invoices 2026-10-13), credits negative, several invoices summed. PPM contract invoices aren't
+-- on a job, so -- exactly as in the UK legacy data -- Maintenance jobs show no invoice value.
+-- No API source for: Latest_Task, Quote_ID, Service_*, Costs_Pending_Acceptance, Parent/Child quote/job
+-- -> typed NULLs. Job_Ref_1 = JobUserReferenceFieldValue.
+CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.pending_costs` AS
+WITH inv AS (
+  SELECT JobId,
+    STRING_AGG(LPAD(CAST(InvoiceNumber AS STRING), 6, "0"), ", " ORDER BY DateRaised) AS Invoice_Number,
+    CAST(ROUND(SUM(IF(IsCredit, -ABS(TotalExcludingVat), TotalExcludingVat)), 2) AS NUMERIC) AS Invoice_Value,
+    DATETIME(MAX(DateRaised), "Europe/Stockholm") AS InvoiceDate
+  FROM `vmimporteddata.sweden_raw.invoices`
+  WHERE JobId IS NOT NULL AND NOT IFNULL(IsDraft, FALSE)
+  GROUP BY JobId
+)
+SELECT
+  j.JobNumber                 AS Job_Number,
+  j.Description               AS Job_Description,
+  DATETIME(j.DateLogged, "Europe/Stockholm")             AS DateLogged,
+  j.LoggedByUserName          AS Logged_By,
+  DATETIME(j.TargetAttendanceDate, "Europe/Stockholm")   AS TargetAttendanceDate,
+  DATETIME(j.AppointmentDate, "Europe/Stockholm")        AS AppointmentDate,
+  DATETIME(j.TargetCompletetionDate, "Europe/Stockholm") AS Target_CompletionDate,
+  DATETIME(j.DateComplete, "Europe/Stockholm")           AS CompletedDate,
+  j.TypeDescription           AS Job_Type,
+  j.CategoryDescription       AS Job_Category,
+  j.JobTrade                  AS Job_Trade,
+  j.CustomReference           AS Job_Reference,
+  j.JobStatusDescription      AS Status,
+  j.PriorityDescription       AS Priority,
+  j.OrderNumber               AS Order_Number,
+  j.Contact                   AS Contact,
+  CAST(j.Telephone AS STRING) AS Telephone,
+  j.EmailAddress              AS Email_Address,
+  CAST(j.CustomerId AS STRING) AS Customer_ID,
+  j.CustomerName              AS Customer,
+  CAST(NULL AS STRING)        AS AccountNumber,
+  j.ReportedFaultCode         AS Reported_Fault_Code,
+  j.ReportedSubFaultCode      AS Reported_Sub_Fault_Code,
+  j.ActualFaultCode           AS Actual_Fault_Code,
+  j.ActualSubFaultCode        AS Actual_Sub_Fault_Code,
+  j.CustomerCustomReference   AS Custom_Reference,
+  CAST(j.SiteId AS STRING)    AS Site_ID,
+  j.SiteName                  AS Site,
+  j.SiteAddress1              AS Site_Address_1,
+  j.SiteAddress2              AS Site_Address_2,
+  j.SiteAddress3              AS Site_Address_3,
+  j.SiteAddress4              AS Site_Address_4,
+  j.SitePostcode              AS Site_Postcode,
+  j.SiteCustomReference       AS Site_Reference,
+  j.Area                      AS Area,
+  CAST(NULL AS STRING)        AS Latest_Task,
+  CAST(NULL AS STRING)        AS Quote_ID,
+  inv.Invoice_Number,
+  inv.Invoice_Value,
+  inv.InvoiceDate,
+  j.Tags                      AS Job_Tags,
+  (SELECT v.EngineerName FROM UNNEST(j.VisitsStatus) v
+     WHERE v.EngineerName IS NOT NULL ORDER BY v.StartDate LIMIT 1) AS First_Engineer,
+  CAST(NULL AS BOOL)          AS Service_Job,
+  CAST(NULL AS STRING)        AS Service_Description,
+  CAST(NULL AS BOOL)          AS Costs_Pending_Acceptance,
+  j.JobUserReferenceFieldValue AS Job_Ref_1,
+  CAST(NULL AS STRING)        AS Parent_Quote,
+  CAST(NULL AS STRING)        AS Parent_Quote_Contact,
+  CAST(NULL AS STRING)        AS Child_Quote,
+  CAST(NULL AS STRING)        AS Child_Job
+FROM `vmimporteddata.sweden_raw.jobs` j
+LEFT JOIN inv ON inv.JobId = j.Id;

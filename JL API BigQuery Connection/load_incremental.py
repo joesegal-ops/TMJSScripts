@@ -13,6 +13,7 @@ import os, json, time, datetime as dt
 from io import BytesIO
 import requests
 from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
 
 TID = os.environ["JL_TENANT_ID"]; CID = os.environ["JL_CLIENT_ID"]; CSEC = os.environ["JL_CLIENT_SECRET"]
 PROJECT = "vmimporteddata"; BASE = "https://api.joblogic.com/api/v1"
@@ -114,7 +115,10 @@ def main():
             print("no rows.", flush=True); return
         # Guardrail: never replace the live table with FEWER rows than it already has (a full
         # backfill should only ever grow or hold steady). Protects against a silent shortfall.
-        existing = bq.get_table(tbl).num_rows
+        try:
+            existing = bq.get_table(tbl).num_rows
+        except NotFound:  # first backfill into a new dataset (e.g. sweden_raw.invoices)
+            existing = 0
         if len(rows) < existing:
             raise RuntimeError(f"backfill refused: fetched {len(rows)} < existing {existing} in {tbl}")
         # Load into a staging table first, swap in only on success — the live table is never
