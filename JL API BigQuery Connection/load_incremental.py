@@ -2,8 +2,8 @@
 
 The Joblogic API has no 'updated since' filter, so we window on the dates it DOES expose and
 upsert by key. Two modes:
-  incr     (default): pull the last JL_INCREMENTAL_DAYS days, upsert changed/new rows into raw.<table>
-  backfill          : walk monthly windows START_DATE..now, full-replace raw.<table>
+  incr     (default): pull the last JL_INCREMENTAL_DAYS days, upsert changed/new rows into $BQ_DATASET.<table>
+  backfill          : walk monthly windows START_DATE..now, full-replace $BQ_DATASET.<table>
                       (keeps each request tiny -> also avoids the invoice endpoint's 403 quota)
 
 Entity chosen via JL_INCR. Config below. Nightly full refreshes (loader.py / run_tier.sh) remain the
@@ -22,6 +22,9 @@ MODE = os.environ.get("JL_MODE", "incr")
 DAYS = int(os.environ.get("JL_INCREMENTAL_DAYS", "14"))
 START_DATE = os.environ.get("JL_START_DATE", "2024-07-31T00:00:00Z")
 PACE = 0.65
+# Target dataset: raw (UK) or sweden_raw (SE, set by run_incremental_se.sh). Was hard-coded "raw" until
+# 2026-10-13, so every SE incremental upserted Swedish jobs into raw.jobs (wiped by the 02:00 UK full).
+DATASET = os.environ.get("BQ_DATASET", "raw")
 
 JOB_FLAGS = {"IncludeReactiveJobs": True, "IncludePPMJobs": True, "IncludeInactive": True,
              "OnlyIncludePrimaryJobTrade": True, "IncludeTags": True, "IncludeContacts": True,
@@ -92,7 +95,7 @@ def gather(date_windows):
 def main():
     now = dt.datetime.now(dt.timezone.utc)
     bq = bigquery.Client(project=PROJECT)
-    tbl = f"{PROJECT}.raw.{CFG['table']}"
+    tbl = f"{PROJECT}.{DATASET}.{CFG['table']}"
     ing = now.isoformat()
 
     if MODE == "backfill":
@@ -116,7 +119,7 @@ def main():
             raise RuntimeError(f"backfill refused: fetched {len(rows)} < existing {existing} in {tbl}")
         # Load into a staging table first, swap in only on success — the live table is never
         # left truncated-but-unfilled if the load fails midway.
-        stg = f"{PROJECT}.raw._{CFG['table']}_backfill"
+        stg = f"{PROJECT}.{DATASET}._{CFG['table']}_backfill"
         bq.load_table_from_file(BytesIO("\n".join(json.dumps(r, default=str) for r in rows).encode()),
             stg, job_config=bigquery.LoadJobConfig(
                 source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
@@ -135,7 +138,7 @@ def main():
         print("no changed rows.", flush=True); return
     for r in rows: r["_ingested_at"] = ing
     schema = bq.get_table(tbl).schema
-    tmp = f"{PROJECT}.raw._{CFG['table']}_delta"
+    tmp = f"{PROJECT}.{DATASET}._{CFG['table']}_delta"
     bq.load_table_from_file(BytesIO("\n".join(json.dumps(r, default=str) for r in rows).encode()),
         tmp, job_config=bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
