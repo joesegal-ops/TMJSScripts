@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.17
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.17: optional Job/Action TSV - only process listed jobs, and set Non-Chargeable on SPO cost lines where asked; patient page loading (no longer stops at a slow page). v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
+// @version      1.18
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.18: with a job list on the SPO page, looks up just those jobs (no full crawl); never touches Cancelled POs. v1.17: optional Job/Action TSV - only process listed jobs, and set Non-Chargeable on SPO cost lines where asked; patient page loading (no longer stops at a slow page). v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -103,7 +103,7 @@
     // ===== end shared dock =====
 
     // Read from the metadata block so the on-screen version can never drift from @version.
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.17');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.18');
     const SCRIPT_ID = 'auto-deliver-pos';
     const SCRIPT_LABEL = '📦 Auto Deliver POs';
     const SCRIPT_COLOR = '#4c9f01';
@@ -681,6 +681,46 @@
         return null;
     }
 
+    // Direct SPO lookup by job number - the same search the SPO list page runs
+    // (POST /SubContractorPO/PurchaseOrderSearchJson, form-encoded). The search is a
+    // "contains" match, so rows are filtered to the exact job number.
+    async function searchSPOsForJob(jobNo, token) {
+        var body = new URLSearchParams({
+            jobId: '', searchTerm: jobNo, pageSize: '50', pageIndex: '1', endDate: '', orderBy: '1', startDate: '',
+            selectedTab: 'All', tagIds: '', ownerIds: '', POTypeIds: '', POStatusIds: '', jobTypeIds: '', raisedByIds: '',
+            completionStatusIds: '', invoiceStatusIds: '', areaIds: '', tradeIds: '', siteIds: '', depotIds: ''
+        });
+        var text = await jlFetch('/SubContractorPO/PurchaseOrderSearchJson', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', '__RequestVerificationToken': token },
+            body: body
+        }, 'SPO search');
+        var rows = (JSON.parse(text).PurchaseOrders || []).filter(function (r) { return String(r.JobNumber || '').toUpperCase() === jobNo; });
+        return rows.map(function (r) {
+            var raw = String(r.DeliveryStatusDescription || '').toLowerCase();
+            return {
+                id: r.Id, jobNo: r.JobNumber, jobId: r.JobAutoId ? String(r.JobAutoId) : null,
+                poNumber: r.PONumber, poStatus: r.POStatusDescription || '', rawStatus: raw,
+                deliveryStatus: raw === 'not completed' ? 'not delivered' : raw.indexOf('partial') !== -1 ? 'partially delivered' : raw
+            };
+        });
+    }
+
+    async function lookupListedSPOs(jobList, skipPartial, token) {
+        var jobs = [];
+        jobList.entries.forEach(function (e) { if (e.action !== 'skip' && jobs.indexOf(e.job) === -1) jobs.push(e.job); });
+        var out = [];
+        for (var i = 0; i < jobs.length && running; i++) {
+            setProgress('Looking up SPOs: job ' + (i + 1) + '/' + jobs.length + ' (' + jobs[i] + ')');
+            var rows = await searchSPOsForJob(jobs[i], token);
+            var target = filterPOs(rows, skipPartial);
+            log(jobs[i] + ': ' + rows.length + ' SPO(s), ' + target.length + ' outstanding' + (rows.length ? ' - ' + rows.map(function (r) { return r.poNumber + ' ' + r.poStatus + '/' + r.rawStatus; }).join(', ') : ''), '#0af');
+            out = out.concat(target);
+        }
+        return out;
+    }
+
     // --- SET SPO COST LINES NON-CHARGEABLE ---
     // Same request the job Costs tab "Edit Subcontractor Cost" form sends when Chargeable
     // type = Non-Chargeable. Body rebuilt from GetEditSubcontractorCostMetadata; verified
@@ -788,9 +828,24 @@
         }
 
         try {
-            // Step 1: Collect all undelivered POs
-            log('Collecting undelivered POs from all pages...', '#0af');
-            var targetPOs = await collectAllPOs(skipPartial);
+            // Step 1: Collect undelivered POs - straight from the job list when there is one
+            // (SPO page), otherwise crawl every page of the list.
+            var targetPOs;
+            if (jobList && spo) {
+                log('Looking up SPOs for the ' + jobList.entries.length + ' listed job row(s) - no full list crawl', '#0af');
+                targetPOs = await lookupListedSPOs(jobList, skipPartial, token);
+            } else {
+                if (jobList) log('Job list given, but direct lookup is only built for the SPO page - crawling all pages and filtering', '#fa0');
+                log('Collecting undelivered POs from all pages...', '#0af');
+                targetPOs = await collectAllPOs(skipPartial);
+            }
+
+            // Never complete/deliver a cancelled PO.
+            var cancelled = targetPOs.filter(function (po) { return /cancel/i.test(po.poStatus || ''); });
+            if (cancelled.length) {
+                log('Ignoring ' + cancelled.length + ' Cancelled PO(s)' + (cancelled.length <= 20 ? ': ' + cancelled.map(function (po) { return (po.poNumber || po.id.substring(0, 8)) + ' (' + po.jobNo + ')'; }).join(', ') : ''), '#888');
+                targetPOs = targetPOs.filter(function (po) { return cancelled.indexOf(po) === -1; });
+            }
 
             if (!running) { log('Stopped by user.', '#f55'); return; }
 
