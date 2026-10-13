@@ -26,6 +26,8 @@ FROM `vmimporteddata.raw.customers`;
 -- Quote tracking. job_type/job_category come from raw.quote_types (Quote/GetById; the list endpoint
 -- returns them null) resolved to names via the static code maps. date_rejected comes from the status
 -- CDC (raw.quote_status_events) since the API exposes no rejection timestamp on standard quotes.
+-- parent_job_* = the job the quote was raised against (q.ParentJobAutoId; ~80% of quotes have one). Time to quote
+-- is a Looker calc field: date_logged - parent_job_logged (negative = back-dated entry, exclude).
 CREATE OR REPLACE VIEW `vmimporteddata.models.quote_tracking` AS
 WITH rejected AS (
   SELECT quote_id, MIN(observed_at) AS date_rejected
@@ -47,8 +49,10 @@ SELECT
   q.SiteName AS site, q.SitePostcode AS site_postcode, q.Contact AS contact, q.EmailAddress AS email,
   q.QuoteValueExcludingVat AS value_excl_vat, q.QuoteValue AS value_incl_vat,
   SAFE_CAST(q.ChanceOfSale AS FLOAT64) AS chance_of_sale,
-  q.IsCancelled AS is_cancelled, q.IsRejected AS is_rejected, q.IsUpgraded AS is_upgraded, q._ingested_at
+  q.IsCancelled AS is_cancelled, q.IsRejected AS is_rejected, q.IsUpgraded AS is_upgraded,
+  pj.JobNumber AS parent_job_number, DATE(pj.DateLogged, "Europe/London") AS parent_job_logged, q._ingested_at
 FROM `vmimporteddata.raw.quotes` q
+LEFT JOIN `vmimporteddata.raw.jobs` pj ON pj.Id = q.ParentJobAutoId
 LEFT JOIN `vmimporteddata.raw.quote_types` qt ON qt.quote_id = q.Id
 LEFT JOIN `vmimporteddata.raw.quote_jobtype_map` jtm ON jtm.code = qt.job_type_code
 LEFT JOIN `vmimporteddata.raw.job_category_map`  jcm ON jcm.code = qt.job_category_code

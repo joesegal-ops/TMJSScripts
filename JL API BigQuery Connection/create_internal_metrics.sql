@@ -11,6 +11,9 @@
 --             (Area "10 York Road" is the single site "10 York Road LON20".) Area is set on WeWork sites only,
 --             so the four areas add up to WeWork, not to the whole business. Quotes/invoices carry no area of
 --             their own: it comes from the site (every site maps to exactly one area in raw.jobs).
+-- Category: HVAC = job category "Heating and Cooling (HVAC)" (2026-10-13). Jobs, PPMs, invoices and costs use the
+--   JOB's category; quotes and project metrics use the QUOTE's own category (models.quote_tracking.job_category).
+--   Overlaps the Customer and Area cuts like they overlap each other — never add it to them.
 -- Neko Sweden = the separate SE tenant (sweden_* datasets) + any "Neko Health AB" record on the UK tenant.
 -- Its money is SEK (see Currency); the SE tenant has no invoices/costs loaded, so those columns are NULL there.
 --
@@ -73,7 +76,8 @@ segments AS (
   SELECT * FROM UNNEST([
     STRUCT(1 AS Segment_Order, "Customer" AS Segment_Type, "Neko UK" AS Segment),
     (2, "Customer", "Neko Sweden"), (3, "Customer", "WeWork"), (4, "Customer", "All Other Customers"),
-    (5, "Area", "East"), (6, "Area", "West"), (7, "Area", "ROUK"), (8, "Area", "10 York Road")])
+    (5, "Area", "East"), (6, "Area", "West"), (7, "Area", "ROUK"), (8, "Area", "10 York Road"),
+    (9, "Category", "HVAC")])
 ),
 site_area AS (
   SELECT SiteId, ANY_VALUE(Area) AS Area
@@ -86,21 +90,24 @@ jobs AS (
   SELECT "UK" AS tenant, j.Id AS job_id, j.JobNumber, j.CustomerName, j.TypeDescription, j.HasParent,
          j.JobStatusDescription AS status, j.Statutory_Category, COALESCE(j.Area, sa.Area) AS Area,
          DATE(j.DateLogged) AS logged_date, j.DateComplete, j.UpdatedAt,
-         (SELECT COUNTIF(v.StatusDescription = "Complete") FROM UNNEST(j.VisitsStatus) v) AS complete_visits
+         (SELECT COUNTIF(v.StatusDescription = "Complete") FROM UNNEST(j.VisitsStatus) v) AS complete_visits,
+         j.CategoryDescription AS job_category
   FROM `vmimporteddata.models.job_statutory_category_v2` j
   LEFT JOIN site_area sa ON sa.SiteId = j.SiteId
   UNION ALL
   SELECT "SE", j.Id, j.JobNumber, j.CustomerName, j.TypeDescription, j.HasParent,
          j.JobStatusDescription, j.Statutory_Category, CAST(NULL AS STRING),
          DATE(j.DateLogged), j.DateComplete, j.UpdatedAt,
-         (SELECT COUNTIF(v.StatusDescription = "Complete") FROM UNNEST(j.VisitsStatus) v)
+         (SELECT COUNTIF(v.StatusDescription = "Complete") FROM UNNEST(j.VisitsStatus) v),
+         j.CategoryDescription
   FROM `vmimporteddata.sweden_models.job_statutory_category` j
 ),
 project_quotes AS (  -- UK quotes typed "Project", with their site's area and parent job's logged date
   SELECT q.Id AS quote_id, q.CustomerName, sa.Area,
          DATE(q.DateLogged, "Europe/London") AS quote_date,
          DATE(pj.DateLogged, "Europe/London") AS parent_logged_date,
-         (qt.status IN ("Approved", "Upgraded") OR IFNULL(qt.is_upgraded, FALSE)) AS is_won
+         (qt.status IN ("Approved", "Upgraded") OR IFNULL(qt.is_upgraded, FALSE)) AS is_won,
+         qt.job_category
   FROM (SELECT * FROM `vmimporteddata.raw.quotes`
         QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
   JOIN `vmimporteddata.models.quote_tracking` qt ON qt.quote_id = q.Id
@@ -118,52 +125,53 @@ facts AS (
   SELECT tenant, CustomerName, Area, "ppm" AS kind, logged_date AS fact_date, Statutory_Category AS category,
          DATE(COALESCE(DateComplete,
                        IF(status IN ("Completed", "Invoiced", "Costed"), UpdatedAt, NULL))) AS done_date,
-         CAST(NULL AS DATE) AS closed_date, CAST(NULL AS FLOAT64) AS amount
+         CAST(NULL AS DATE) AS closed_date, CAST(NULL AS FLOAT64) AS amount, job_category
   FROM jobs
   WHERE STARTS_WITH(JobNumber, "PM") AND status != "Cancelled"
 
   UNION ALL  -- backlog tickets: one row per non-PPM, non-Project job, dated by logged date
   SELECT tenant, CustomerName, Area, "ticket", logged_date, NULL, NULL,
          IF(status IN ("Completed", "Invoiced", "Costed", "Cancelled"),
-            DATE(COALESCE(DateComplete, UpdatedAt)), NULL), NULL
+            DATE(COALESCE(DateComplete, UpdatedAt)), NULL), NULL, job_category
   FROM jobs
   WHERE NOT STARTS_WITH(JobNumber, "PM") AND IFNULL(TypeDescription, "") != "Project"
 
   UNION ALL  -- first time fix: completed tickets with >= 1 completed visit, dated by completion; amount = 1 if fixed in one
   SELECT tenant, CustomerName, Area, "ftf", DATE(COALESCE(DateComplete, UpdatedAt)), NULL, NULL, NULL,
-         IF(complete_visits = 1, 1, 0)
+         IF(complete_visits = 1, 1, 0), job_category
   FROM jobs
   WHERE NOT STARTS_WITH(JobNumber, "PM") AND IFNULL(TypeDescription, "") != "Project"
     AND status IN ("Completed", "Invoiced", "Costed") AND complete_visits >= 1
 
   UNION ALL  -- quotes raised (UK)
   SELECT "UK", q.CustomerName, sa.Area, "quote", DATE(q.DateLogged, "Europe/London"), NULL, NULL, NULL,
-         q.QuoteValueExcludingVat
+         q.QuoteValueExcludingVat, qt.job_category
   FROM (SELECT * FROM `vmimporteddata.raw.quotes`
         QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
   LEFT JOIN site_area sa ON sa.SiteId = q.SiteId
+  LEFT JOIN `vmimporteddata.models.quote_tracking` qt ON qt.quote_id = q.Id
   WHERE NOT IFNULL(q.IsCancelled, FALSE)
 
   UNION ALL  -- quotes raised (SE, SEK)
   SELECT "SE", q.CustomerName, NULL, "quote", DATE(q.DateLogged, "Europe/Stockholm"), NULL, NULL, NULL,
-         q.QuoteValueExcludingVat
+         q.QuoteValueExcludingVat, CAST(NULL AS STRING)
   FROM (SELECT * FROM `vmimporteddata.sweden_raw.quotes`
         QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
   WHERE NOT IFNULL(q.IsCancelled, FALSE)
 
   UNION ALL  -- projects: time to quote (parent job logged -> quote raised), by quote date
   SELECT "UK", CustomerName, Area, "ttq", quote_date, NULL, NULL, NULL,
-         DATE_DIFF(quote_date, parent_logged_date, DAY)
+         DATE_DIFF(quote_date, parent_logged_date, DAY), job_category
   FROM project_quotes
   WHERE parent_logged_date IS NOT NULL AND quote_date >= parent_logged_date
 
   UNION ALL  -- projects: conversion (amount = 1 if won), by quote date
-  SELECT "UK", CustomerName, Area, "conv", quote_date, NULL, NULL, NULL, IF(is_won, 1, 0)
+  SELECT "UK", CustomerName, Area, "conv", quote_date, NULL, NULL, NULL, IF(is_won, 1, 0), job_category
   FROM project_quotes
 
   UNION ALL  -- projects: quote approval -> upgraded job completed, by completion date
   SELECT "UK", pq.CustomerName, pq.Area, "deliv", d.completed_date, NULL, NULL, NULL,
-         d.days_approval_to_completion
+         d.days_approval_to_completion, pq.job_category
   FROM `vmimporteddata.reporting.quote_to_job_completion` d
   JOIN project_quotes pq ON pq.quote_id = d.quote_id
   WHERE d.is_complete AND d.days_approval_to_completion >= 0 AND d.link_confidence != "low"
@@ -171,7 +179,7 @@ facts AS (
   UNION ALL  -- invoices (UK only — no SE invoice table), split by whether the job came from a quote
   SELECT "UK", i.CustomerName, COALESCE(j.Area, sa.Area),
          IF(qj.JobNumber IS NOT NULL, "inv_quote", "inv_other"),
-         DATE(i.DateRaised, "Europe/London"), NULL, NULL, NULL, i.TotalExcludingVat
+         DATE(i.DateRaised, "Europe/London"), NULL, NULL, NULL, i.TotalExcludingVat, j.job_category
   FROM (SELECT * FROM `vmimporteddata.raw.invoices`
         QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) i
   LEFT JOIN jobs j ON j.tenant = "UK" AND j.job_id = i.JobId
@@ -180,7 +188,7 @@ facts AS (
   WHERE NOT IFNULL(i.IsDraft, FALSE)
 
   UNION ALL  -- other costs: cost lines on jobs that did not come from a quote (UK only)
-  SELECT "UK", j.CustomerName, j.Area, "cost_other", DATE(c.date_incurred), NULL, NULL, NULL, c.cost_excl_vat
+  SELECT "UK", j.CustomerName, j.Area, "cost_other", DATE(c.date_incurred), NULL, NULL, NULL, c.cost_excl_vat, j.job_category
   FROM `vmimporteddata.models.cost_line_items` c
   JOIN jobs j ON j.tenant = "UK" AND j.job_id = c.job_id
   WHERE c.date_incurred IS NOT NULL
@@ -199,7 +207,8 @@ seg_facts AS (
            CASE f.Area WHEN "East London"  THEN "East"
                        WHEN "West London"  THEN "West"
                        WHEN "Rest of UK"   THEN "ROUK"
-                       WHEN "10 York Road" THEN "10 York Road" END)
+                       WHEN "10 York Road" THEN "10 York Road" END),
+    STRUCT("Category", IF(f.job_category = "Heating and Cooling (HVAC)", "HVAC", NULL))
   ]) s
   WHERE s.Segment IS NOT NULL
     AND IFNULL(f.CustomerName, "") != "Test"
