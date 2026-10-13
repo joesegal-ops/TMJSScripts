@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JL - Create 6-Month PPM Contracts + Floor Visits
 // @namespace    https://up-fm.com/joblogic
-// @version      1.0.1
-// @description  Paste a 4-column TSV (Site, Start Date, No. Days, No. Floors) and pick an initiation date. For each row it creates a No-Billing PPM Contract on that Site running for 6 months from the initiation date, then adds one visit per floor starting on the row's Start Date and lasting No. Days. Preview (dry-run) first. Safe to re-run — existing contracts are reused and only missing floor visits are added.
+// @version      1.1.0
+// @description  Paste a TSV (Site, Start Date, No. Days, No. Floors, optional Engineer) and pick an initiation date. For each row it creates a No-Billing PPM Contract on that Site running for 6 months from the initiation date, then adds one visit per floor starting on the row's Start Date and lasting No. Days, optionally assigned to an engineer/subcontractor. Preview (dry-run) first. Safe to re-run — existing contracts are reused and only missing floor visits are added.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
 // @run-at       document-idle
@@ -25,7 +25,10 @@
  *        Start        : row Start Date at the panel start time (default 08:00)
  *        Duration     : No. Days, ending at the panel end time on the last day (default 17:00)
  *                       e.g. 5 days 08:00→17:00 = 4×1440 + 540 = 6300 minutes
- *        Unassigned (no engineer) — allocate afterwards as normal.
+ *        Assigned to : the panel "Assign to" name, or an optional 5th TSV column per row
+ *                      (Engineer list first, then Subcontractors). Blank = unassigned.
+ *        Existing floor visits that are still unassigned are assigned too (assigned ones
+ *        are never changed). Assigned visits are NOT deployed — deploy from the planner.
  *   Visits are verified by re-reading the contract (SavePPMContractVisits can return
  *   success:true while silently ignoring a save).
  *
@@ -129,8 +132,8 @@
   const SCRIPT_ID = 'ppm-create-6month-contracts-floor-visits';
   const SCRIPT_LABEL = '🏗️ 6-Month PPMs + Floor Visits';
   const SCRIPT_COLOR = '#1b7a3a';
-  const SCRIPT_VERSION = 'v1.0.1';
-  const SCRIPT_DESC = 'Paste 4 columns (Site, Start Date, No. Days, No. Floors) and set the initiation date. Each row becomes a No-Billing PPM Contract on that Site for 6 months from the initiation date, with one visit per floor starting on the Start Date and lasting No. Days (unassigned). Click Preview first (nothing is changed), then Create all. Safe to re-run — existing contracts (same plan ref + site + start) are reused and only missing floor visits are added.';
+  const SCRIPT_VERSION = 'v1.1.0';
+  const SCRIPT_DESC = 'Paste 4 columns (Site, Start Date, No. Days, No. Floors) and set the initiation date. Each row becomes a No-Billing PPM Contract on that Site for 6 months from the initiation date, with one visit per floor starting on the Start Date and lasting No. Days — assigned to the "Assign to" engineer/subcontractor (or a 5th column per row), else unassigned. Click Preview first (nothing is changed), then Create all. Safe to re-run — existing contracts (same plan ref + site + start) are reused and only missing floor visits are added.';
 
   // ----------------------------------------------------------------------------
   // CONFIG
@@ -220,7 +223,7 @@
       if (!start) { errors.push('Line ' + (i + 1) + ' (' + site + '): Start Date "' + (c[1] || '') + '" not recognised — skipped'); return; }
       if (!Number.isInteger(days) || days < 1) { errors.push('Line ' + (i + 1) + ' (' + site + '): No. Days "' + (c[2] || '') + '" must be a whole number ≥ 1 — skipped'); return; }
       if (!Number.isInteger(floors) || floors < 1) { errors.push('Line ' + (i + 1) + ' (' + site + '): No. Floors "' + (c[3] || '') + '" must be a whole number ≥ 1 — skipped'); return; }
-      rows.push({ line: i + 1, site, start, days, floors });
+      rows.push({ line: i + 1, site, start, days, floors, assignTo: c[4] || '' });
     });
     return { rows, errors };
   }
@@ -392,13 +395,69 @@
     return res.data.AdditionalData;
   }
 
+  // The contract's live visits that are this row's floor visits (matched by description).
+  const floorVisits = (ad, job) => { const want = new Set(job.descs.map(normRef)); return (ad.Visits || []).filter(v => !v.IsDeleted && want.has(normRef(v.Description))); };
   const liveDescs = ad => new Set((ad.Visits || []).filter(v => !v.IsDeleted).map(v => normRef(v.Description)));
 
+  // ---- Assignee lookup: Engineers first, then Subcontractors (full lists, matched client-side)
+  const ASSIGN = { engineer: 0, subcontractor: 3 }; // ENUM_ASSIGN_TYPE
+  const normName = n => String(n || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  let directories = null;
+  async function loadDirectories() {
+    if (directories) return directories;
+    const list = async url => {
+      const res = await jlFetch(url);
+      const d = res.data;
+      const arr = Array.isArray(d) ? d : ((d && (d.Data || d.data || d.results)) || []);
+      if (res.status !== 200 || !arr.length) throw new Error('Could not load ' + url + ' (HTTP ' + res.status + ')');
+      return arr.map(o => ({ id: o.Id, name: o.Name })).filter(o => o.name);
+    };
+    directories = { engineers: await list('/Staff/GetEngineers'), subs: await list('/Subcontractor/GetSubcontractorsBy') };
+    return directories;
+  }
+  function matchIn(name, list) {
+    const n = normName(name);
+    const exact = list.filter(o => normName(o.name) === n);
+    if (exact.length) return exact.length === 1 ? exact[0] : 'ambiguous';
+    const part = list.filter(o => normName(o.name).includes(n));
+    return part.length === 1 ? part[0] : (part.length ? 'ambiguous' : null);
+  }
+  // → null (blank = unassigned) or {type, AssignType, id, name}; throws if not found/ambiguous
+  async function resolveAssignee(name) {
+    if (!normName(name)) return null;
+    const dir = await loadDirectories();
+    const e = matchIn(name, dir.engineers);
+    if (e && e !== 'ambiguous') return { type: 'Engineer', AssignType: ASSIGN.engineer, id: e.id, name: e.name };
+    const sc = matchIn(name, dir.subs);
+    if (sc && sc !== 'ambiguous') return { type: 'Subcontractor', AssignType: ASSIGN.subcontractor, id: sc.id, name: sc.name };
+    if (e === 'ambiguous' || sc === 'ambiguous') throw new Error('"' + name + '" matches more than one engineer/subcontractor — use the full name');
+    throw new Error('"' + name + '" not found in Engineers or Subcontractors');
+  }
+  const assigneeFields = a => ({
+    AssignType: a ? a.AssignType : 0,
+    EngineerId: a && a.AssignType === 0 ? a.id : null,
+    EngineerTeamId: null,
+    SubcontractorId: a && a.AssignType === 3 ? a.id : null
+  });
+  const isUnassigned = v => !v.EngineerId && !v.EngineerTeamId && !v.SubcontractorId;
+
+  // Existing visit → edit submit (page's GetSubmitData shape), changing only the assignee.
+  function assignExisting(v, a) {
+    return Object.assign({
+      Id: v.Id, JobId: v.JobId, JobCategoryId: v.JobCategoryId, Description: v.Description,
+      StartDate: v.StartDate, EstDuration: v.EstDuration, FixedPriceValue: v.FixedPriceValue,
+      Appointment: v.Appointment || 0, SendEmailSMS: false,
+      IsNew: false, Edited: true, IsDeleted: false, FixedDuration: v.FixedDuration,
+      Assets: [], Tasks: [], LastUsedServiceOrder: v.LastUsedServiceOrder || null,
+      TradeId: v.TradeId, TradeDescription: v.TradeDescription,
+      IsDateAndTimeLocked: v.IsDateAndTimeLocked, AdminEnforcedLock: v.AdminEnforcedLock
+    }, assigneeFields(a));
+  }
+
   // New-visit submit object — same fields as the page's GetSubmitData for an IsNew row.
-  function newVisit(desc, startStr, durMin) {
+  function newVisit(desc, startStr, durMin, a) {
     return {
-      Id: crypto.randomUUID(), AssignType: 0,
-      EngineerId: null, EngineerTeamId: null, SubcontractorId: null,
+      Id: crypto.randomUUID(), ...assigneeFields(a),
       JobId: null, JobCategoryId: null, Description: desc,
       StartDate: startStr, EstDuration: durMin, FixedPriceValue: 0,
       Appointment: 0, // appointmentWaitingStatus
@@ -438,11 +497,12 @@
         <b>Visit desc</b><input id="sm-desc" type="text" style="${inp}grid-column:span 3;" title="{n} = floor number, {site} = site name">
         <b>Visit start</b><input id="sm-st" type="time" style="${inp}">
         <b>Ends (last day)</b><input id="sm-et" type="time" style="${inp}">
+        <b>Assign to</b><input id="sm-eng" type="text" placeholder="optional — engineer or subcontractor name (a 5th column overrides per row)" style="${inp}grid-column:span 3;">
         <b>Customer filter</b><input id="sm-cust" type="text" placeholder="optional — only if a site name exists under several customers" style="${inp}grid-column:span 3;">
       </div>
       <div id="sm-summary" style="margin-bottom:8px;color:#4a6572;"></div>
-      <label style="display:block;margin-bottom:8px;">Paste 4 columns — Site · Start Date · No. Days · No. Floors (header row optional):<br>
-        <textarea id="sm-table" spellcheck="false" placeholder="Site&#9;Start Date&#9;No Days&#9;No Floors&#10;1 Mark Square LON19&#9;03/11/2026&#9;5&#9;8" style="width:100%;height:120px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre;box-sizing:border-box;"></textarea>
+      <label style="display:block;margin-bottom:8px;">Paste Site · Start Date · No. Days · No. Floors · <i>Engineer (optional)</i> — header row optional:<br>
+        <textarea id="sm-table" spellcheck="false" placeholder="Site&#9;Start Date&#9;No Days&#9;No Floors&#9;Engineer&#10;1 Mark Square LON19&#9;03/11/2026&#9;5&#9;8&#9;Joe Segal" style="width:100%;height:120px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;white-space:pre;box-sizing:border-box;"></textarea>
       </label>
       <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
         <button id="sm-preview" class="jl-button-green" style="padding:5px 14px;">Preview</button>
@@ -469,7 +529,7 @@
     const link = (guid, text) => '<a href="/PPMContract/Detail/' + guid + '#visitsTab" target="_blank" style="color:#1b6fb3;">' + esc(text) + '</a>';
 
     // Settings persist per browser (convenience only).
-    const fields = { init: '', months: DEFAULTS.months, plan: DEFAULTS.planTpl, desc: DEFAULTS.visitTpl, st: DEFAULTS.startTime, et: DEFAULTS.endTime, cust: '' };
+    const fields = { init: '', months: DEFAULTS.months, plan: DEFAULTS.planTpl, desc: DEFAULTS.visitTpl, st: DEFAULTS.startTime, et: DEFAULTS.endTime, eng: '', cust: '' };
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch (e) {}
     Object.keys(fields).forEach(k => { $(k).value = saved[k] != null ? saved[k] : fields[k]; });
@@ -482,7 +542,7 @@
       const s = readSettings();
       const st = parseDate(s.init), months = parseInt(s.months, 10);
       $('summary').innerHTML = st && months > 0
-        ? '<b>Contract</b> ' + dmy(st) + ' → ' + dmy(contractEnd(st, months)) + ' · <b>No Billing</b> · visits ' + esc(s.st) + ' on day 1 → ' + esc(s.et) + ' on the last day, unassigned'
+        ? '<b>Contract</b> ' + dmy(st) + ' → ' + dmy(contractEnd(st, months)) + ' · <b>No Billing</b> · visits ' + esc(s.st) + ' on day 1 → ' + esc(s.et) + ' on the last day · ' + (s.eng.trim() ? 'assigned to <b>' + esc(s.eng.trim()) + '</b>' : 'unassigned') + ' unless the row names someone'
         : '<span style="color:' + COL.err + '">Set an initiation date.</span>';
     };
     Object.keys(fields).forEach(k => $(k).addEventListener('input', summarise));
@@ -524,6 +584,7 @@
           cStart, cEnd, dur, visitEnd,
           plan: s.plan.replace(/\{site\}/g, r.site).trim(),
           startStr: dmy(r.start) + ' ' + s.st,
+          assignName: r.assignTo || s.eng.trim(),
           descs: Array.from({ length: r.floors }, (_, i) => s.desc.replace(/\{n\}/g, i + 1).replace(/\{site\}/g, r.site).trim())
         });
       });
@@ -549,13 +610,19 @@
         status((dryRun ? 'Checking ' : 'Processing ') + (i + 1) + ' of ' + jobs.length + '…');
         try {
           job.site = await resolveSite(job.site, s.cust);
+          const who = await resolveAssignee(job.assignName); // throws before anything is created
+          const whoTxt = who ? who.type + ' ' + who.name : 'unassigned';
           const warns = [];
           if (job.start < cStartD || job.visitEnd > cEndD) warns.push('visit ' + dmy(job.start) + '–' + dmy(job.visitEnd) + ' falls outside the contract period');
 
           let existing = await findExisting(job);
           let guid = existing ? existing.UniqueId : null;
-          let haveDescs = new Set();
-          if (guid) haveDescs = liveDescs(await getVisits(guid));
+          let haveDescs = new Set(), toAssign = [];
+          if (guid) {
+            const ad0 = await getVisits(guid);
+            haveDescs = liveDescs(ad0);
+            toAssign = who ? floorVisits(ad0, job).filter(isUnassigned) : [];
+          }
           const todo = job.descs.filter(d => !haveDescs.has(normRef(d)));
 
           if (dryRun) {
@@ -563,7 +630,8 @@
             if (existing) log('    contract EXISTS: ' + existing.PPMContractNumber + ' — will reuse; ' + (job.floors - todo.length) + '/' + job.floors + ' floor visits already there', 'warn');
             else log('    new contract "' + job.plan + '"');
             log('    ' + todo.length + ' visit(s) to add: ' + (todo.length ? todo[0] + (todo.length > 1 ? ' … ' + todo[todo.length - 1] : '') : '—') +
-              ' · ' + job.startStr + ' for ' + job.days + ' day(s) (' + job.dur + ' min)');
+              ' · ' + job.startStr + ' for ' + job.days + ' day(s) (' + job.dur + ' min) · ' + whoTxt);
+            if (toAssign.length) log('    ' + toAssign.length + ' existing unassigned floor visit(s) will be assigned to ' + whoTxt, 'warn');
             warns.forEach(w => log('    ⚠ ' + w, 'warn'));
             existing ? tally.reused++ : tally.contracts++;
             tally.visits += todo.length;
@@ -605,15 +673,26 @@
           const ad = await getVisits(guid);
           const have = liveDescs(ad);
           const add = job.descs.filter(d => !have.has(normRef(d)));
-          if (!add.length) { log('    all ' + job.floors + ' floor visits already present', 'ok'); continue; }
-          await saveVisits(ad.PPMContractId, ad.SiteId, add.map(d => newVisit(d, job.startStr, job.dur)));
+          const reassign = who ? floorVisits(ad, job).filter(isUnassigned) : [];
+          const locked = reassign.filter(v => v.EditVisitAllowed === false);
+          const edits = reassign.filter(v => v.EditVisitAllowed !== false);
+          locked.forEach(v => log('    ⚠ ' + v.Description + ' (' + v.JobNumber + ') is locked/deployed — not reassigned', 'warn'));
+          if (!add.length && !edits.length) { log('    all ' + job.floors + ' floor visits already present' + (who ? ' and assigned' : ''), 'ok'); continue; }
+          await saveVisits(ad.PPMContractId, ad.SiteId,
+            add.map(d => newVisit(d, job.startStr, job.dur, who)).concat(edits.map(v => assignExisting(v, who))));
 
           // 3) Verify (success:true is not proof)
           const after = liveDescs(await getVisits(guid));
           const missing = job.descs.filter(d => !after.has(normRef(d)));
           tally.visits += add.length - missing.filter(d => add.includes(d)).length;
           if (missing.length) { tally.problems++; log('    ✗ ' + missing.length + ' visit(s) NOT saved: ' + missing.join(', '), 'err'); }
-          else log('    ✓ ' + add.length + ' visit(s) added (' + job.startStr + ', ' + job.days + ' day(s))', 'ok');
+          else if (add.length) log('    ✓ ' + add.length + ' visit(s) added (' + job.startStr + ', ' + job.days + ' day(s)) · ' + whoTxt, 'ok');
+          if (who) {
+            const afterAd = await getVisits(guid);
+            const unassigned = floorVisits(afterAd, job).filter(isUnassigned).filter(v => v.EditVisitAllowed !== false);
+            if (unassigned.length) { tally.problems++; log('    ✗ ' + unassigned.length + ' floor visit(s) still unassigned: ' + unassigned.map(v => v.Description).join(', '), 'err'); }
+            else if (edits.length) log('    ✓ ' + edits.length + ' existing visit(s) assigned to ' + whoTxt, 'ok');
+          }
           warns.forEach(w => log('    ⚠ ' + w, 'warn'));
         } catch (e) {
           tally.problems++;
