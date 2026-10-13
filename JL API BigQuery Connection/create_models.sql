@@ -418,69 +418,19 @@ SELECT ID, Site, Priority, Date_Logged, DateComplete, First_Visit, Hours_to_Visi
        ELSE "Within SLA" END AS SLA_Breached
 FROM with_hours;
 
--- Statutory / Critical classification from job Tags (2026-07-21). Returns ALL raw.jobs columns EXCEPT
--- the 27 that are 100% NULL/empty (listed in EXCEPT below) plus a derived Statutory_Category. Tags is a
--- comma-separated STRING; split + trim so we match WHOLE tags, not substrings (so "Critical Spares" is NOT
--- counted as "Critical"). Statutory wins if a job somehow carries both. Critical branch is currently 0 rows
--- (no exact "Critical" tag exists yet) but is future-proof. One row per job.
+-- Statutory / Critical / Non-Statutory classification, one row per UK job. (v1 2026-07-21, v2 2026-10-08,
+-- v1 folded in and DROPPED 2026-10-13 — v2 is the only version; it used to read v1, now it reads raw.jobs.)
+-- Returns ALL raw.jobs columns EXCEPT the 27 that are 100% NULL/empty (listed in EXCEPT below), local DATETIMEs,
+-- plus subcontractor flags, Contract_Tags and the derived Statutory_Category / _Source columns.
 -- NB the EXCEPT list is a point-in-time snapshot of all-empty columns; if a previously-empty column starts
 -- getting populated it will stay hidden until removed from this list (re-run the null-count check to refresh).
 -- Is_Subcontracted (2026-10-07): TRUE if a subcontractor is allocated on the job (raw.jobs.Subcontractors)
 -- OR the job has a non-cancelled subcontractor PO. Both are needed: ~650 jobs carry a subcontractor with
 -- no PO, and ~190 have a live PO but no subcontractor left on the job. Subcontractor_Names unions both.
-CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category` AS
-WITH spo AS (
-  SELECT JobNumber,
-         ARRAY_AGG(DISTINCT TRIM(SubContractorName) IGNORE NULLS) AS spo_names,
-         COUNT(DISTINCT PONumber)                                  AS spo_count
-  FROM `vmimporteddata.raw.subcontractor_purchase_orders`
-  WHERE JobNumber IS NOT NULL AND IFNULL(Status, "") != "Cancelled"
-  GROUP BY JobNumber
-)
-SELECT
-  j.* EXCEPT (
-    ActualFaultCode, ActualSubFaultCode, AssetFrequency, AttributeDescriptions, AxaAuthorisationCode,
-    AxaRef, CustomerContractId, CustomerContractNumber, DepotId, DepotName, DocumentName, EDIReference,
-    EquipmentClass, ExternalProjectNumber, ImportedEndDate, ImportedStartDate, JobSpendLimit, JobTempSite,
-    ProjectColor, ProjectMilestoneDate, ProjectMilestoneId, ProjectMilestoneName, ReportedFaultCode,
-    ReportedSubFaultCode, SitePreferredEngineerName, SiteTypeDescription, SiteTypeId
-  ) REPLACE (
-    DATETIME(j.AppointmentDate, "Europe/London")        AS AppointmentDate,
-    DATETIME(j.ApprovedDate, "Europe/London")           AS ApprovedDate,
-    DATETIME(j.DateComplete, "Europe/London")           AS DateComplete,
-    DATETIME(j.DateJobAttended, "Europe/London")        AS DateJobAttended,
-    DATETIME(j.DateLogged, "Europe/London")             AS DateLogged,
-    DATETIME(j.NextContactDate, "Europe/London")        AS NextContactDate,
-    DATETIME(j.TargetAttendanceDate, "Europe/London")   AS TargetAttendanceDate,
-    DATETIME(j.TargetCompletetionDate, "Europe/London") AS TargetCompletetionDate,
-    DATETIME(j.UpdatedAt, "Europe/London")              AS UpdatedAt,
-    ARRAY(SELECT AS STRUCT v.* REPLACE (DATETIME(v.StartDate, "Europe/London") AS StartDate,
-                                        DATETIME(v.EndDate, "Europe/London")   AS EndDate)
-          FROM UNNEST(j.VisitsStatus) v WITH OFFSET o ORDER BY o) AS VisitsStatus
-  ),
-  CASE
-    WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory") THEN "Statutory"
-    WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "critical")  THEN "Critical"
-    ELSE "Non-Statutory"
-  END AS Statutory_Category,
-  (ARRAY_LENGTH(j.Subcontractors) > 0 OR spo.JobNumber IS NOT NULL) AS Is_Subcontracted,
-  (SELECT STRING_AGG(DISTINCT n, ", " ORDER BY n)
-     FROM UNNEST(ARRAY_CONCAT(IFNULL(j.Subcontractors, []), IFNULL(spo.spo_names, []))) n
-    WHERE TRIM(n) != "")                                             AS Subcontractor_Names,
-  IFNULL(spo.spo_count, 0)                                           AS Subcontractor_PO_Count
-FROM `vmimporteddata.raw.jobs` j
-LEFT JOIN spo ON spo.JobNumber = j.JobNumber;
-
--- Neko Health UK Limited slice of job_statutory_category (for a Neko-specific report). (2026-07-22)
-CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category_neko` AS
-SELECT *
-FROM `vmimporteddata.models.job_statutory_category`
-WHERE CustomerName = "Neko Health UK Limited";
-
--- v2 of job_statutory_category (2026-10-08). Same rows/columns as v1 (v1 left untouched), but Statutory_Category
--- also looks at the PPM CONTRACT's tags and the job Description, because PPM jobs usually carry no job tags —
--- e.g. PM0000137/157 has no tags but its contract PM0000137 is tagged "StatutoryPPM" and the description says
--- "STATUTORY - Must be completed". Precedence: Statutory (any source) > Critical (job or contract tag) > Non-Statutory.
+-- Statutory_Category looks at the job's tags, the PPM CONTRACT's tags and the job Description, because PPM jobs
+-- usually carry no job tags — e.g. PM0000137/157 has no tags but its contract PM0000137 is tagged "StatutoryPPM"
+-- and the description says "STATUTORY - Must be completed". Precedence: Statutory (any source) > Critical (job or
+-- contract tag) > Non-Statutory. Tags are split + trimmed so WHOLE tags match ("Critical Spares" is not "Critical").
 --   * Contract tags come from raw.ppm_contract_tags (contract number = JobNumber prefix before "/"). The public API's
 --     PPMContract/GetAll has no tags, so that table comes from the web app's /api/PPMContract/SearchPPMContract,
 --     refreshed nightly ~01:00 by the Mac scheduled task "refresh-ppm-contract-tags" (pull_ppm_contract_tags.js
@@ -489,9 +439,47 @@ WHERE CustomerName = "Neko Health UK Limited";
 --   * Description: whole word "statutory", ignoring "non-statutory"/"non statutory".
 -- Statutory_Source / Critical_Source list every source that matched (e.g. "Contract Tag, Description").
 CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category_v2` AS
-WITH flagged AS (
+WITH spo AS (
+  SELECT JobNumber,
+         ARRAY_AGG(DISTINCT TRIM(SubContractorName) IGNORE NULLS) AS spo_names,
+         COUNT(DISTINCT PONumber)                                  AS spo_count
+  FROM `vmimporteddata.raw.subcontractor_purchase_orders`
+  WHERE JobNumber IS NOT NULL AND IFNULL(Status, "") != "Cancelled"
+  GROUP BY JobNumber
+),
+base AS (
   SELECT
-    v.* EXCEPT (Statutory_Category),
+    j.* EXCEPT (
+      ActualFaultCode, ActualSubFaultCode, AssetFrequency, AttributeDescriptions, AxaAuthorisationCode,
+      AxaRef, CustomerContractId, CustomerContractNumber, DepotId, DepotName, DocumentName, EDIReference,
+      EquipmentClass, ExternalProjectNumber, ImportedEndDate, ImportedStartDate, JobSpendLimit, JobTempSite,
+      ProjectColor, ProjectMilestoneDate, ProjectMilestoneId, ProjectMilestoneName, ReportedFaultCode,
+      ReportedSubFaultCode, SitePreferredEngineerName, SiteTypeDescription, SiteTypeId
+    ) REPLACE (
+      DATETIME(j.AppointmentDate, "Europe/London")        AS AppointmentDate,
+      DATETIME(j.ApprovedDate, "Europe/London")           AS ApprovedDate,
+      DATETIME(j.DateComplete, "Europe/London")           AS DateComplete,
+      DATETIME(j.DateJobAttended, "Europe/London")        AS DateJobAttended,
+      DATETIME(j.DateLogged, "Europe/London")             AS DateLogged,
+      DATETIME(j.NextContactDate, "Europe/London")        AS NextContactDate,
+      DATETIME(j.TargetAttendanceDate, "Europe/London")   AS TargetAttendanceDate,
+      DATETIME(j.TargetCompletetionDate, "Europe/London") AS TargetCompletetionDate,
+      DATETIME(j.UpdatedAt, "Europe/London")              AS UpdatedAt,
+      ARRAY(SELECT AS STRUCT v.* REPLACE (DATETIME(v.StartDate, "Europe/London") AS StartDate,
+                                          DATETIME(v.EndDate, "Europe/London")   AS EndDate)
+            FROM UNNEST(j.VisitsStatus) v WITH OFFSET o ORDER BY o) AS VisitsStatus
+    ),
+    (ARRAY_LENGTH(j.Subcontractors) > 0 OR spo.JobNumber IS NOT NULL) AS Is_Subcontracted,
+    (SELECT STRING_AGG(DISTINCT n, ", " ORDER BY n)
+       FROM UNNEST(ARRAY_CONCAT(IFNULL(j.Subcontractors, []), IFNULL(spo.spo_names, []))) n
+      WHERE TRIM(n) != "")                                             AS Subcontractor_Names,
+    IFNULL(spo.spo_count, 0)                                           AS Subcontractor_PO_Count
+  FROM `vmimporteddata.raw.jobs` j
+  LEFT JOIN spo ON spo.JobNumber = j.JobNumber
+),
+flagged AS (
+  SELECT
+    v.*,
     ct.Tags AS Contract_Tags,
     EXISTS (SELECT 1 FROM UNNEST(SPLIT(v.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory")     AS stat_job_tag,
     EXISTS (SELECT 1 FROM UNNEST(ct.TagList) t WHERE LOWER(TRIM(t)) = "statutoryppm")          AS stat_contract_tag,
@@ -499,7 +487,7 @@ WITH flagged AS (
                     r"\bstatutory\b")                                                           AS stat_description,
     EXISTS (SELECT 1 FROM UNNEST(SPLIT(v.Tags, ",")) t WHERE LOWER(TRIM(t)) = "critical")      AS crit_job_tag,
     EXISTS (SELECT 1 FROM UNNEST(ct.TagList) t WHERE LOWER(TRIM(t)) = "critical")              AS crit_contract_tag
-  FROM `vmimporteddata.models.job_statutory_category` v
+  FROM base v
   LEFT JOIN `vmimporteddata.raw.ppm_contract_tags` ct
     ON ct.PPMContractNumber = REGEXP_EXTRACT(v.JobNumber, r"^(PM\d+)/")
 )
@@ -517,6 +505,13 @@ SELECT
     IF(crit_job_tag, "Job Tag", NULL), IF(crit_contract_tag, "Contract Tag", NULL)]) s
     WHERE s IS NOT NULL), ", ")                                                 AS Critical_Source
 FROM flagged f;
+
+-- Neko Health UK Limited slice of job_statutory_category_v2 (for a Neko-specific report). (2026-07-22;
+-- repointed from v1 to v2 2026-10-13, so it gains Contract_Tags / _Source and the v2 categories.)
+CREATE OR REPLACE VIEW `vmimporteddata.models.job_statutory_category_neko` AS
+SELECT *
+FROM `vmimporteddata.models.job_statutory_category_v2`
+WHERE CustomerName = "Neko Health UK Limited";
 
 -- Invoice header + Job Type/Category/Status (one row per invoice). SELL side only (no cost on invoices).
 -- Job fields NULL for batch/PPM/credit invoices with no single-job link (~880). (2026-07-22)

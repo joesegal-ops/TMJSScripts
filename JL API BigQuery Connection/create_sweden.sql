@@ -55,32 +55,67 @@ FROM `vmimporteddata.sweden_models.job_and_visit_details`
 WHERE Visit_Status = "Complete" AND Engineer IS NOT NULL AND VisitEndDateTime IS NOT NULL
 GROUP BY engineer, date;
 
+-- Port of UK models.job_statutory_category_v2 (2026-10-13) so the Neko AB dashboard copy binds the same
+-- columns as job_statutory_category_neko. Differences from UK:
+--   * No PPM contract tags for SE (the Mac tag scrape is UK-only), so Contract_Tags is NULL and the
+--     "Contract Tag" source never fires. Categorisation = job tag + description only.
+--   * sweden_raw.subcontractor_purchase_orders doesn't exist (cron runs, SE has no SPOs so nothing lands),
+--     so subcontractor columns come from jobs.Subcontractors only and Subcontractor_PO_Count is 0. If SE
+--     SPOs appear, add the spo CTE back from the UK view.
 CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.job_statutory_category` AS
+WITH base AS (
+  SELECT
+    j.* EXCEPT (
+      ActualFaultCode, ActualSubFaultCode, AssetFrequency, AttributeDescriptions, AxaAuthorisationCode,
+      AxaRef, CustomerContractId, CustomerContractNumber, DepotId, DepotName, DocumentName, EDIReference,
+      EquipmentClass, ExternalProjectNumber, ImportedEndDate, ImportedStartDate, JobSpendLimit, JobTempSite,
+      ProjectColor, ProjectMilestoneDate, ProjectMilestoneId, ProjectMilestoneName, ReportedFaultCode,
+      ReportedSubFaultCode, SitePreferredEngineerName, SiteTypeDescription, SiteTypeId
+    ) REPLACE (
+      DATETIME(j.AppointmentDate, "Europe/Stockholm")        AS AppointmentDate,
+      SAFE_CAST(j.ApprovedBy AS INT64)                       AS ApprovedBy,       -- STRING in sweden_raw, INT64 in UK
+      DATETIME(SAFE_CAST(j.ApprovedDate AS TIMESTAMP), "Europe/Stockholm")    AS ApprovedDate,     -- STRING in sweden_raw
+      DATETIME(j.DateComplete, "Europe/Stockholm")           AS DateComplete,
+      DATETIME(j.DateJobAttended, "Europe/Stockholm")        AS DateJobAttended,
+      DATETIME(j.DateLogged, "Europe/Stockholm")             AS DateLogged,
+      DATETIME(SAFE_CAST(j.NextContactDate AS TIMESTAMP), "Europe/Stockholm") AS NextContactDate,  -- STRING in sweden_raw
+      DATETIME(j.TargetAttendanceDate, "Europe/Stockholm")   AS TargetAttendanceDate,
+      DATETIME(j.TargetCompletetionDate, "Europe/Stockholm") AS TargetCompletetionDate,
+      DATETIME(j.UpdatedAt, "Europe/Stockholm")              AS UpdatedAt,
+      ARRAY(SELECT AS STRUCT v.* REPLACE (DATETIME(v.StartDate, "Europe/Stockholm") AS StartDate,
+                                          DATETIME(v.EndDate, "Europe/Stockholm")   AS EndDate)
+            FROM UNNEST(j.VisitsStatus) v WITH OFFSET o ORDER BY o) AS VisitsStatus
+    ),
+    (ARRAY_LENGTH(j.Subcontractors) > 0)                              AS Is_Subcontracted,
+    (SELECT STRING_AGG(DISTINCT TRIM(n), ", " ORDER BY TRIM(n))
+       FROM UNNEST(IFNULL(j.Subcontractors, [])) n
+      WHERE TRIM(n) != "")                                             AS Subcontractor_Names,
+    0                                                                  AS Subcontractor_PO_Count
+  FROM `vmimporteddata.sweden_raw.jobs` j
+),
+flagged AS (
+  SELECT
+    v.*,
+    CAST(NULL AS STRING) AS Contract_Tags,
+    EXISTS (SELECT 1 FROM UNNEST(SPLIT(v.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory")     AS stat_job_tag,
+    REGEXP_CONTAINS(REGEXP_REPLACE(LOWER(IFNULL(v.Description, "")), r"non[\s-]*statutory", ""),
+                    r"\bstatutory\b")                                                           AS stat_description,
+    EXISTS (SELECT 1 FROM UNNEST(SPLIT(v.Tags, ",")) t WHERE LOWER(TRIM(t)) = "critical")      AS crit_job_tag
+  FROM base v
+)
 SELECT
-  j.* EXCEPT (
-    ActualFaultCode, ActualSubFaultCode, AssetFrequency, AttributeDescriptions, AxaAuthorisationCode,
-    AxaRef, CustomerContractId, CustomerContractNumber, DepotId, DepotName, DocumentName, EDIReference,
-    EquipmentClass, ExternalProjectNumber, ImportedEndDate, ImportedStartDate, JobSpendLimit, JobTempSite,
-    ProjectColor, ProjectMilestoneDate, ProjectMilestoneId, ProjectMilestoneName, ReportedFaultCode,
-    ReportedSubFaultCode, SitePreferredEngineerName, SiteTypeDescription, SiteTypeId
-  ) REPLACE (
-    DATETIME(j.AppointmentDate, "Europe/Stockholm")        AS AppointmentDate,
-    DATETIME(j.DateComplete, "Europe/Stockholm")           AS DateComplete,
-    DATETIME(j.DateJobAttended, "Europe/Stockholm")        AS DateJobAttended,
-    DATETIME(j.DateLogged, "Europe/Stockholm")             AS DateLogged,
-    DATETIME(j.TargetAttendanceDate, "Europe/Stockholm")   AS TargetAttendanceDate,
-    DATETIME(j.TargetCompletetionDate, "Europe/Stockholm") AS TargetCompletetionDate,
-    DATETIME(j.UpdatedAt, "Europe/Stockholm")              AS UpdatedAt,
-    ARRAY(SELECT AS STRUCT v.* REPLACE (DATETIME(v.StartDate, "Europe/Stockholm") AS StartDate,
-                                        DATETIME(v.EndDate, "Europe/Stockholm")   AS EndDate)
-          FROM UNNEST(j.VisitsStatus) v WITH OFFSET o ORDER BY o) AS VisitsStatus
-  ),
+  f.* EXCEPT (stat_job_tag, stat_description, crit_job_tag),
   CASE
-    WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "statutory") THEN "Statutory"
-    WHEN EXISTS (SELECT 1 FROM UNNEST(SPLIT(j.Tags, ",")) t WHERE LOWER(TRIM(t)) = "critical")  THEN "Critical"
+    WHEN stat_job_tag OR stat_description THEN "Statutory"
+    WHEN crit_job_tag                     THEN "Critical"
     ELSE "Non-Statutory"
-  END AS Statutory_Category
-FROM `vmimporteddata.sweden_raw.jobs` j;
+  END AS Statutory_Category,
+  ARRAY_TO_STRING(ARRAY(SELECT s FROM UNNEST([
+    IF(stat_job_tag, "Job Tag", NULL), IF(stat_description, "Description", NULL)]) s
+    WHERE s IS NOT NULL), ", ")                                                 AS Statutory_Source,
+  ARRAY_TO_STRING(ARRAY(SELECT s FROM UNNEST([IF(crit_job_tag, "Job Tag", NULL)]) s
+    WHERE s IS NOT NULL), ", ")                                                 AS Critical_Source
+FROM flagged f;
 
 CREATE OR REPLACE VIEW `vmimporteddata.sweden_models.all_in_job` AS
 SELECT
@@ -99,7 +134,10 @@ SELECT
   CAST(NULL AS NUMERIC) AS PurchaseOrderAdjustment,
   j.PriorityDescription AS Priority,
   (SELECT COUNT(*) FROM UNNEST(j.VisitsStatus) v WHERE v.StatusDescription = "Complete") AS Visit_Count,
-  CAST(NULL AS STRING) AS Visit_Notes,
+  CAST(NULL AS STRING) AS Visit_Notes,   -- no SE notes backfill
+  (SELECT v.EngineerName FROM UNNEST(j.VisitsStatus) v
+     WHERE v.EngineerName IS NOT NULL ORDER BY v.StartDate DESC LIMIT 1) AS Engineer,
+  CAST(NULL AS STRING) AS Last_Engineer_Note,
   j.Tags AS Job_Tags,
   CAST(NULL AS BOOL) AS Service_Job, CAST(NULL AS STRING) AS Service_Description,
   j.Id AS Job_Auto_Id, j._ingested_at
@@ -137,7 +175,7 @@ SELECT
 FROM `vmimporteddata.sweden_raw.quotes` q;
 
 CREATE OR REPLACE VIEW `vmimporteddata.sweden_reporting.jobs` AS
--- Neko AB dashboard jobs view. Ported from UK reporting.jobs WITHOUT the notes columns (SE has no notes backfill).
+-- Neko AB dashboard jobs view. Ported from UK reporting.jobs; notes columns are NULL/0 (SE has no notes backfill).
 SELECT
   j.JobNumber                 AS Job_Number,
   j.Id                        AS Job_Auto_Id,
@@ -177,5 +215,15 @@ SELECT
      DATE_DIFF(CURRENT_DATE("Europe/Stockholm"), DATE(j.DateLogged, "Europe/Stockholm"), DAY), NULL) AS Open_Age_Days,
   IF(j.DateJobAttended IS NOT NULL, TIMESTAMP_DIFF(j.DateJobAttended, j.DateLogged, HOUR), NULL) AS Response_Hours,
   NULLIF(j.PriorityResponseTime, 0) AS SLA_Target_Response_Minutes,
+  -- notes: typed NULL placeholders so the dashboard copy binds the same columns as UK reporting.jobs
+  CAST(NULL AS STRING)   AS Job_Notes,
+  CAST(NULL AS STRING)   AS Engineer_Notes,
+  0                      AS Job_Note_Count,
+  0                      AS Engineer_Note_Count,
+  0                      AS Total_Note_Count,
+  CAST(NULL AS STRING)   AS Last_Note,
+  CAST(NULL AS DATETIME) AS Last_Note_Date,
+  CAST(NULL AS STRING)   AS Last_Note_By,
+  CAST(NULL AS STRING)   AS Last_Note_Type,
   j._ingested_at
 FROM `vmimporteddata.sweden_raw.jobs` j;

@@ -17,9 +17,11 @@
 -- PPM COMPLIANCE (jobs numbered PM..., i.e. generated from a PPM contract; Cancelled excluded)
 --   Due date  = the job's DateLogged (JL creates each PPM job on its scheduled date; AppointmentDate agrees).
 --   Due       = PPMs falling due in the period, up to today for the current period.
---   On_Time   = of those, completed (DateComplete) by the END OF THE PERIOD they fell due in. So weekly
---               compliance is stricter than monthly: a PPM due Mon 3rd done Tue 11th is late for the week
---               but on time for the month. Completed-status jobs with no DateComplete fall back to UpdatedAt.
+--   On_Time   = of those, completed AT ANY TIME up to now (DateComplete set, or status Completed/Invoiced/Costed).
+--               Changed 2026-10-13 from "completed by the end of the period they fell due in" to match the Looker
+--               compliance tile (WeWork Statutory Sept 2026: 250/259 = 96.5%, was 234/259 = 90.3%). Consequence:
+--               a past month's figure keeps rising as late PPMs get closed. Column names kept so the Operations
+--               Metrics sheet formulas (which map *_Compliance_Pct -> *_PPM_On_Time / *_PPM_Due) don't break.
 --   Category  = Statutory_Category from models.job_statutory_category_v2 (job tag, contract tag "StatutoryPPM",
 --               or description), sweden_models.job_statutory_category for SE (job tags only).
 --   *_Compliance_Pct = On_Time / Due (0-1; format as % in Looker). NULL when nothing was due.
@@ -165,11 +167,11 @@ seg_facts AS (
 flow AS (
   SELECT p.Period_Type, p.Period_Start, f.Segment_Type, f.Segment,
     COUNTIF(f.kind = "ppm" AND f.category = "Statutory")                                AS Statutory_PPM_Due,
-    COUNTIF(f.kind = "ppm" AND f.category = "Statutory" AND f.done_date <= p.Period_End) AS Statutory_PPM_On_Time,
+    COUNTIF(f.kind = "ppm" AND f.category = "Statutory" AND f.done_date IS NOT NULL) AS Statutory_PPM_On_Time,
     COUNTIF(f.kind = "ppm" AND f.category = "Critical")                                 AS Critical_PPM_Due,
-    COUNTIF(f.kind = "ppm" AND f.category = "Critical" AND f.done_date <= p.Period_End)  AS Critical_PPM_On_Time,
+    COUNTIF(f.kind = "ppm" AND f.category = "Critical" AND f.done_date IS NOT NULL)  AS Critical_PPM_On_Time,
     COUNTIF(f.kind = "ppm" AND f.category = "Non-Statutory")                                AS Non_Statutory_PPM_Due,
-    COUNTIF(f.kind = "ppm" AND f.category = "Non-Statutory" AND f.done_date <= p.Period_End) AS Non_Statutory_PPM_On_Time,
+    COUNTIF(f.kind = "ppm" AND f.category = "Non-Statutory" AND f.done_date IS NOT NULL) AS Non_Statutory_PPM_On_Time,
     COUNTIF(f.kind = "ftf")                         AS First_Time_Fix_Jobs,
     SUM(IF(f.kind = "ftf", f.amount, NULL))         AS First_Time_Fix_Fixed,
     COUNTIF(f.kind = "quote")                       AS Quotes_Raised,
