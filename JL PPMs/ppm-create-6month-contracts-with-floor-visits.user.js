@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JL - Create 6-Month PPM Contracts + Floor Visits
 // @namespace    https://up-fm.com/joblogic
-// @version      1.1.0
+// @version      1.2.0
 // @description  Paste a TSV (Site, Start Date, No. Days, No. Floors, optional Engineer) and pick an initiation date. For each row it creates a No-Billing PPM Contract on that Site running for 6 months from the initiation date, then adds one visit per floor starting on the row's Start Date and lasting No. Days, optionally assigned to an engineer/subcontractor. Preview (dry-run) first. Safe to re-run — existing contracts are reused and only missing floor visits are added.
 // @match        https://go.joblogic.com/PPMContract
 // @match        https://go.joblogic.com/PPMContract/*
@@ -29,6 +29,10 @@
  *                      (Engineer list first, then Subcontractors). Blank = unassigned.
  *        Existing floor visits that are still unassigned are assigned too (assigned ones
  *        are never changed). Assigned visits are NOT deployed — deploy from the planner.
+ *   4. Optional "Update dates on existing visits": floor visits that already exist but whose
+ *      start / duration differ from the row are re-dated. Deployed visits (EditVisitAllowed
+ *      false) can't be re-dated this way — they're listed, not touched. Every move is verified
+ *      by re-reading (Joblogic returns success:true even when it ignores an edit).
  *   Visits are verified by re-reading the contract (SavePPMContractVisits can return
  *   success:true while silently ignoring a save).
  *
@@ -132,7 +136,7 @@
   const SCRIPT_ID = 'ppm-create-6month-contracts-floor-visits';
   const SCRIPT_LABEL = '🏗️ 6-Month PPMs + Floor Visits';
   const SCRIPT_COLOR = '#1b7a3a';
-  const SCRIPT_VERSION = 'v1.1.0';
+  const SCRIPT_VERSION = 'v1.2.0';
   const SCRIPT_DESC = 'Paste 4 columns (Site, Start Date, No. Days, No. Floors) and set the initiation date. Each row becomes a No-Billing PPM Contract on that Site for 6 months from the initiation date, with one visit per floor starting on the Start Date and lasting No. Days — assigned to the "Assign to" engineer/subcontractor (or a 5th column per row), else unassigned. Click Preview first (nothing is changed), then Create all. Safe to re-run — existing contracts (same plan ref + site + start) are reused and only missing floor visits are added.';
 
   // ----------------------------------------------------------------------------
@@ -441,18 +445,39 @@
   });
   const isUnassigned = v => !v.EngineerId && !v.EngineerTeamId && !v.SubcontractorId;
 
-  // Existing visit → edit submit (page's GetSubmitData shape), changing only the assignee.
-  function assignExisting(v, a) {
+  // Existing visit → edit submit (page's GetSubmitData shape). Only what's in `ch` changes:
+  // ch.assignee → new assignee (else the visit keeps its own); ch.start/ch.dur → re-date.
+  function editExisting(v, ch) {
+    const keep = { AssignType: v.AssignType, EngineerId: v.EngineerId || null, EngineerTeamId: v.EngineerTeamId || null, SubcontractorId: v.SubcontractorId || null };
     return Object.assign({
       Id: v.Id, JobId: v.JobId, JobCategoryId: v.JobCategoryId, Description: v.Description,
-      StartDate: v.StartDate, EstDuration: v.EstDuration, FixedPriceValue: v.FixedPriceValue,
+      StartDate: ch.start || v.StartDate, EstDuration: ch.dur != null ? ch.dur : v.EstDuration,
+      FixedPriceValue: v.FixedPriceValue,
       Appointment: v.Appointment || 0, SendEmailSMS: false,
-      IsNew: false, Edited: true, IsDeleted: false, FixedDuration: v.FixedDuration,
+      IsNew: false, Edited: true, IsDeleted: false, FixedDuration: ch.start ? true : v.FixedDuration,
       Assets: [], Tasks: [], LastUsedServiceOrder: v.LastUsedServiceOrder || null,
       TradeId: v.TradeId, TradeDescription: v.TradeDescription,
       IsDateAndTimeLocked: v.IsDateAndTimeLocked, AdminEnforcedLock: v.AdminEnforcedLock
-    }, assigneeFields(a));
+    }, ch.assignee ? assigneeFields(ch.assignee) : keep);
   }
+
+  const isOnDate = (v, job) => String(v.StartDate || '').trim() === job.startStr && Number(v.EstDuration) === job.dur;
+
+  // What to do with the floor visits already on the contract.
+  //  edits:  [{v, ch, assign, move}] editable visits that need assigning and/or re-dating
+  //  locked: [{v, assign, move}]     deployed visits that needed a change but can't be edited
+  function planExisting(ad, job, who, moveDates) {
+    const edits = [], locked = [];
+    floorVisits(ad, job).forEach(v => {
+      const assign = !!(who && isUnassigned(v));
+      const move = !!(moveDates && !isOnDate(v, job));
+      if (!assign && !move) return;
+      if (v.EditVisitAllowed === false) { locked.push({ v, assign, move }); return; }
+      edits.push({ v, assign, move, ch: { assignee: assign ? who : null, start: move ? job.startStr : null, dur: move ? job.dur : null } });
+    });
+    return { edits, locked };
+  }
+  const editWhat = e => [e.move ? 'move ' + e.v.StartDate + ' → ' + '{start}' : '', e.assign ? 'assign' : ''].filter(Boolean).join(' + ');
 
   // New-visit submit object — same fields as the page's GetSubmitData for an IsNew row.
   function newVisit(desc, startStr, durMin, a) {
@@ -498,6 +523,7 @@
         <b>Visit start</b><input id="sm-st" type="time" style="${inp}">
         <b>Ends (last day)</b><input id="sm-et" type="time" style="${inp}">
         <b>Assign to</b><input id="sm-eng" type="text" placeholder="optional — engineer or subcontractor name (a 5th column overrides per row)" style="${inp}grid-column:span 3;">
+        <b>Existing visits</b><label style="grid-column:span 3;font-weight:400;" title="Matches the contract by plan ref + site + initiation date, so keep the initiation date the same. Deployed visits can't be moved and are listed instead."><input id="sm-move" type="checkbox" style="vertical-align:middle;"> Update dates on existing floor visits to match the pasted Start Date / No. Days</label>
         <b>Customer filter</b><input id="sm-cust" type="text" placeholder="optional — only if a site name exists under several customers" style="${inp}grid-column:span 3;">
       </div>
       <div id="sm-summary" style="margin-bottom:8px;color:#4a6572;"></div>
@@ -533,8 +559,10 @@
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch (e) {}
     Object.keys(fields).forEach(k => { $(k).value = saved[k] != null ? saved[k] : fields[k]; });
+    $('move').checked = false; // never remembered — moving is opt-in each time
     const readSettings = () => {
       const s = {}; Object.keys(fields).forEach(k => { s[k] = $(k).value; });
+      s.move = $('move').checked;
       try { localStorage.setItem(LS_KEY, JSON.stringify(s)); } catch (e) {}
       return s;
     };
@@ -542,10 +570,11 @@
       const s = readSettings();
       const st = parseDate(s.init), months = parseInt(s.months, 10);
       $('summary').innerHTML = st && months > 0
-        ? '<b>Contract</b> ' + dmy(st) + ' → ' + dmy(contractEnd(st, months)) + ' · <b>No Billing</b> · visits ' + esc(s.st) + ' on day 1 → ' + esc(s.et) + ' on the last day · ' + (s.eng.trim() ? 'assigned to <b>' + esc(s.eng.trim()) + '</b>' : 'unassigned') + ' unless the row names someone'
+        ? '<b>Contract</b> ' + dmy(st) + ' → ' + dmy(contractEnd(st, months)) + ' · <b>No Billing</b> · visits ' + esc(s.st) + ' on day 1 → ' + esc(s.et) + ' on the last day · ' + (s.eng.trim() ? 'assigned to <b>' + esc(s.eng.trim()) + '</b>' : 'unassigned') + ' unless the row names someone' + (s.move ? ' · <b style="color:#9a6b00;">existing floor visits will be re-dated</b>' : '')
         : '<span style="color:' + COL.err + '">Set an initiation date.</span>';
     };
     Object.keys(fields).forEach(k => $(k).addEventListener('input', summarise));
+    $('move').addEventListener('change', summarise);
     summarise();
 
     $('copy').onclick = () => navigator.clipboard.writeText(outEl.textContent);
@@ -594,14 +623,14 @@
       log('Parsed ' + jobs.length + ' row(s), ' + jobs.reduce((a, j) => a + j.floors, 0) + ' floor visit(s). Contract ' + cStart + ' → ' + cEnd + ', No Billing.');
       if (!getToken()) log('! Anti-forgery token not found on this page — requests may be rejected. Reload and try again.', 'warn');
 
-      if (!dryRun && !window.confirm('Create up to ' + jobs.length + ' No-Billing PPM contract(s) (' + cStart + ' → ' + cEnd + ') and ' +
-        jobs.reduce((a, j) => a + j.floors, 0) + ' floor visit(s)?\n\nExisting contracts (same plan ref + site + start) are reused, and floor visits already on them are skipped.')) {
+      if (!dryRun && !window.confirm((s.move ? '⚠ Update dates is ON\n\n' : '') + 'Create up to ' + jobs.length + ' No-Billing PPM contract(s) (' + cStart + ' → ' + cEnd + ') and ' +
+        jobs.reduce((a, j) => a + j.floors, 0) + ' floor visit(s)?\n\nExisting contracts (same plan ref + site + start) are reused, and floor visits already on them are skipped' + (s.move ? '.\n\nUPDATE DATES is ON: existing floor visits on a different date/duration will be MOVED to the pasted dates.' : '.')) ) {
         status('Cancelled.', 'warn'); return;
       }
 
       setBusy(true); stopRequested = false;
       log(dryRun ? '── PREVIEW (dry run, nothing is changed) ──' : '── CREATING ──');
-      const tally = { contracts: 0, reused: 0, visits: 0, problems: 0 };
+      const tally = { contracts: 0, reused: 0, visits: 0, moved: 0, assigned: 0, problems: 0 };
 
       for (let i = 0; i < jobs.length; i++) {
         if (stopRequested) { log('■ Stopped by user before row ' + (i + 1) + '.', 'warn'); break; }
@@ -617,11 +646,11 @@
 
           let existing = await findExisting(job);
           let guid = existing ? existing.UniqueId : null;
-          let haveDescs = new Set(), toAssign = [];
+          let haveDescs = new Set(), pre = { edits: [], locked: [] };
           if (guid) {
             const ad0 = await getVisits(guid);
             haveDescs = liveDescs(ad0);
-            toAssign = who ? floorVisits(ad0, job).filter(isUnassigned) : [];
+            pre = planExisting(ad0, job, who, s.move);
           }
           const todo = job.descs.filter(d => !haveDescs.has(normRef(d)));
 
@@ -631,7 +660,12 @@
             else log('    new contract "' + job.plan + '"');
             log('    ' + todo.length + ' visit(s) to add: ' + (todo.length ? todo[0] + (todo.length > 1 ? ' … ' + todo[todo.length - 1] : '') : '—') +
               ' · ' + job.startStr + ' for ' + job.days + ' day(s) (' + job.dur + ' min) · ' + whoTxt);
-            if (toAssign.length) log('    ' + toAssign.length + ' existing unassigned floor visit(s) will be assigned to ' + whoTxt, 'warn');
+            pre.edits.forEach(e => log('    ↻ ' + e.v.Description + ' (' + e.v.JobNumber + '): ' + editWhat(e).replace('{start}', job.startStr) + (e.assign ? ' to ' + whoTxt : ''), 'warn'));
+            pre.locked.forEach(e => log('    ⚠ ' + e.v.Description + ' (' + e.v.JobNumber + ') is deployed/locked — can\'t ' + (e.move ? 'move (stays ' + e.v.StartDate + ')' : 'assign'), 'err'));
+            if (s.move && existing && !pre.edits.some(e => e.move) && !pre.locked.some(e => e.move)) log('    existing floor visits already on ' + job.startStr + ' / ' + job.dur + ' min');
+            tally.moved += pre.edits.filter(e => e.move).length;
+            tally.assigned += pre.edits.filter(e => e.assign).length;
+            if (pre.locked.length) tally.problems++;
             warns.forEach(w => log('    ⚠ ' + w, 'warn'));
             existing ? tally.reused++ : tally.contracts++;
             tally.visits += todo.length;
@@ -673,13 +707,12 @@
           const ad = await getVisits(guid);
           const have = liveDescs(ad);
           const add = job.descs.filter(d => !have.has(normRef(d)));
-          const reassign = who ? floorVisits(ad, job).filter(isUnassigned) : [];
-          const locked = reassign.filter(v => v.EditVisitAllowed === false);
-          const edits = reassign.filter(v => v.EditVisitAllowed !== false);
-          locked.forEach(v => log('    ⚠ ' + v.Description + ' (' + v.JobNumber + ') is locked/deployed — not reassigned', 'warn'));
-          if (!add.length && !edits.length) { log('    all ' + job.floors + ' floor visits already present' + (who ? ' and assigned' : ''), 'ok'); continue; }
+          const { edits, locked } = planExisting(ad, job, who, s.move);
+          locked.forEach(e => log('    ⚠ ' + e.v.Description + ' (' + e.v.JobNumber + ') is deployed/locked — can\'t ' + (e.move ? 'move (stays ' + e.v.StartDate + ')' : 'assign'), 'err'));
+          if (locked.length) tally.problems++;
+          if (!add.length && !edits.length) { log('    all ' + job.floors + ' floor visits already present' + (who ? ', assigned' : '') + (s.move ? ', on the right dates' : ''), 'ok'); warns.forEach(w => log('    ⚠ ' + w, 'warn')); continue; }
           await saveVisits(ad.PPMContractId, ad.SiteId,
-            add.map(d => newVisit(d, job.startStr, job.dur, who)).concat(edits.map(v => assignExisting(v, who))));
+            add.map(d => newVisit(d, job.startStr, job.dur, who)).concat(edits.map(e => editExisting(e.v, e.ch))));
 
           // 3) Verify (success:true is not proof)
           const after = liveDescs(await getVisits(guid));
@@ -687,11 +720,17 @@
           tally.visits += add.length - missing.filter(d => add.includes(d)).length;
           if (missing.length) { tally.problems++; log('    ✗ ' + missing.length + ' visit(s) NOT saved: ' + missing.join(', '), 'err'); }
           else if (add.length) log('    ✓ ' + add.length + ' visit(s) added (' + job.startStr + ', ' + job.days + ' day(s)) · ' + whoTxt, 'ok');
-          if (who) {
-            const afterAd = await getVisits(guid);
-            const unassigned = floorVisits(afterAd, job).filter(isUnassigned).filter(v => v.EditVisitAllowed !== false);
-            if (unassigned.length) { tally.problems++; log('    ✗ ' + unassigned.length + ' floor visit(s) still unassigned: ' + unassigned.map(v => v.Description).join(', '), 'err'); }
-            else if (edits.length) log('    ✓ ' + edits.length + ' existing visit(s) assigned to ' + whoTxt, 'ok');
+          if (edits.length || who) {
+            const byId = new Map(((await getVisits(guid)).Visits || []).map(v => [v.Id, v]));
+            const notMoved = edits.filter(e => e.move && !(byId.get(e.v.Id) && isOnDate(byId.get(e.v.Id), job)));
+            const notAssigned = edits.filter(e => e.assign && (!byId.get(e.v.Id) || isUnassigned(byId.get(e.v.Id))));
+            const moved = edits.filter(e => e.move).length - notMoved.length;
+            const assigned = edits.filter(e => e.assign).length - notAssigned.length;
+            tally.moved += moved; tally.assigned += assigned;
+            if (moved) log('    ✓ ' + moved + ' existing visit(s) moved to ' + job.startStr + ' (' + job.days + ' day(s))', 'ok');
+            if (assigned) log('    ✓ ' + assigned + ' existing visit(s) assigned to ' + whoTxt, 'ok');
+            if (notMoved.length) { tally.problems++; log('    ✗ ' + notMoved.length + ' visit(s) NOT moved (Joblogic ignored the edit): ' + notMoved.map(e => e.v.Description + ' ' + e.v.JobNumber).join(', '), 'err'); }
+            if (notAssigned.length) { tally.problems++; log('    ✗ ' + notAssigned.length + ' visit(s) still unassigned: ' + notAssigned.map(e => e.v.Description).join(', '), 'err'); }
           }
           warns.forEach(w => log('    ⚠ ' + w, 'warn'));
         } catch (e) {
@@ -700,8 +739,8 @@
         }
       }
 
-      const summary = (dryRun ? 'Preview: ' + tally.contracts + ' contract(s) to create, ' + tally.reused + ' to reuse, ' + tally.visits + ' visit(s) to add'
-        : 'Done: ' + tally.contracts + ' contract(s) created, ' + tally.reused + ' reused, ' + tally.visits + ' visit(s) added') +
+      const summary = (dryRun ? 'Preview: ' + tally.contracts + ' contract(s) to create, ' + tally.reused + ' to reuse, ' + tally.visits + ' visit(s) to add, ' + tally.moved + ' to move, ' + tally.assigned + ' to assign'
+        : 'Done: ' + tally.contracts + ' contract(s) created, ' + tally.reused + ' reused, ' + tally.visits + ' visit(s) added, ' + tally.moved + ' moved, ' + tally.assigned + ' assigned') +
         ', ' + tally.problems + ' problem(s).';
       status(summary, tally.problems ? 'warn' : 'ok');
       log('── ' + summary + ' ──', tally.problems ? 'warn' : 'ok');
