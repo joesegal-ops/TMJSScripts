@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Update Jobs: Description + Tag (TSV)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Paste a TSV/CSV of Job Number, new Description, Tag(s). Replaces each job's Description and adds the tag(s) (existing tags kept) in one save per job. Blank cells leave that field alone. Dry Run preview, Azure-WAF-safe pacing, verifies each save by re-reading the job. Collapses into the shared JL dock.
 // @match        https://go.joblogic.com/*
 // @grant        none
@@ -100,7 +100,7 @@
     }
     // ===== end shared dock =====
 
-    const VERSION = '1.0';
+    const VERSION = '1.1';
     const SCRIPT_ID = 'update-jobs-desc-tag';
     const SCRIPT_LABEL = '✏️ Update Jobs: Description + Tag';
     const SCRIPT_COLOR = '#3b5a2b';
@@ -272,17 +272,35 @@
         const normHeader = (s) => norm(s).replace(/_/g, ' ');
         const firstRow = (allRows[0] || []).map(normHeader);
 
+        // Header cells are matched loosely ("Tags to be added", "New job description", …).
+        const isJobH = (h) => JOB_HEADERS.includes(h) || /\bjob\b.*\b(no|number|ref)/.test(h);
+        const isDescH = (h) => DESC_HEADERS.includes(h) || /desc/.test(h);
+        const isTagH = (h) => TAG_HEADERS.includes(h) || /\btags?\b/.test(h);
+
         let jobCol = -1, descCol = -1, tagCol = -1, dataStart = 0;
         for (let i = 0; i < firstRow.length; i++) {
-            if (jobCol < 0 && JOB_HEADERS.includes(firstRow[i])) jobCol = i;
-            if (descCol < 0 && DESC_HEADERS.includes(firstRow[i])) descCol = i;
-            if (tagCol < 0 && TAG_HEADERS.includes(firstRow[i])) tagCol = i;
+            const h = firstRow[i];
+            if (jobCol < 0 && isJobH(h)) jobCol = i;
+            else if (descCol < 0 && isDescH(h)) descCol = i;
+            else if (tagCol < 0 && isTagH(h)) tagCol = i;
         }
-        if (jobCol >= 0 && (descCol >= 0 || tagCol >= 0)) {
+        const firstLooksLikeJob = /^[a-z]{2}\d{4,}/i.test((allRows[0] || [])[0] || '');
+        if (!firstLooksLikeJob && (jobCol >= 0 || descCol >= 0 || tagCol >= 0)) {
+            // Header row: any column it didn't recognise is assigned by position (Job, Description, Tag).
             dataStart = 1;
+            const free = firstRow.map((_, i) => i).filter(i => ![jobCol, descCol, tagCol].includes(i));
+            if (jobCol < 0) jobCol = free.shift() ?? -1;
+            if (descCol < 0) descCol = free.shift() ?? -1;
+            if (tagCol < 0) tagCol = free.shift() ?? -1;
         } else {
             jobCol = 0; descCol = 1; tagCol = 2; dataStart = 0;
         }
+        const columns = {
+            header: dataStart === 1,
+            job: jobCol >= 0 ? (dataStart ? allRows[0][jobCol] : 'column 1') : '(none)',
+            desc: descCol >= 0 ? (dataStart ? allRows[0][descCol] : 'column 2') : '(none)',
+            tag: tagCol >= 0 ? (dataStart ? allRows[0][tagCol] : 'column 3') : '(none)'
+        };
 
         const jobs = [];
         const seen = {};
@@ -309,7 +327,7 @@
             seen[key] = j;
             jobs.push(j);
         }
-        return { jobs, dupes };
+        return { jobs, dupes, columns };
     }
 
     // =======================================================================
@@ -343,7 +361,7 @@
 
         overlay.querySelector('#jl-jobdesctag-cancel').onclick = () => overlay.remove();
         overlay.querySelector('#jl-jobdesctag-ok').onclick = () => {
-            const { jobs: parsed, dupes, error } = parseInput(ta.value);
+            const { jobs: parsed, dupes, columns, error } = parseInput(ta.value);
             overlay.remove();
             if (error || !parsed.length) {
                 setProgress('No valid rows found. Check the format.');
@@ -352,6 +370,8 @@
             }
             jobsInput = parsed;
             logArea.innerHTML = '';
+            log(`Columns${columns.header ? ' (from header row)' : ''}: Job = "${columns.job}"  ·  Description = "${columns.desc}"  ·  Tag = "${columns.tag}"`, '#0af');
+            if (!jobsInput.some(j => j.tags.length)) log('No tags found in the paste — only descriptions will change. Check the Tag column.', '#fa0');
             log(`Loaded ${jobsInput.length} job${jobsInput.length === 1 ? '' : 's'}:`, '#0af');
             jobsInput.slice(0, 8).forEach(j => log(`  ${j.jobRef}  →  desc: ${j.description == null ? '(unchanged)' : '"' + short(j.description, 50) + '"'}  ·  tags: ${j.tags.join(', ') || '(none)'}`, '#ccc'));
             if (jobsInput.length > 8) log(`  … and ${jobsInput.length - 8} more`, '#888');
@@ -693,6 +713,7 @@
         };
         const showProgress = (now) => setProgress(`Job ${curJob}/${total}${now ? '  ·  ' + now : ''}  ·  ${tally()}`);
 
+        tagMap = null; // reload each run so tags created since the last run are found
         try {
             if (jobsInput.some(j => j.tags.length)) await loadTags();
             else tagMap = {};
@@ -709,7 +730,7 @@
             if (!running) { log('Stopped by user.', '#f55'); break; }
             const { jobRef, description, tags } = jobsInput[i];
             curJob = i + 1;
-            log(`--- [${i + 1}/${total}] ${jobRef} ---`, '#fff');
+            log(`--- [${i + 1}/${total}] ${jobRef}  ·  tags: ${tags.join(', ') || '(none)'}  ·  desc: ${description == null ? '(unchanged)' : 'new'} ---`, '#fff');
             showProgress(`${jobRef} — resolving tags`);
 
             const resolved = [];
@@ -752,7 +773,7 @@
                 const addedNames = res.addedTags.map(id => (resolved.find(r => r.id === id) || {}).title || id);
 
                 if (res.nothing) {
-                    log('  already has this description and tag(s) — skipped', '#888');
+                    log(`  nothing to change — ${description == null ? '' : 'description already matches; '}${resolved.length ? 'tag(s) already on the job' : 'no tags requested'}`, '#888');
                     stats.nothing++;
                 } else if (res.frozen) {
                     log('  frozen — cannot edit, skipped', '#fa0');
