@@ -50,6 +50,10 @@
 --                          and negative durations (work finished before formal approval) are dropped.
 --   *_Total / *_Count give the average (*_Avg = Total / Count, so it can be re-averaged across segments); *_Median
 --   is per row only — it cannot be combined across segments.
+--   Project_Sell / _Cost   WON project quotes by APPROVAL date (reporting.project_margin): sell = quote value ex VAT,
+--                          cost = Total_Cost_exVAT = GREATEST(quote cost, upgraded job's own cost) — never the sum.
+--   Project_Margin_Pct     (Sell - Cost) / Sell (0-1). GROSS margin on sold work, NOT net profit: JobLogic holds no
+--                          overheads. Priced margin, so it is known at approval — not dependent on invoicing.
 --   Quote_Conversion_Pct   of project quotes raised in the period (not cancelled), the share Won (status Approved/
 --                          Upgraded). Like PPM compliance, a month's figure rises as its outstanding quotes are decided.
 --
@@ -103,7 +107,7 @@ jobs AS (
   FROM `vmimporteddata.sweden_models.job_statutory_category` j
 ),
 project_quotes AS (  -- UK quotes typed "Project", with their site's area and parent job's logged date
-  SELECT q.Id AS quote_id, q.CustomerName, sa.Area,
+  SELECT q.Id AS quote_id, q.QuoteNumber AS quote_number, q.CustomerName, sa.Area,
          DATE(q.DateLogged, "Europe/London") AS quote_date,
          DATE(pj.DateLogged, "Europe/London") AS parent_logged_date,
          (qt.status IN ("Approved", "Upgraded") OR IFNULL(qt.is_upgraded, FALSE)) AS is_won,
@@ -176,6 +180,14 @@ facts AS (
   JOIN project_quotes pq ON pq.quote_id = d.quote_id
   WHERE d.is_complete AND d.days_approval_to_completion >= 0 AND d.link_confidence != "low"
 
+  UNION ALL  -- projects: margin on won project quotes, by approval date (two rows per quote: sell, cost)
+  SELECT "UK", pq.CustomerName, pq.Area, kind, m.Approved_Date, NULL, NULL, NULL,
+         IF(kind = "pm_sell", m.Quote_Sell_exVAT, m.Total_Cost_exVAT), pq.job_category
+  FROM `vmimporteddata.reporting.project_margin` m
+  JOIN project_quotes pq ON pq.quote_number = m.Quote_Number
+  CROSS JOIN UNNEST(["pm_sell", "pm_cost"]) AS kind
+  WHERE m.Is_Won AND m.Approved_Date IS NOT NULL
+
   UNION ALL  -- invoices (UK only — no SE invoice table), split by whether the job came from a quote
   SELECT "UK", i.CustomerName, COALESCE(j.Area, sa.Area),
          IF(qj.JobNumber IS NOT NULL, "inv_quote", "inv_other"),
@@ -229,6 +241,8 @@ flow AS (
     SUM(IF(f.kind = "deliv", f.amount, NULL))       AS Approval_To_Delivery_Total,
     COUNTIF(f.kind = "deliv")                       AS Approval_To_Delivery_Count,
     APPROX_QUANTILES(IF(f.kind = "deliv", f.amount, NULL), 2)[OFFSET(1)] AS Approval_To_Delivery_Median,
+    SUM(IF(f.kind = "pm_sell", f.amount, NULL))     AS Project_Sell,
+    SUM(IF(f.kind = "pm_cost", f.amount, NULL))     AS Project_Cost,
     COUNTIF(f.kind = "conv")                        AS Quote_Conversion_Quotes,
     SUM(IF(f.kind = "conv", f.amount, NULL))        AS Quote_Conversion_Won,
     COUNTIF(f.kind = "quote")                       AS Quotes_Raised,
@@ -286,6 +300,9 @@ SELECT
   IFNULL(f.Quote_Conversion_Quotes, 0)                  AS Quote_Conversion_Quotes,
   CAST(IFNULL(f.Quote_Conversion_Won, 0) AS INT64)      AS Quote_Conversion_Won,
   SAFE_DIVIDE(f.Quote_Conversion_Won, f.Quote_Conversion_Quotes)                    AS Quote_Conversion_Pct,
+  ROUND(IFNULL(f.Project_Sell, 0), 2)                   AS Project_Sell,
+  ROUND(IFNULL(f.Project_Cost, 0), 2)                   AS Project_Cost,
+  SAFE_DIVIDE(f.Project_Sell - f.Project_Cost, f.Project_Sell)                      AS Project_Margin_Pct,
   -- money (ex VAT, in Currency)
   IFNULL(f.Quotes_Raised, 0)                            AS Quotes_Raised,
   ROUND(IFNULL(f.Quoted_Value, 0), 2)                   AS Quoted_Value,
