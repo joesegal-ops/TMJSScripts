@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.40
-// @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder).
+// @version      3.41
+// @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder). v3.41: sections by PPM criticality (Statutory / Critical / Non-Statutory / Internal) from contract tags.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
 // @run-at       document-idle
@@ -113,7 +113,7 @@
     const VERSION   = '3.26';   // saved-state schema version — bump only when state shape changes
     // Displayed version — reads the userscript @version so the button header and
     // load log always track the installed version (bump @version, this follows).
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.40';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.41';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -239,6 +239,56 @@
     function categorise(desc) {
         for (const rule of CAT_RULES) if (rule.re.test(desc)) return rule;
         return CAT_GENERAL;
+    }
+
+    // ─── PPM criticality (top-level report sections) ──────────────────────────
+    // Derived from the CONTRACT's tags (whole tags, case/space/hyphen-insensitive):
+    // "StatutoryPPM"/"Statutory", "Critical", "Non Statutory", "Internal".
+    // Precedence when several match: Statutory > Critical > Non-Statutory > Internal.
+    // Fallback when no tag matches: whole word "statutory" / "non-statutory" in the
+    // plan description (same rule as the BQ job_statutory_category_v2 model).
+    const CRIT_DEFS = [
+        { name:'Statutory',     accent:'#b91c1c', bg:'#7f1d1d', text:'#fee2e2', tags:['statutory','statutoryppm'] },
+        { name:'Critical',      accent:'#ea580c', bg:'#7c2d12', text:'#ffedd5', tags:['critical','criticalppm'] },
+        { name:'Non-Statutory', accent:'#2563eb', bg:'#1e3a8a', text:'#dbeafe', tags:['nonstatutory','nonstatutoryppm'] },
+        { name:'Internal',      accent:'#64748b', bg:'#334155', text:'#e2e8f0', tags:['internal','internalppm'] },
+    ];
+    const CRIT_NONE = { name:'Unclassified', accent:'#9ca3af', bg:'#4b5563', text:'#f3f4f6', tags:[] };
+
+    function classifyCriticality(tags, desc) {
+        const norm = (tags || []).map(t => String(t).toLowerCase().replace(/[\s_-]+/g, ''));
+        for (const c of CRIT_DEFS) if (norm.some(t => c.tags.includes(t))) return c.name;
+        const d = String(desc || '');
+        if (/\bnon[\s-]?statutory\b/i.test(d)) return 'Non-Statutory';
+        if (/\bstatutory\b/i.test(d))          return 'Statutory';
+        return CRIT_NONE.name;
+    }
+
+    // Split a tags string/cell into individual tag names
+    function splitTags(v) {
+        return String(v || '').split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
+    }
+    function tagsFromCell(cell) {
+        if (!cell) return [];
+        // Chips/labels → one tag each; plain text → comma-separated
+        const chips = [...cell.querySelectorAll('span, .label, .badge, li')]
+            .filter(el => !el.querySelector('span, .label, .badge, li'))
+            .map(el => el.textContent.trim()).filter(Boolean);
+        return chips.length ? [...new Set(chips)] : splitTags(cell.textContent);
+    }
+
+    // Tags on the PPM contract detail page (Kendo MultiSelect #Job_TagIds)
+    function readContractTagsFromPage() {
+        try {
+            const $  = window.jQuery || window.$;
+            const el = document.getElementById('Job_TagIds');
+            const ms = el && $ ? $(el).data('kendoMultiSelect') : null;
+            if (ms && ms.dataItems) {
+                const t = ms.dataItems().map(d => d.Title || d.Text || d.Name || '').filter(Boolean);
+                if (t.length) return t;
+            }
+        } catch (e) { /* fall through to DOM chips */ }
+        return qsa('#Job_TagIds_taglist li').map(li => li.textContent.trim()).filter(Boolean);
     }
 
     // Strip the per-visit suffix ("- Visit 3 of 12") so every visit of the same
@@ -747,18 +797,39 @@
         const usedCatNames = new Set(rows.map(r => r.category.name));
         const activeCats   = allCatDefs.filter(c => usedCatNames.has(c.name));
 
-        const catGroups = {};
-        for (const cat of activeCats) catGroups[cat.name] = [];
+        // Top-level sections by contract criticality; service categories nest inside.
+        const contractCritMap = new Map(contractDataList.map(cd =>
+            [(cd.meta && cd.meta.ref) || '', cd.criticality || CRIT_NONE.name]));
+        for (const row of rows) row.criticality = contractCritMap.get(row.contractRef) || CRIT_NONE.name;
+        const usedCrits   = new Set(rows.map(r => r.criticality));
+        const activeCrits = [...CRIT_DEFS, CRIT_NONE].filter(c => usedCrits.has(c.name));
+        // Only draw criticality bands when at least one contract is classified —
+        // otherwise the report looks exactly as before.
+        const showCrit    = activeCrits.some(c => c !== CRIT_NONE);
+
+        const critGroups = {};   // critName → catName → rows
         for (const row of rows) {
-            catGroups[row.category.name].push(row);
+            const ck = showCrit ? row.criticality : '';
+            ((critGroups[ck] ||= {})[row.category.name] ||= []).push(row);
         }
         // Sort within each category by (contractRef, description)
-        for (const arr of Object.values(catGroups)) {
+        for (const cats of Object.values(critGroups)) for (const arr of Object.values(cats)) {
             arr.sort((a, b) => {
                 const rc = a.contractRef.localeCompare(b.contractRef);
                 if (rc !== 0) return rc;
                 return a.description.localeCompare(b.description);
             });
+        }
+
+        // Per-section stats for the criticality band
+        function sectionStats(secRows) {
+            let t = 0, c = 0, o = 0;
+            for (const r of secRows) for (const cell of Object.values(r.months)) for (const v of cell.visits) {
+                t++; if (v.status === 'complete') c++; else if (v.status === 'overdue') o++;
+            }
+            const due = c + o;
+            return { t, c, o, u: t - c - o, pct: due > 0 ? Math.round((c / due) * 100) : null,
+                     contracts: new Set(secRows.map(r => r.contractRef)).size };
         }
 
         // Stats — contract total
@@ -827,8 +898,24 @@
 
         // Build table rows
         let tableRows = '';
-        for (const cat of activeCats) {
-            const catRows = catGroups[cat.name];
+        const stickyCols = showSite ? 3 : 2;
+        for (const crit of (showCrit ? activeCrits : [null])) {
+          const catGroups = critGroups[crit ? crit.name : ''] || {};
+          if (crit) {
+            const s = sectionStats(Object.values(catGroups).flat());
+            const stat = (n, l, col) => `<span style="margin-left:14px;"><b style="color:${col};font-size:11px;">${n}</b> <span style="opacity:.7;">${l}</span></span>`;
+            tableRows += `<tr class="crit-band">
+                <td colspan="${stickyCols}" style="position:sticky;left:0;z-index:11;background:${crit.bg};color:${crit.text};
+                    padding:9px 14px;border-top:3px solid ${crit.accent};white-space:nowrap;">
+                    <span style="font-family:'Syne',sans-serif;font-size:12px;font-weight:800;letter-spacing:0.1em;text-transform:uppercase;">${esc(crit.name)}</span>
+                    <span style="font-size:9.5px;opacity:.75;margin-left:8px;">${s.contracts} contract${s.contracts !== 1 ? 's' : ''}</span>
+                    <div style="font-size:9.5px;margin-top:3px;margin-left:-14px;">${stat(s.t, 'visits', '#fff')}${stat(s.c, 'complete', '#4ade80')}${stat(s.o, 'overdue', '#fca5a5')}${stat(s.u, 'upcoming', '#7dd3fc')}${s.pct !== null ? stat(s.pct + '%', 'done to date', '#fff') : ''}</div>
+                </td>
+                ${sortedMonths.map(mk => `<td class="mcol${blankMonths.has(mk) ? ' m-blank' : ''}" style="background:${crit.bg};border-top:3px solid ${crit.accent};min-width:66px;"></td>`).join('')}
+            </tr>`;
+          }
+          for (const cat of activeCats) {
+            const catRows = catGroups[cat.name] || [];
             if (!catRows.length) continue;
 
             // Category header row — spans all sticky columns (2 or 3 depending on showSite)
@@ -897,6 +984,7 @@
                     ).join('')}
                 </tr>`;
             }
+          }
         }
 
         const tableHtml = `<div style="overflow-x:auto;">
@@ -1132,6 +1220,7 @@
                 planRef:  item.PlanReference || item.PlanRef || item.PlanName || item.PPMPlanName || '',
                 site:     item.SiteName     || item.Site              || item.SiteAddress    || '',
                 customer: item.CustomerName || item.Customer          || item.ClientName     || '',
+                tags:     Array.isArray(item.Tags) ? item.Tags.map(t => t.Title || t.Name || String(t)) : splitTags(item.Tags),
                 status,
             });
         }
@@ -1317,6 +1406,7 @@
                 const siteHdr   = headIdx(/\bsite\b/);
                 const custHdr   = headIdx(/customer|client/);
                 const descHdr   = headIdx(/\bdescription\b/);
+                const tagsHdr   = headIdx(/^tags?\b/);
                 let added = 0;
                 for (const row of qsa('tr', tbl).filter(r => r.querySelector('a[href*="/PPMContract/Detail/"]'))) {
                     const a = row.querySelector('a[href*="/PPMContract/Detail/"]');
@@ -1335,11 +1425,13 @@
                     const site       = at(siteHdr >= 0 ? siteHdr : 1);   // "Site Name"
                     const customer   = at(custHdr >= 0 ? custHdr : 2);   // "Customer Name"
                     const planRef    = at(descHdr);                       // "Description" col (may be blank)
+                    const tagsIdx    = tagsHdr >= 0 ? tagsHdr + offset : -1;
+                    const tags       = tagsIdx >= 0 ? tagsFromCell(cells[tagsIdx]) : [];
                     if (tabIsSuspended || /suspend/i.test(row.textContent)) {
                         suspended.push({ id, ref, status: 'Suspended' });
                         ppmLog('[PPM-Multi]  → suspended:', ref);
                     } else {
-                        contracts.push({ id, ref, planRef, site, customer, status: 'active' });
+                        contracts.push({ id, ref, planRef, site, customer, tags, status: 'active' });
                         added++;
                     }
                 }
@@ -1496,6 +1588,13 @@
             if (!meta.customer)    meta.customer    = contract.customer || '';
             if (!meta.description) meta.description = contract.planRef || '';
 
+            // Criticality — list-page tags first, detail-page tag chips as fallback
+            let tags = (contract.tags && contract.tags.length) ? contract.tags : [];
+            if (!tags.length) { try { tags = readContractTagsFromPage(); } catch { tags = []; } }
+            contract.tags        = tags;
+            contract.criticality = classifyCriticality(tags, meta.description || contract.planRef);
+            ppmLog(`[PPM-Multi] ${contract.ref}: tags [${tags.join(', ')}] → ${contract.criticality}`);
+
             contract.meta   = meta;
             // Only re-read if we don't already have an error set (timeout case already has [])
             if (!contract.error) contract.visits = await readVisitsFromPage();
@@ -1637,7 +1736,8 @@
 
         const contractDataList = st.contracts
             .filter(c => c.visited)
-            .map(c => ({ id: c.id, meta: c.meta || { ref: c.ref, site: c.site, customer: c.customer }, visits: c.visits, pos: c.pos || [] }));
+            .map(c => ({ id: c.id, meta: c.meta || { ref: c.ref, site: c.site, customer: c.customer }, visits: c.visits, pos: c.pos || [],
+                         criticality: c.criticality || classifyCriticality(c.tags, (c.meta && c.meta.description) || c.planRef) }));
 
         if (!contractDataList.length) {
             setStatus('No visit data collected — check that the contracts have visits loaded.');
