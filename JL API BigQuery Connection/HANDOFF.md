@@ -253,3 +253,13 @@ percentages — that weights a £200 callout the same as a £20k fit-out.
 - List endpoints are thin; detail endpoints are rich (notes, quote type, costs all needed per-entity detail calls).
 - Priority/SLA: PriorityResponseTime/CompletionTime = MINUTES; TargetAttendanceDate = DateLogged + ResponseTime; P1–P4 carry 0 (no numeric target); **HasMetPriority is unreliable** — compute response time yourself.
 - Quote→job link: `quotes.ParentJobAutoId = jobs.Id` (2090/3165 linked). Quote job type is INDEPENDENT of the parent job's type.
+
+## Engineer daily AM/PM sites — built 2026-10-21
+The allocator sets each engineer's site on the Planner as Non-Productive Time whose type is the site name
+(first of the day = AM, second = PM, one = whole day). Feeds same-day bulk allocation.
+- **Source:** `POST /api/v1/Visit/SearchPlanner` with `IncludeNonProductiveTime:true` (≤1 month per call,
+  times in UTC). **Future recurring NPT is not returned** until the day itself, so the window ends today.
+- **Loader:** `load_engineer_sites.py` + `run_engineer_sites.sh`, cron `*/30 6-18` (London) →
+  `raw.engineer_daily_sites` (DDL `create_engineer_daily_sites.sql`). Each run replaces today-7..today in one
+  transaction; an empty API result exits 1 instead of wiping the window. `engineer_email` from Engineer/GetAll.
+- Verified 2026-10-21: today's 13 engineers matched the Planner exactly.

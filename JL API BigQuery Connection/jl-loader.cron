@@ -56,6 +56,10 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 0 3 * * * root /opt/jl-loader/jl-run.sh tier-customer /opt/jl-loader/run_tier.sh "Customer/GetAll:customers,Site/GetAll:sites,Staff/GetAll:staff,Supplier/GetAll:suppliers,Subcontractor/GetAll:subcontractors,Asset/GetAll:assets,Part/GetAll:parts,Expense/GetAll:expenses,PPMContract/GetAll:ppm_contracts"
 # Timesheets - daily 04:00 (full history, weekly-chunked)
 0 4 * * * root /opt/jl-loader/jl-run.sh tier-timesheet /opt/jl-loader/run_tier.sh "Timesheet/GetAll:timesheets"
+# Engineer daily AM/PM sites (Planner NPT, Visit/SearchPlanner) -> raw.engineer_daily_sites.
+# Feeds same-day bulk allocation; the allocator edits sites through the day, so every 30 min 06:00-18:30.
+# Each run replaces today-7..today (~4 API calls).
+*/30 6-18 * * * root flock -n /tmp/jl_engineer_sites.lock /opt/jl-loader/jl-run.sh engineer_sites /opt/jl-loader/run_engineer_sites.sh
 # Status audit sync US->EU daily 04:30 (feeds sla_analysis pause-hours; no API source)
 30 4 * * * root /opt/jl-loader/jl-run.sh audit_sync /opt/jl-loader/run_audit_sync.sh
 

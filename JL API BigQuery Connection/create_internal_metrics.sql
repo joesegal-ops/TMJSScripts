@@ -43,8 +43,12 @@
 -- (remote fixes, admin closures, ~6%) are left out of both. First_Time_Fix_Pct = Fixed / Jobs (0-1).
 --
 -- PROJECTS (2026-10-13; UK quotes whose job_type in models.quote_tracking is "Project"; SE quotes carry no type)
---   Time_To_Quote_*        days from the PARENT job being logged to the quote being raised, by quote date. Only quotes
---                          raised against a job (~64%); negative gaps (back-dated entry) dropped.
+--   Time_To_Quote_*        (redefined 2026-10-20) days from the MONDAY ITEM being created (system created_at) to the
+--                          item's FIRST JobLogic quote being raised, by quote date. One row per item on the WW Active
+--                          and Other Clients boards that has a quote (reporting.projects.Quote_Numbers = quotes linked
+--                          via the item's job ref OR typed on the board). Quote raised before the item = 0 days.
+--                          WW TRIAGE is left out (intake board; its quoted items duplicate WW Active). Customer, site
+--                          area and category come from that first quote. Not limited to quotes typed "Project".
 --   Approval_To_Delivery_* days from quote approval to completion of the job it was upgraded into, by COMPLETION date.
 --                          The quote->job link is inferred (reporting.quote_to_job_completion): "low" confidence links
 --                          and negative durations (work finished before formal approval) are dropped.
@@ -87,6 +91,14 @@
 --   jobs whose work moved to the upgraded job) are skipped. Owed = value - standard invoices raised against the job
 --   number by As_Of. Projects are NOT billed on grouped invoices, so — unlike the ticket figure — a job in status
 --   Invoiced with no job-number invoice still counts as owed (worth chasing: it's a status/billing mismatch).
+--
+-- PHOTOS (2026-10-21; UK tickets only — same scope as FIRST TIME FIX; SE has no notes loaded). A photo = an image file
+--   (jpg/jpeg/png/heic/heif/bmp/gif/webp/tif) in the Attachments of a note (raw.notes, deduped on note UniqueId).
+--   Engineers attach them to VISIT notes; job-level note images count towards the job too. Videos are not photos.
+--   Photo_Jobs / Photo_Jobs_With_Photo / Photo_Pct: completed tickets with >= 1 completed visit (by completion date);
+--     With_Photo = at least one photo anywhere on the job.
+--   Photos_Per_Visit_Total / _Count / _Avg: completed visits on tickets (by visit END date) and the photos on each
+--     visit's own notes; _Avg = Total / Count (visits with 0 photos count as 0).
 --
 -- BACKLOG (snapshot, NOT a flow): open "tickets" at the period's As_Of date (period end, or today for the current
 -- period) older than 30 / 60 / 100 days since logged. Tickets = every job except PPM (PM...) and Project jobs.
@@ -160,6 +172,22 @@ all_quotes AS (  -- every non-cancelled UK quote, one row per quote
   LEFT JOIN site_area sa ON sa.SiteId = q.SiteId
   WHERE NOT IFNULL(qt.is_cancelled, FALSE)
 ),
+photo_files AS (  -- one row per image attached to a (deduped) note
+  SELECT n._EntityType AS entity_type, n._JobId AS job_id, n._VisitId AS visit_id
+  FROM (SELECT * FROM `vmimporteddata.raw.notes`
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY UniqueId ORDER BY _ingested_at DESC) = 1) n,
+       UNNEST(n.Attachments) a
+  WHERE REGEXP_CONTAINS(LOWER(a.FileName), r"\.(jpe?g|png|heic|heif|bmp|gif|webp|tiff?)$")
+),
+photo_jobs AS (SELECT job_id, COUNT(*) AS photos FROM photo_files GROUP BY job_id),
+photo_visits AS (SELECT visit_id, COUNT(*) AS photos FROM photo_files
+                 WHERE entity_type = "Visit" AND visit_id IS NOT NULL GROUP BY visit_id),
+ticket_visits AS (  -- completed visits on UK tickets, with the visit end date (local)
+  SELECT j.Id AS job_id, v.VisitId AS visit_id, DATE(v.EndDate) AS visit_date
+  FROM `vmimporteddata.models.job_statutory_category_v2` j, UNNEST(j.VisitsStatus) v
+  WHERE v.StatusDescription = "Complete" AND v.EndDate IS NOT NULL
+    AND NOT STARTS_WITH(j.JobNumber, "PM") AND IFNULL(j.TypeDescription, "") != "Project"
+),
 quote_jobs AS (  -- UK jobs that came from a quote
   SELECT upgraded_job_number AS JobNumber FROM `vmimporteddata.reporting.quote_to_job_completion`
   UNION DISTINCT
@@ -204,11 +232,22 @@ facts AS (
         QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
   WHERE NOT IFNULL(q.IsCancelled, FALSE)
 
-  UNION ALL  -- projects: time to quote (parent job logged -> quote raised), by quote date
+  UNION ALL  -- projects: time to quote (Monday item created -> its first JL quote raised; quote first = 0), by quote date
   SELECT "UK", CustomerName, Area, "ttq", quote_date, NULL, NULL, NULL,
-         DATE_DIFF(quote_date, parent_logged_date, DAY), job_category
-  FROM project_quotes
-  WHERE parent_logged_date IS NOT NULL AND quote_date >= parent_logged_date
+         GREATEST(DATE_DIFF(quote_date, item_created, DAY), 0), job_category
+  FROM (
+    SELECT q.CustomerName, sa.Area, qt.job_category, DATE(m.Item_Created_At) AS item_created,
+           DATE(q.DateLogged, "Europe/London") AS quote_date
+    FROM `vmimporteddata.reporting.projects` m
+    CROSS JOIN UNNEST(SPLIT(m.Quote_Numbers, ",")) AS qn
+    JOIN (SELECT * FROM `vmimporteddata.raw.quotes`
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) q
+      ON q.QuoteNumber = TRIM(qn)
+    LEFT JOIN `vmimporteddata.models.quote_tracking` qt ON qt.quote_id = q.Id
+    LEFT JOIN site_area sa ON sa.SiteId = q.SiteId
+    WHERE m.Board IN ("WW Active", "Other Clients") AND m.Item_Created_At IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY m.Board, m.Item_Id ORDER BY q.DateLogged, q.Id) = 1
+  )
 
   UNION ALL  -- projects: conversion (amount = 1 if won), by quote date
   SELECT "UK", CustomerName, Area, "conv", quote_date, NULL, NULL, NULL, IF(is_won, 1, 0), job_category
@@ -253,6 +292,21 @@ facts AS (
   FROM jobs
   WHERE NOT STARTS_WITH(JobNumber, "PM") AND IFNULL(TypeDescription, "") != "Project"
     AND status IN ("Completed", "Invoiced", "Costed")
+
+  UNION ALL  -- photos: completed UK tickets with >= 1 completed visit; amount = 1 if any photo on the job
+  SELECT j.tenant, j.CustomerName, j.Area, "photo_job", DATE(COALESCE(j.DateComplete, j.UpdatedAt)), NULL, NULL, NULL,
+         IF(pj.job_id IS NOT NULL, 1, 0), j.job_category
+  FROM jobs j
+  LEFT JOIN photo_jobs pj ON pj.job_id = j.job_id
+  WHERE j.tenant = "UK" AND NOT STARTS_WITH(j.JobNumber, "PM") AND IFNULL(j.TypeDescription, "") != "Project"
+    AND j.status IN ("Completed", "Invoiced", "Costed") AND j.complete_visits >= 1
+
+  UNION ALL  -- photos per visit: completed ticket visits by visit end date; amount = photos on that visit
+  SELECT j.tenant, j.CustomerName, j.Area, "photo_visit", tv.visit_date, NULL, NULL, NULL,
+         IFNULL(pv.photos, 0), j.job_category
+  FROM ticket_visits tv
+  JOIN jobs j ON j.tenant = "UK" AND j.job_id = tv.job_id
+  LEFT JOIN photo_visits pv ON pv.visit_id = tv.visit_id
 
   UNION ALL  -- invoices (UK only — no SE invoice table), split by whether the job came from a quote
   SELECT "UK", i.CustomerName, COALESCE(j.Area, sa.Area),
@@ -299,6 +353,10 @@ flow AS (
     COUNTIF(f.kind = "ppm" AND f.category = "Critical" AND f.done_date IS NOT NULL)  AS Critical_PPM_On_Time,
     COUNTIF(f.kind = "ppm" AND f.category = "Non-Statutory")                                AS Non_Statutory_PPM_Due,
     COUNTIF(f.kind = "ppm" AND f.category = "Non-Statutory" AND f.done_date IS NOT NULL) AS Non_Statutory_PPM_On_Time,
+    COUNTIF(f.kind = "photo_job")                   AS Photo_Jobs,
+    SUM(IF(f.kind = "photo_job", f.amount, NULL))   AS Photo_Jobs_With_Photo,
+    SUM(IF(f.kind = "photo_visit", f.amount, NULL)) AS Photos_Per_Visit_Total,
+    COUNTIF(f.kind = "photo_visit")                 AS Photos_Per_Visit_Count,
     COUNTIF(f.kind = "ftf")                         AS First_Time_Fix_Jobs,
     SUM(IF(f.kind = "ftf", f.amount, NULL))         AS First_Time_Fix_Fixed,
     SUM(IF(f.kind = "ttq", f.amount, NULL))         AS Time_To_Quote_Total,
@@ -446,6 +504,13 @@ SELECT
   IFNULL(f.Non_Statutory_PPM_Due, 0)                    AS Non_Statutory_PPM_Due,
   IFNULL(f.Non_Statutory_PPM_On_Time, 0)                AS Non_Statutory_PPM_On_Time,
   SAFE_DIVIDE(f.Non_Statutory_PPM_On_Time, f.Non_Statutory_PPM_Due) AS Non_Statutory_Compliance_Pct,
+  -- photos (UK tickets)
+  IF(s.Segment = "Neko Sweden", NULL, IFNULL(f.Photo_Jobs, 0))                                AS Photo_Jobs,
+  IF(s.Segment = "Neko Sweden", NULL, CAST(IFNULL(f.Photo_Jobs_With_Photo, 0) AS INT64))      AS Photo_Jobs_With_Photo,
+  SAFE_DIVIDE(f.Photo_Jobs_With_Photo, f.Photo_Jobs)                                          AS Photo_Pct,
+  IF(s.Segment = "Neko Sweden", NULL, CAST(IFNULL(f.Photos_Per_Visit_Total, 0) AS INT64))     AS Photos_Per_Visit_Total,
+  IF(s.Segment = "Neko Sweden", NULL, IFNULL(f.Photos_Per_Visit_Count, 0))                    AS Photos_Per_Visit_Count,
+  ROUND(SAFE_DIVIDE(f.Photos_Per_Visit_Total, f.Photos_Per_Visit_Count), 2)                   AS Photos_Per_Visit_Avg,
   -- first time fix
   IFNULL(f.First_Time_Fix_Jobs, 0)                      AS First_Time_Fix_Jobs,
   CAST(IFNULL(f.First_Time_Fix_Fixed, 0) AS INT64)      AS First_Time_Fix_Fixed,
