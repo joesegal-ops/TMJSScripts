@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.42
-// @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder). v3.41: sections by PPM criticality (Statutory / Critical / Non-Statutory / Internal) from contract tags. v3.42: Download HTML button in the report.
+// @version      3.43
+// @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder). v3.41: sections by PPM criticality (Statutory / Critical / Non-Statutory / Internal) from contract tags. v3.42: Download HTML button in the report. v3.43: sortable headers + filter bar in the report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
 // @run-at       document-idle
@@ -113,7 +113,7 @@
     const VERSION   = '3.26';   // saved-state schema version — bump only when state shape changes
     // Displayed version — reads the userscript @version so the button header and
     // load log always track the installed version (bump @version, this follows).
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.42';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.43';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -639,7 +639,9 @@
                 ? `<a href="${esc(v.jobUrl)}" target="_blank" style="text-decoration:none;line-height:0;" title="Open job — ${cfg.label} · ${v.day}">${inner}</a>`
                 : inner;
         }).join('');
-        return `<td class="mcol" style="background:${bg};border:1px solid #f1f5f9;padding:5px 3px;` +
+        // data-r = worst status rank in the cell (overdue 3 … complete 0) — month-column sort key
+        const worstRank = Math.max(...cell.visits.map(v => RANK[v.status || 'pending'] ?? 1));
+        return `<td class="mcol" data-r="${worstRank}" style="background:${bg};border:1px solid #f1f5f9;padding:5px 3px;` +
             `vertical-align:middle;min-width:66px;` +
             `${isCur ? 'outline:2px solid #0097A7;outline-offset:-2px;' : ''}">` +
             `<div style="display:flex;flex-wrap:wrap;gap:2px;justify-content:center;align-items:center;">` +
@@ -888,28 +890,30 @@
         const monthHeaders = sortedMonths.map(mk => {
             const isCur  = mk === thisMonthKey;
             const blankC = blankMonths.has(mk) ? ' m-blank' : '';
-            return `<th class="mcol${blankC}" style="background:${isCur ? '#162040' : '#09152b'};` +
+            return `<th class="mcol sortable${blankC}" data-sort="month" title="Click to sort — most urgent first" style="background:${isCur ? '#162040' : '#09152b'};cursor:pointer;` +
                 `color:${isCur ? '#93c5fd' : '#c0cfe0'};` +
                 `font-size:10px;font-weight:600;padding:9px 4px;text-align:center;min-width:66px;` +
                 `border-left:1px solid #1a2e4a;border-bottom:2px solid #1a2e4a;white-space:nowrap;">` +
                 `${isCur ? '<div style="font-size:7px;color:#0097A7;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:2px;">NOW</div>' : ''}` +
-                `${monthLabel(mk)}</th>`;
+                `${monthLabel(mk)}<span class="sort-ind"></span></th>`;
         }).join('');
 
         // Build table rows
         let tableRows = '';
         const stickyCols = showSite ? 3 : 2;
+        let rowIdx = 0;   // original order — the sort script restores it on the third click
         for (const crit of (showCrit ? activeCrits : [null])) {
           const catGroups = critGroups[crit ? crit.name : ''] || {};
           if (crit) {
             const s = sectionStats(Object.values(catGroups).flat());
-            const stat = (n, l, col) => `<span style="margin-left:14px;"><b style="color:${col};font-size:11px;">${n}</b> <span style="opacity:.7;">${l}</span></span>`;
-            tableRows += `<tr class="crit-band">
+            // bs-* classes let the in-report filter script recompute these for visible rows
+            const stat = (cls, n, l, col) => `<span class="${cls}w" style="margin-left:14px;"><b class="${cls}" style="color:${col};font-size:11px;">${n}</b> <span style="opacity:.7;">${l}</span></span>`;
+            tableRows += `<tr class="crit-band" data-crit="${esc(crit.name)}">
                 <td colspan="${stickyCols}" style="position:sticky;left:0;z-index:11;background:${crit.bg};color:${crit.text};
                     padding:9px 14px;border-top:3px solid ${crit.accent};white-space:nowrap;">
                     <span style="font-family:'Syne',sans-serif;font-size:12px;font-weight:800;letter-spacing:0.1em;text-transform:uppercase;">${esc(crit.name)}</span>
-                    <span style="font-size:9.5px;opacity:.75;margin-left:8px;">${s.contracts} contract${s.contracts !== 1 ? 's' : ''}</span>
-                    <div style="font-size:9.5px;margin-top:3px;margin-left:-14px;">${stat(s.t, 'visits', '#fff')}${stat(s.c, 'complete', '#4ade80')}${stat(s.o, 'overdue', '#fca5a5')}${stat(s.u, 'upcoming', '#7dd3fc')}${s.pct !== null ? stat(s.pct + '%', 'done to date', '#fff') : ''}</div>
+                    <span class="bs-n" style="font-size:9.5px;opacity:.75;margin-left:8px;">${s.contracts} contract${s.contracts !== 1 ? 's' : ''}</span>
+                    <div style="font-size:9.5px;margin-top:3px;margin-left:-14px;">${stat('bs-t', s.t, 'visits', '#fff')}${stat('bs-c', s.c, 'complete', '#4ade80')}${stat('bs-o', s.o, 'overdue', '#fca5a5')}${stat('bs-u', s.u, 'upcoming', '#7dd3fc')}<span class="bs-pw" style="${s.pct === null ? 'display:none;' : ''}">${stat('bs-p', (s.pct ?? 0) + '%', 'done to date', '#fff')}</span></div>
                 </td>
                 ${sortedMonths.map(mk => `<td class="mcol${blankMonths.has(mk) ? ' m-blank' : ''}" style="background:${crit.bg};border-top:3px solid ${crit.accent};min-width:66px;"></td>`).join('')}
             </tr>`;
@@ -919,7 +923,7 @@
             if (!catRows.length) continue;
 
             // Category header row — spans all sticky columns (2 or 3 depending on showSite)
-            tableRows += `<tr>
+            tableRows += `<tr class="cat-hdr" data-cat="${esc(cat.name)}">
                 <td colspan="${showSite ? 3 : 2}" style="position:sticky;left:0;z-index:10;background:${cat.bg};color:${cat.text};
                     font-size:8px;font-weight:800;letter-spacing:0.14em;text-transform:uppercase;
                     padding:5px 14px;border-top:2px solid ${cat.accent};
@@ -953,7 +957,13 @@
                                  text-decoration-color:rgba(15,35,71,0.35);"
                           title="Open ${esc(row.contractRef)} in Joblogic">${esc(row.contractRef)}</a>`
                     : esc(row.contractRef);
-                tableRows += `<tr>
+                // Sort/filter data for the in-report script (t/c/o/g = total/complete/overdue/in-progress)
+                const rv = Object.values(row.months).flatMap(m => m.visits);
+                const cnt = st => rv.filter(v => v.status === st).length;
+                tableRows += `<tr class="data-row" data-i="${rowIdx++}" data-crit="${esc(showCrit ? row.criticality : '')}"
+                    data-cat="${esc(cat.name)}" data-contract="${esc(row.contractRef)}" data-site="${esc(rowSite)}"
+                    data-service="${esc(row.description || '')}" data-t="${rv.length}" data-c="${cnt('complete')}"
+                    data-o="${cnt('overdue')}" data-g="${cnt('raised')}">
                     <td style="position:sticky;left:0;z-index:10;background:#fff;
                         font-size:10px;font-weight:700;color:#0f2347;
                         padding:6px 6px 6px 10px;
@@ -988,21 +998,21 @@
         }
 
         const tableHtml = `<div style="overflow-x:auto;">
-            <table style="border-collapse:collapse;width:100%;min-width:600px;background:#fff;">
+            <table id="ppm-matrix" style="border-collapse:collapse;width:100%;min-width:600px;background:#fff;">
                 <thead>
                     <tr>
                         <th style="position:sticky;left:0;z-index:20;background:#09152b;color:#3d5a80;
                             font-size:8.5px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;
                             padding:10px 10px;text-align:left;width:90px;
-                            border-right:1px solid #1a2e4a;border-bottom:2px solid #1a2e4a;">Contract</th>
+                            border-right:1px solid #1a2e4a;border-bottom:2px solid #1a2e4a;cursor:pointer;" class="sortable" data-sort="contract" title="Click to sort">Contract<span class="sort-ind"></span></th>
                         ${showSite ? `<th style="position:sticky;left:90px;z-index:20;background:#09152b;color:#3d5a80;
                             font-size:8.5px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;
                             padding:10px 10px;text-align:left;width:${SITE_W}px;
-                            border-right:1px solid #1a2e4a;border-bottom:2px solid #1a2e4a;">Site</th>` : ''}
+                            border-right:1px solid #1a2e4a;border-bottom:2px solid #1a2e4a;cursor:pointer;" class="sortable" data-sort="site" title="Click to sort">Site<span class="sort-ind"></span></th>` : ''}
                         <th style="position:sticky;left:${svcLeft}px;z-index:20;background:#09152b;color:#3d5a80;
                             font-size:8.5px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;
                             padding:10px 14px;text-align:left;max-width:220px;
-                            border-right:1px solid #1a2e4a;border-bottom:2px solid #1a2e4a;">Service</th>
+                            border-right:1px solid #1a2e4a;border-bottom:2px solid #1a2e4a;cursor:pointer;" class="sortable" data-sort="service" title="Click to sort">Service<span class="sort-ind"></span></th>
                         ${monthHeaders}
                     </tr>
                 </thead>
@@ -1012,6 +1022,148 @@
 
         return { tableHtml, monthHeaders, blankMonths, total, complete, overdue, upcoming, pct, pctColor,
                  mTotal, mComplete, mOverdue, mUpcoming, mPct, thisMonthName };
+    }
+
+    // ─── In-report interactivity (sort / filter / download) ───────────────────
+    // Serialised with .toString() into a <script> in the report, so it runs in the
+    // report window AND in downloaded copies. Self-contained: no outer references.
+    // Re-running on a downloaded copy resets filters/sort indicators cleanly.
+    function reportInteractive() {
+        var table = document.getElementById('ppm-matrix');
+        var tbody = table && table.tBodies[0];
+
+        // Download — bound here, not via inline onclick: inside an inline handler
+        // `URL` resolves to document.URL (a string), not window.URL.
+        var dl = document.getElementById('dl-html-btn');
+        if (dl) dl.onclick = function () {
+            var html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+            var a = document.createElement('a');
+            a.href = window.URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+            a.download = dl.getAttribute('data-fn') || 'PPM Report.html';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function () { window.URL.revokeObjectURL(a.href); }, 2000);
+        };
+        if (!tbody) return;
+
+        var rows = [].slice.call(tbody.querySelectorAll('tr.data-row'));
+        var num  = function (r, k) { return parseInt(r.getAttribute('data-' + k), 10) || 0; };
+        var escH = function (s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); };
+
+        // ── Filter dropdowns: values in report order, hidden when < 2 choices
+        function fill(id, attr) {
+            var sel = document.getElementById(id); if (!sel) return;
+            var seen = {}, vals = [];
+            rows.forEach(function (r) { var v = r.getAttribute(attr); if (v && !seen[v]) { seen[v] = 1; vals.push(v); } });
+            if (attr === 'data-site') vals.sort(function (a, b) { return a.localeCompare(b); });
+            sel.innerHTML = '<option value="">All</option>' + vals.map(function (v) { return '<option>' + escH(v) + '</option>'; }).join('');
+            sel.parentNode.style.display = vals.length < 2 ? 'none' : '';
+        }
+        fill('f-crit', 'data-crit'); fill('f-cat', 'data-cat'); fill('f-site', 'data-site');
+        var ctl = { q: 'f-q', crit: 'f-crit', cat: 'f-cat', site: 'f-site', status: 'f-status' };
+        Object.keys(ctl).forEach(function (k) { ctl[k] = document.getElementById(ctl[k]); if (ctl[k]) ctl[k].value = ''; });
+
+        function matches(r) {
+            var q = (ctl.q.value || '').trim().toLowerCase();
+            if (q && (r.getAttribute('data-contract') + ' ' + r.getAttribute('data-site') + ' ' + r.getAttribute('data-service')).toLowerCase().indexOf(q) < 0) return false;
+            if (ctl.crit.value && r.getAttribute('data-crit') !== ctl.crit.value) return false;
+            if (ctl.cat.value  && r.getAttribute('data-cat')  !== ctl.cat.value)  return false;
+            if (ctl.site.value && r.getAttribute('data-site') !== ctl.site.value) return false;
+            var t = num(r, 't'), c = num(r, 'c'), o = num(r, 'o'), g = num(r, 'g');
+            switch (ctl.status.value) {
+                case 'overdue':  return o > 0;
+                case 'progress': return g > 0;
+                case 'upcoming': return t - c - o > 0;
+                case 'complete': return t > 0 && c === t;
+                case 'none':     return t === 0;
+            }
+            return true;
+        }
+
+        function apply() {
+            var shown = 0;
+            rows.forEach(function (r) { var ok = matches(r); r.style.display = ok ? '' : 'none'; if (ok) shown++; });
+            // Hide category headers / criticality bands with no visible rows; recompute band stats
+            var band = null, bandAcc = null, cat = null, catN = 0;
+            function closeCat()  { if (cat) cat.style.display = catN ? '' : 'none'; }
+            function closeBand() {
+                if (!band) return;
+                band.style.display = bandAcc.rows ? '' : 'none';
+                var set = function (cls, v) { var el = band.querySelector('.' + cls); if (el) el.textContent = v; };
+                var n = Object.keys(bandAcc.contracts).length, due = bandAcc.c + bandAcc.o;
+                set('bs-n', n + ' contract' + (n !== 1 ? 's' : ''));
+                set('bs-t', bandAcc.t); set('bs-c', bandAcc.c); set('bs-o', bandAcc.o); set('bs-u', bandAcc.t - bandAcc.c - bandAcc.o);
+                set('bs-p', (due ? Math.round(bandAcc.c / due * 100) : 0) + '%');
+                var pw = band.querySelector('.bs-pw'); if (pw) pw.style.display = due ? '' : 'none';
+            }
+            [].slice.call(tbody.children).forEach(function (tr) {
+                if (tr.classList.contains('crit-band')) {
+                    closeCat(); cat = null; closeBand();
+                    band = tr; bandAcc = { rows: 0, t: 0, c: 0, o: 0, contracts: {} };
+                } else if (tr.classList.contains('cat-hdr')) {
+                    closeCat(); cat = tr; catN = 0;
+                } else if (tr.classList.contains('data-row') && tr.style.display !== 'none') {
+                    catN++;
+                    if (bandAcc) {
+                        bandAcc.rows++; bandAcc.t += num(tr, 't'); bandAcc.c += num(tr, 'c'); bandAcc.o += num(tr, 'o');
+                        bandAcc.contracts[tr.getAttribute('data-contract')] = 1;
+                    }
+                }
+            });
+            closeCat(); closeBand();
+            var cnt = document.getElementById('f-count');
+            if (cnt) cnt.textContent = shown === rows.length ? rows.length + ' rows' : 'Showing ' + shown + ' of ' + rows.length + ' rows';
+        }
+
+        Object.keys(ctl).forEach(function (k) { if (ctl[k]) ctl[k].addEventListener(k === 'q' ? 'input' : 'change', apply); });
+        var clr = document.getElementById('f-clear');
+        if (clr) clr.onclick = function () { Object.keys(ctl).forEach(function (k) { if (ctl[k]) ctl[k].value = ''; }); apply(); };
+
+        // ── Sorting: within each category group, so the criticality/category sections stay intact.
+        // Click cycles: ascending → descending → original order. Month columns sort most-urgent first.
+        var ths = [].slice.call(table.querySelectorAll('th.sortable'));
+        var state = { th: null, dir: 0 };
+        ths.forEach(function (th) { var ind = th.querySelector('.sort-ind'); if (ind) ind.textContent = ''; });
+
+        function keyOf(r, th) {
+            var k = th.getAttribute('data-sort');
+            if (k === 'month') { var cell = r.cells[th.cellIndex]; return cell && cell.hasAttribute('data-r') ? parseInt(cell.getAttribute('data-r'), 10) : -1; }
+            return r.getAttribute('data-' + k) || '';
+        }
+        function sortRows() {
+            var runs = [], cur = null;
+            [].slice.call(tbody.children).forEach(function (tr) {
+                if (tr.classList.contains('data-row')) { if (!cur) { cur = { before: tr.previousElementSibling, rows: [] }; runs.push(cur); } cur.rows.push(tr); }
+                else cur = null;
+            });
+            var th = state.th, dir = state.dir, isMonth = th && th.getAttribute('data-sort') === 'month';
+            runs.forEach(function (run) {
+                run.rows.sort(function (a, b) {
+                    var d = 0;
+                    if (th && dir) {
+                        var ka = keyOf(a, th), kb = keyOf(b, th);
+                        d = isMonth ? (kb - ka) : String(ka).localeCompare(String(kb), undefined, { numeric: true, sensitivity: 'base' });
+                        // Blank text sorts last either way
+                        if (!isMonth && (ka === '') !== (kb === '')) return ka === '' ? 1 : -1;
+                        d *= dir;
+                    }
+                    return d || (num(a, 'i') - num(b, 'i'));
+                });
+                var anchor = run.before;
+                run.rows.forEach(function (r) { tbody.insertBefore(r, anchor ? anchor.nextSibling : tbody.firstChild); anchor = r; });
+            });
+        }
+        ths.forEach(function (th) {
+            th.addEventListener('click', function () {
+                if (state.th !== th) { state.th = th; state.dir = 1; }
+                else state.dir = state.dir === 1 ? -1 : state.dir === -1 ? 0 : 1;
+                ths.forEach(function (h) { var ind = h.querySelector('.sort-ind'); if (ind) ind.textContent = ''; });
+                var ind = th.querySelector('.sort-ind');
+                if (ind && state.dir) ind.textContent = state.dir === 1 ? '▲' : '▼';
+                sortRows();
+            });
+        });
+
+        apply();
     }
 
     // ─── Generate the full combined HTML report ───────────────────────────────
@@ -1058,6 +1210,13 @@
   body { font-family:'Plus Jakarta Sans',system-ui,sans-serif; background:#f0f4f8; color:#111827;
          -webkit-print-color-adjust:exact; print-color-adjust:exact; }
   .page { max-width:1100px; margin:0 auto; padding:24px; }
+  #ppm-filters .fl { display:flex; flex-direction:column; gap:3px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; font-size:8.5px; color:#64748b; }
+  #ppm-filters input, #ppm-filters select { font:inherit; font-size:12px; font-weight:400; letter-spacing:0; text-transform:none;
+      color:#1e293b; padding:5px 8px; border:1px solid #cbd5e1; border-radius:5px; background:#fff; min-width:120px; }
+  #ppm-filters input { min-width:200px; }
+  #ppm-filters button { font:inherit; font-size:11px; padding:6px 12px; border:1px solid #cbd5e1; border-radius:5px; background:#f8fafc; color:#334155; cursor:pointer; }
+  th.sortable:hover { filter:brightness(1.35); }
+  .sort-ind { margin-left:4px; color:#0097A7; }
   @media print {
     body { background:white; }
     .page { padding:0; }
@@ -1094,15 +1253,7 @@
             border:1px solid rgba(255,255,255,0.15);border-radius:6px;color:#94a3b8;
             font-size:11px;cursor:pointer;font-family:inherit;display:inline-block;">⎙ Print</button>
         <!-- Download — saves this page as a standalone .html file to share -->
-        <button class="no-print" data-fn="${esc(fileName)}" title="Save this report as a standalone HTML file to share"
-          onclick="(function(btn){
-            var html = '<!DOCTYPE html>\\n' + document.documentElement.outerHTML;
-            var a = document.createElement('a');
-            a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
-            a.download = btn.getAttribute('data-fn');
-            document.body.appendChild(a); a.click(); a.remove();
-            setTimeout(function(){ URL.revokeObjectURL(a.href); }, 2000);
-          })(this)"
+        <button class="no-print" id="dl-html-btn" data-fn="${esc(fileName)}" title="Save this report as a standalone HTML file to share"
           style="margin-top:14px;margin-left:6px;padding:7px 16px;background:rgba(255,255,255,0.08);
             border:1px solid rgba(255,255,255,0.15);border-radius:6px;color:#94a3b8;
             font-size:11px;cursor:pointer;font-family:inherit;display:inline-block;">⬇ Download HTML</button>
@@ -1174,6 +1325,26 @@
     </div>
   </div>
 
+  <!-- ── FILTER BAR (options filled in by reportInteractive) ── -->
+  <div id="ppm-filters" class="no-print" style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;
+      background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:10px 14px;margin-bottom:12px;
+      font-size:10px;color:#475569;">
+    <label class="fl">Search<input id="f-q" type="search" placeholder="Contract, site or service…"></label>
+    <label class="fl">Criticality<select id="f-crit"></select></label>
+    <label class="fl">Category<select id="f-cat"></select></label>
+    <label class="fl">Site<select id="f-site"></select></label>
+    <label class="fl">Status<select id="f-status">
+      <option value="">All</option>
+      <option value="overdue">Has overdue</option>
+      <option value="progress">Has in progress</option>
+      <option value="upcoming">Has upcoming</option>
+      <option value="complete">All complete</option>
+      <option value="none">No visits</option>
+    </select></label>
+    <button id="f-clear" type="button">Clear</button>
+    <span id="f-count" style="margin-left:auto;align-self:center;color:#94a3b8;"></span>
+  </div>
+
   <!-- ── COMBINED MATRIX ── -->
   <div style="border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;
       box-shadow:0 1px 4px rgba(0,0,0,.06);">
@@ -1188,6 +1359,7 @@
   </div>
 
 </div>
+<script>(${reportInteractive.toString()})();</script>
 </body>
 </html>`;
     }
