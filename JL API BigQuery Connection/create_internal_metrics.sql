@@ -100,6 +100,15 @@
 --   Photos_Per_Visit_Total / _Count / _Avg: completed visits on tickets (by visit END date) and the photos on each
 --     visit's own notes; _Avg = Total / Count (visits with 0 photos count as 0).
 --
+-- TOTAL SELL (2026-10-22; UK, ex VAT) = value of work DELIVERED in the period, invoiced or not:
+--   Sell_Tickets   completed tickets (BACKLOG scope) by completion date: chargeable cost-line sell, or QuotedValue when
+--                  the job has no cost lines (same valuation as Uninvoiced_*).
+--   Sell_Projects  finished Project jobs (Completed/Invoiced/Costed/"Reqs. Invoice") by completion date: QuotedValue,
+--                  else cost-line sell (same valuation as Project_Uninvoiced_*). Original request jobs with no value = 0.
+--   Sell_PPM       PPM contract invoices (PPMContractId set) by invoice date — PPMs are billed on the contract
+--                  schedule, so the invoice IS the sell. PPM job cost lines are not added (would double count).
+--   Total_Sell     = the three together. Differs from Invoiced_* (billing date, incl. invoices for work done earlier).
+--
 -- BACKLOG (snapshot, NOT a flow): open "tickets" at the period's As_Of date (period end, or today for the current
 -- period) older than 30 / 60 / 100 days since logged. Tickets = every job except PPM (PM...) and Project jobs.
 -- Open at As_Of = logged on/before As_Of and not closed by then. Closed = status Completed/Invoiced/Costed/
@@ -187,6 +196,19 @@ ticket_visits AS (  -- completed visits on UK tickets, with the visit end date (
   FROM `vmimporteddata.models.job_statutory_category_v2` j, UNNEST(j.VisitsStatus) v
   WHERE v.StatusDescription = "Complete" AND v.EndDate IS NOT NULL
     AND NOT STARTS_WITH(j.JobNumber, "PM") AND IFNULL(j.TypeDescription, "") != "Project"
+),
+job_sell AS (  -- UK job valuation for TOTAL SELL: chargeable cost-line sell, else quoted value
+  SELECT j.job_id,
+         IF(IFNULL(jc.n_lines, 0) > 0, IFNULL(cl.sell, 0), IFNULL(j.QuotedValue, 0)) AS ticket_value,
+         IF(IFNULL(j.QuotedValue, 0) > 0, j.QuotedValue, IFNULL(cl.sell, 0))         AS project_value
+  FROM jobs j
+  LEFT JOIN (SELECT job_id, n_lines FROM `vmimporteddata.raw.job_costs`
+             QUALIFY ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY _ingested_at DESC) = 1) jc
+    ON jc.job_id = j.job_id
+  LEFT JOIN (SELECT job_id, SUM(sell_excl_vat) AS sell FROM `vmimporteddata.models.cost_line_items`
+             WHERE IFNULL(is_chargeable, TRUE) GROUP BY job_id) cl
+    ON cl.job_id = j.job_id
+  WHERE j.tenant = "UK"
 ),
 quote_jobs AS (  -- UK jobs that came from a quote
   SELECT upgraded_job_number AS JobNumber FROM `vmimporteddata.reporting.quote_to_job_completion`
@@ -319,6 +341,25 @@ facts AS (
   LEFT JOIN quote_jobs qj ON qj.JobNumber = i.JobNumber
   WHERE NOT IFNULL(i.IsDraft, FALSE)
 
+  UNION ALL  -- total sell: completed tickets (by completion date) and finished Project jobs
+  SELECT j.tenant, j.CustomerName, j.Area,
+         IF(j.TypeDescription = "Project", "sell_project", "sell_ticket"),
+         DATE(COALESCE(j.DateComplete, j.UpdatedAt)), NULL, NULL, NULL,
+         IF(j.TypeDescription = "Project", js.project_value, js.ticket_value), j.job_category
+  FROM jobs j
+  JOIN job_sell js ON js.job_id = j.job_id
+  WHERE j.tenant = "UK" AND NOT STARTS_WITH(j.JobNumber, "PM")
+    AND (j.status IN ("Completed", "Invoiced", "Costed")
+         OR (j.TypeDescription = "Project" AND j.status = "Reqs. Invoice"))
+
+  UNION ALL  -- total sell: PPM contract invoices, by invoice date
+  SELECT "UK", i.CustomerName, sa.Area, "sell_ppm", DATE(i.DateRaised, "Europe/London"), NULL, NULL, NULL,
+         i.TotalExcludingVat, CAST(NULL AS STRING)
+  FROM (SELECT * FROM `vmimporteddata.raw.invoices`
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY Id ORDER BY _ingested_at DESC) = 1) i
+  LEFT JOIN site_area sa ON sa.SiteId = i.SiteId
+  WHERE i.PPMContractId IS NOT NULL AND NOT IFNULL(i.IsDraft, FALSE)
+
   UNION ALL  -- other costs: cost lines on jobs that did not come from a quote (UK only)
   SELECT "UK", j.CustomerName, j.Area, "cost_other", DATE(c.date_incurred), NULL, NULL, NULL, c.cost_excl_vat, j.job_category
   FROM `vmimporteddata.models.cost_line_items` c
@@ -357,6 +398,9 @@ flow AS (
     SUM(IF(f.kind = "photo_job", f.amount, NULL))   AS Photo_Jobs_With_Photo,
     SUM(IF(f.kind = "photo_visit", f.amount, NULL)) AS Photos_Per_Visit_Total,
     COUNTIF(f.kind = "photo_visit")                 AS Photos_Per_Visit_Count,
+    SUM(IF(f.kind = "sell_ticket", f.amount, NULL))  AS Sell_Tickets,
+    SUM(IF(f.kind = "sell_project", f.amount, NULL)) AS Sell_Projects,
+    SUM(IF(f.kind = "sell_ppm", f.amount, NULL))     AS Sell_PPM,
     COUNTIF(f.kind = "ftf")                         AS First_Time_Fix_Jobs,
     SUM(IF(f.kind = "ftf", f.amount, NULL))         AS First_Time_Fix_Fixed,
     SUM(IF(f.kind = "ttq", f.amount, NULL))         AS Time_To_Quote_Total,
@@ -546,6 +590,12 @@ SELECT
   ROUND(IFNULL(f.Project_Sell, 0), 2)                   AS Project_Sell,
   ROUND(IFNULL(f.Project_Cost, 0), 2)                   AS Project_Cost,
   SAFE_DIVIDE(f.Project_Sell - f.Project_Cost, f.Project_Sell)                      AS Project_Margin_Pct,
+  -- total sell: work delivered in the period, invoiced or not (UK, ex VAT)
+  IF(s.Segment = "Neko Sweden", NULL, ROUND(IFNULL(f.Sell_Tickets, 0), 2))  AS Sell_Tickets,
+  IF(s.Segment = "Neko Sweden", NULL, ROUND(IFNULL(f.Sell_Projects, 0), 2)) AS Sell_Projects,
+  IF(s.Segment = "Neko Sweden", NULL, ROUND(IFNULL(f.Sell_PPM, 0), 2))      AS Sell_PPM,
+  IF(s.Segment = "Neko Sweden", NULL,
+     ROUND(IFNULL(f.Sell_Tickets, 0) + IFNULL(f.Sell_Projects, 0) + IFNULL(f.Sell_PPM, 0), 2)) AS Total_Sell,
   -- money (ex VAT, in Currency)
   IFNULL(f.Quotes_Raised, 0)                            AS Quotes_Raised,
   ROUND(IFNULL(f.Quoted_Value, 0), 2)                   AS Quoted_Value,
