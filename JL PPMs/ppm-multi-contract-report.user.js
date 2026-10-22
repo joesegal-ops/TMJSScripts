@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JL: PPM Multi-Contract Report
 // @namespace    https://go.joblogic.com/
-// @version      3.41
-// @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder). v3.41: sections by PPM criticality (Statutory / Critical / Non-Statutory / Internal) from contract tags.
+// @version      3.42
+// @description  On the PPM Contracts list page, read every visible contract (skipping Suspended), collect all visits, and generate a single combined Untitled Projects branded matrix report. v3.27: collapses to a launcher button in the shared dock (drag to reorder). v3.41: sections by PPM criticality (Statutory / Critical / Non-Statutory / Internal) from contract tags. v3.42: Download HTML button in the report.
 // @match        https://go.joblogic.com/PPMContract*
 // @grant        none
 // @run-at       document-idle
@@ -113,7 +113,7 @@
     const VERSION   = '3.26';   // saved-state schema version — bump only when state shape changes
     // Displayed version — reads the userscript @version so the button header and
     // load log always track the installed version (bump @version, this follows).
-    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.41';
+    const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '3.42';
     const STATE_KEY = 'ppm-multi-report-v1';
     const PLOG_KEY  = 'ppm-multi-log-v1';
 
@@ -1018,6 +1018,9 @@
     function generateFullReport(contractDataList, reportTitle = 'PPM Service Report') {
         const today   = new Date(); today.setHours(0,0,0,0);
         const genDate = today.toLocaleDateString('en-GB', { day:'numeric', month:'long', year:'numeric' });
+        // Download filename: "<Report Title> YYYY-MM-DD.html" (filesystem-safe)
+        const fileName = `${(reportTitle || 'PPM Service Report').replace(/[\\/:*?"<>|]+/g, '-').trim()} ` +
+            `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}.html`;
 
         // Stat box — font size and width scale with the number so 3-digit values
         // don't overflow their containers and bleed into neighbouring stats.
@@ -1090,6 +1093,19 @@
           style="margin-top:14px;padding:7px 16px;background:rgba(255,255,255,0.08);
             border:1px solid rgba(255,255,255,0.15);border-radius:6px;color:#94a3b8;
             font-size:11px;cursor:pointer;font-family:inherit;display:inline-block;">⎙ Print</button>
+        <!-- Download — saves this page as a standalone .html file to share -->
+        <button class="no-print" data-fn="${esc(fileName)}" title="Save this report as a standalone HTML file to share"
+          onclick="(function(btn){
+            var html = '<!DOCTYPE html>\\n' + document.documentElement.outerHTML;
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+            a.download = btn.getAttribute('data-fn');
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function(){ URL.revokeObjectURL(a.href); }, 2000);
+          })(this)"
+          style="margin-top:14px;margin-left:6px;padding:7px 16px;background:rgba(255,255,255,0.08);
+            border:1px solid rgba(255,255,255,0.15);border-radius:6px;color:#94a3b8;
+            font-size:11px;cursor:pointer;font-family:inherit;display:inline-block;">⬇ Download HTML</button>
       </div>
 
       <!-- Stat blocks -->
