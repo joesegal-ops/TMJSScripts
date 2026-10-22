@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.18
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.18: with a job list on the SPO page, looks up just those jobs (no full crawl); never touches Cancelled POs. v1.17: optional Job/Action TSV - only process listed jobs, and set Non-Chargeable on SPO cost lines where asked; patient page loading (no longer stops at a slow page). v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
+// @version      1.19
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.19: Non-Chargeable rows also fix SPOs that are already completed; conflicting rows for one job are skipped; clearer per-job report. v1.18: with a job list on the SPO page, looks up just those jobs (no full crawl); never touches Cancelled POs. v1.17: optional Job/Action TSV - only process listed jobs, and set Non-Chargeable on SPO cost lines where asked; patient page loading (no longer stops at a slow page). v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -103,7 +103,7 @@
     // ===== end shared dock =====
 
     // Read from the metadata block so the on-screen version can never drift from @version.
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.18');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.19');
     const SCRIPT_ID = 'auto-deliver-pos';
     const SCRIPT_LABEL = '📦 Auto Deliver POs';
     const SCRIPT_COLOR = '#4c9f01';
@@ -707,17 +707,53 @@
         });
     }
 
+    // One action per job. Rows without a PO column that disagree for the same job are a
+    // conflict - the job is skipped rather than guessing which row wins.
+    function resolveJobActions(jobList) {
+        var map = {}, order = [];
+        jobList.entries.forEach(function (e) {
+            if (e.po) return; // PO-specific rows are matched per PO
+            if (!map[e.job]) { map[e.job] = { job: e.job, actions: [] }; order.push(e.job); }
+            if (map[e.job].actions.indexOf(e.action) === -1) map[e.job].actions.push(e.action);
+        });
+        jobList.entries.forEach(function (e) {
+            if (!e.po || map[e.job]) return;
+            map[e.job] = { job: e.job, actions: [], perPO: true }; order.push(e.job);
+        });
+        return order.map(function (j) {
+            var m = map[j];
+            if (m.perPO) return { job: j, action: 'perPO' };
+            return { job: j, action: m.actions.length === 1 ? m.actions[0] : 'conflict', actions: m.actions };
+        });
+    }
+
     async function lookupListedSPOs(jobList, skipPartial, token) {
-        var jobs = [];
-        jobList.entries.forEach(function (e) { if (e.action !== 'skip' && jobs.indexOf(e.job) === -1) jobs.push(e.job); });
-        var out = [];
+        var jobs = resolveJobActions(jobList);
+        var out = [], report = { completed: [], cancelledOnly: [], none: [], conflict: [] };
         for (var i = 0; i < jobs.length && running; i++) {
-            setProgress('Looking up SPOs: job ' + (i + 1) + '/' + jobs.length + ' (' + jobs[i] + ')');
-            var rows = await searchSPOsForJob(jobs[i], token);
-            var target = filterPOs(rows, skipPartial);
-            log(jobs[i] + ': ' + rows.length + ' SPO(s), ' + target.length + ' outstanding' + (rows.length ? ' - ' + rows.map(function (r) { return r.poNumber + ' ' + r.poStatus + '/' + r.rawStatus; }).join(', ') : ''), '#0af');
-            out = out.concat(target);
+            var j = jobs[i];
+            if (j.action === 'skip') continue;
+            if (j.action === 'conflict') { report.conflict.push(j.job + ' (' + j.actions.join('/') + ')'); continue; }
+            setProgress('Looking up SPOs: job ' + (i + 1) + '/' + jobs.length + ' (' + j.job + ')');
+            var rows = await searchSPOsForJob(j.job, token);
+            var live = rows.filter(function (r) { return !/cancel/i.test(r.poStatus); });
+            var target = filterPOs(live, skipPartial);
+            // Non-Chargeable also applies to SPOs someone already completed: their cost line
+            // exists and may still be chargeable.
+            var done = j.action === 'deliver' ? [] : live.filter(function (r) {
+                return target.indexOf(r) === -1 && /complet/.test(r.rawStatus) && !/not completed/.test(r.rawStatus);
+            });
+            done.forEach(function (r) { r.alreadyComplete = true; });
+            log(j.job + ': ' + rows.length + ' SPO(s), ' + target.length + ' outstanding' + (done.length ? ', ' + done.length + ' already completed to check' : '') + (rows.length ? ' - ' + rows.map(function (r) { return r.poNumber + ' ' + r.poStatus + '/' + r.rawStatus; }).join(', ') : ''), '#0af');
+            if (!rows.length) report.none.push(j.job);
+            else if (!live.length) report.cancelledOnly.push(j.job);
+            else if (!target.length && !done.length) report.completed.push(j.job);
+            out = out.concat(target, done);
         }
+        if (report.conflict.length) log('SKIPPED - rows disagree on the action (add a PO column to split them): ' + report.conflict.join(', '), '#f55');
+        if (report.completed.length) log('Nothing to do - already completed (' + report.completed.length + '): ' + report.completed.join(', '), '#888');
+        if (report.cancelledOnly.length) log('Nothing to do - only cancelled SPOs (' + report.cancelledOnly.length + '): ' + report.cancelledOnly.join(', '), '#888');
+        if (report.none.length) log('No SPOs found for (' + report.none.length + '): ' + report.none.join(', '), '#fa0');
         return out;
     }
 
@@ -755,17 +791,25 @@
         return json.AdditionalData || [];
     }
 
-    // Returns how many job cost lines were switched to Non-Chargeable.
-    async function setSPOLinesNonChargeable(poId, lineIds, token) {
+    // Switches the given SPO lines' job cost lines to Non-Chargeable (apply=false just counts).
+    // Lines already non-chargeable are left alone; lines already on an invoice are never
+    // touched (changing them would desync the invoice) and are reported instead.
+    // Returns { changed, already, invoiced, sell } - sell = chargeable sell removed (or that would be).
+    async function setSPOLinesNonChargeable(poId, lineIds, token, apply) {
+        if (apply === undefined) apply = true;
         var lines = (await getSPOLines(poId)).filter(function (l) { return lineIds.indexOf(l.Id) !== -1; });
-        var changed = 0;
+        var out = { changed: 0, already: 0, invoiced: 0, sell: 0 };
         for (var i = 0; i < lines.length; i++) {
             var l = lines[i];
-            if (!l.JobLineId) throw new Error('SPO line "' + (l.Description || '').trim() + '" has no job cost line after completion');
+            if (!l.JobLineId) throw new Error('SPO line "' + (l.Description || '').trim() + '" has no job cost line');
             var mdUrl = '/api/JobCost/GetEditSubcontractorCostMetadata?id=' + l.JobLineId + '&jobId=' + l.JobId;
             var md = JSON.parse(await jlFetch(mdUrl, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } }, 'Cost line')).AdditionalData;
             if (!md || md.Id !== l.JobLineId || md.JobId !== l.JobId) throw new Error('cost line ' + l.JobLineId + ' metadata did not match');
-            if (md.IsChargeable === false) continue; // already non-chargeable (e.g. quoted job)
+            if (md.IsChargeable === false) { out.already++; continue; } // already non-chargeable (e.g. quoted job)
+            if (md.HasBeenInvoiced) { out.invoiced++; continue; }
+            var st = parseJlDateTime(md.DateIncurred), en = parseJlDateTime(md.EndDate);
+            out.sell += (Number(md.SellPerHour) || 0) * ((st && en) ? (en - st) / 3600000 : 1);
+            if (!apply) { out.changed++; continue; }
             var text = await jlFetch('/api/JobLine/SaveSubcontractorCost', {
                 method: 'POST',
                 credentials: 'same-origin',
@@ -774,9 +818,16 @@
             }, 'SaveSubcontractorCost');
             var res = (function () { try { return JSON.parse(text); } catch (e) { return {}; } })();
             if (res.success === false) throw new Error(res.Message || (res.errors || []).join(', ') || 'cost line save failed');
-            changed++;
+            out.changed++;
         }
-        return changed;
+        return out;
+    }
+
+    function describeNonChg(r, dryRun) {
+        var parts = [(dryRun ? 'would set ' : 'set ') + r.changed + ' cost line(s) Non-Chargeable' + (r.sell ? ' (removes ' + fmtMoney(r.sell) + ' sell)' : '')];
+        if (r.already) parts.push(r.already + ' already non-chargeable');
+        if (r.invoiced) parts.push(r.invoiced + ' already INVOICED - left alone, fix by hand/credit if needed');
+        return parts.join('; ');
     }
 
     // --- MAIN PROCESS ---
@@ -858,17 +909,23 @@
             }
 
             if (jobList) {
-                var before = targetPOs.length;
+                var actionByJob = {};
+                resolveJobActions(jobList).forEach(function (j) { actionByJob[j.job] = j.action; });
+                var before = targetPOs.length, missing = [];
                 targetPOs = targetPOs.filter(function (po) {
-                    var e = findListEntry(jobList, po);
-                    if (!e) return false;
-                    e.matched++;
-                    po.listAction = e.action;
-                    return e.action !== 'skip';
+                    var a = actionByJob[(po.jobNo || '').toUpperCase()];
+                    if (a === 'perPO') { var e = findListEntry(jobList, po); a = e ? e.action : null; }
+                    if (!a || a === 'conflict' || a === 'skip') return false;
+                    po.listAction = a;
+                    return true;
                 });
-                log('Job list matched ' + targetPOs.length + ' of ' + before + ' target POs', '#0af');
-                var unmatched = jobList.entries.filter(function (e) { return !e.matched && e.action !== 'skip'; });
-                if (unmatched.length) log('  Not found among outstanding POs (' + unmatched.length + '): ' + unmatched.map(function (e) { return e.job + (e.po ? '/' + e.po : ''); }).join(', '), '#fa0');
+                log('Job list matched ' + targetPOs.length + ' of ' + before + ' PO(s)', '#0af');
+                if (!spo) {
+                    Object.keys(actionByJob).forEach(function (j) {
+                        if (actionByJob[j] !== 'skip' && !targetPOs.some(function (po) { return (po.jobNo || '').toUpperCase() === j; })) missing.push(j);
+                    });
+                    if (missing.length) log('  Not found among outstanding POs (' + missing.length + '): ' + missing.join(', '), '#fa0');
+                }
             }
 
             // Step 2: Process each PO
@@ -879,7 +936,7 @@
             var errors = 0;
             var impactCost = 0, impactSell = 0, impactUnknown = 0, impactInvoicedSell = 0, impactInvoicedJobs = 0;
             var impactNonChargeable = 0, impactNonChargeableCost = 0;
-            var nonChgSet = 0, nonChgPOs = 0;
+            var nonChgSet = 0, nonChgPOs = 0, fixedDone = 0, fixedDoneLines = 0, fixedDoneSell = 0, invoicedLeft = 0;
 
             for (var i = 0; i < targetPOs.length; i++) {
                 if (!running) { log('Stopped by user.', '#f55'); break; }
@@ -918,7 +975,24 @@
                         continue;
                     }
 
-                    log('PO ' + po.id.substring(0, 8) + '... -> ' + po.jobNo + ' [' + job.statusDescription + '] - ' + (spo ? 'completion' : 'delivery') + ': ' + po.rawStatus + (wantNonChg ? '  [list: Non-Chargeable]' : po.listAction ? '  [list: Deliver]' : ''), '#aaf');
+                    log('PO ' + (po.poNumber || po.id.substring(0, 8) + '...') + ' -> ' + po.jobNo + ' [' + job.statusDescription + '] - ' + (spo ? 'completion' : 'delivery') + ': ' + po.rawStatus + (wantNonChg ? '  [list: Non-Chargeable]' : po.listAction ? '  [list: Deliver]' : ''), '#aaf');
+
+                    // Already completed by someone else: no completion, just fix the cost line(s).
+                    if (po.alreadyComplete) {
+                        if (!wantNonChg) continue;
+                        var doneIds = (await getSPOLines(po.id)).filter(function (l) { return l.IsRequired && l.Completed; }).map(function (l) { return l.Id; });
+                        try {
+                            var fr = await setSPOLinesNonChargeable(po.id, doneIds, token, !dryRun);
+                            log('  Already completed - ' + describeNonChg(fr, dryRun), fr.invoiced ? '#f90' : fr.changed ? (dryRun ? '#ff0' : '#0fa') : '#888');
+                            if (fr.changed) { fixedDone++; fixedDoneLines += fr.changed; fixedDoneSell += fr.sell; }
+                            invoicedLeft += fr.invoiced;
+                        } catch (e) {
+                            if (e.message === 'stopped') throw e;
+                            log('  ERROR checking/setting Non-Chargeable: ' + e.message, '#f55');
+                            errors++;
+                        }
+                        continue;
+                    }
 
                     // Must run before delivering - afterwards the lines are no longer outstanding.
                     if (showImpact) {
@@ -960,9 +1034,9 @@
                             delivered++;
                             if (wantNonChg) {
                                 try {
-                                    var n = await setSPOLinesNonChargeable(po.id, outstandingIds, token);
-                                    nonChgSet += n; nonChgPOs++;
-                                    log('  Set ' + n + ' job cost line(s) to Non-Chargeable' + (n < outstandingIds.length ? ' (' + (outstandingIds.length - n) + ' already non-chargeable)' : ''), '#0fa');
+                                    var nr = await setSPOLinesNonChargeable(po.id, outstandingIds, token, true);
+                                    nonChgSet += nr.changed; nonChgPOs++; invoicedLeft += nr.invoiced;
+                                    log('  ' + describeNonChg(nr, false), nr.invoiced ? '#f90' : '#0fa');
                                 } catch (e) {
                                     if (e.message === 'stopped') throw e;
                                     log('  ERROR setting Non-Chargeable (PO IS completed - fix the cost line by hand): ' + e.message, '#f55');
@@ -996,7 +1070,11 @@
             log('POs skipped (job still open): ' + skippedJobOpen, '#888');
             log('POs skipped (no job/not found): ' + skippedNoJob, '#888');
             log('Errors: ' + errors, errors > 0 ? '#f55' : '#0fa');
-            if (jobList) log('POs ' + (dryRun ? 'that would be ' : '') + 'set Non-Chargeable from job list: ' + nonChgPOs + (dryRun ? '' : ' (' + nonChgSet + ' cost line(s) changed)'), '#0af');
+            if (jobList) {
+                log('POs ' + (dryRun ? 'that would be ' : '') + 'completed + set Non-Chargeable: ' + nonChgPOs + (dryRun ? '' : ' (' + nonChgSet + ' cost line(s) changed)'), '#0af');
+                log('Already-completed SPOs ' + (dryRun ? 'that would be ' : '') + 'switched to Non-Chargeable: ' + fixedDone + ' (' + fixedDoneLines + ' line(s), ' + fmtMoney(fixedDoneSell) + ' sell removed)', '#0af');
+                if (invoicedLeft) log('Cost lines left alone because they are already invoiced: ' + invoicedLeft, '#f90');
+            }
             if (showImpact) {
                 log('Job cost ' + (dryRun ? 'that would be ' : '') + 'added: ' + fmtMoney(impactCost), '#ffd27f');
                 log('Job sell ' + (dryRun ? 'that would be ' : '') + 'added (est.): ' + fmtMoney(impactSell) + (impactUnknown ? '  (+ ' + impactUnknown + ' PO(s) with unknown uplift)' : ''), '#ffd27f');
