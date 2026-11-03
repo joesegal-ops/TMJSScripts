@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.24
-// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID", SITEID auto-derived from the job's site → set every line on a Project-type job to nominal "202 - Projects Income" → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
+// @version      1.25
+// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID | WW Paid|Member Paid", SITEID auto-derived from the job's site and the payer read from the Monday item's Client column (YES = WW Paid) → set every line on a Project-type job to nominal "202 - Projects Income" → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -132,6 +132,7 @@
     const MB_PO      = 'text_mky86hyy';      // PO Number (primary match key)
     const MB_JOBREF  = 'text_mkyrcb16';      // Job Ref. (fallback match key)
     const MB_PMSTAT  = 'status';             // PM Stat. — "Complete" means leave the job as Invoiced
+    const MB_CLIENT  = 'color_mky7yjmx';     // Client — WeWork / YES (old label, = WeWork) / Member → payer on the Reference
     const MONDAY_TOKEN_KEY = 'jl-monday-token';   // Tampermonkey GM storage, set via a prompt (no DOM field → password managers can't clobber it)
     function mondayToken() { try { return GM_getValue(MONDAY_TOKEN_KEY, '') || ''; } catch (e) { return ''; } }
 
@@ -173,8 +174,8 @@
         const cleaned = String(raw || '').trim().replace(/^PO[-\s:]*/i, '');
         return 'PO-' + cleaned;
     }
-    function buildReference(po, siteId) {
-        return `PROJ | ${formatPO(po)} - ${siteId}`;
+    function buildReference(po, siteId, payer) {
+        return `PROJ | ${formatPO(po)} - ${siteId}` + (payer ? ` | ${payer}` : '');
     }
 
     async function fetchText(url) {
@@ -638,16 +639,44 @@
     async function mondayFindItem(po, jobRef) {
         async function byColumn(colId, value) {
             if (!value) return [];
-            const q = `query { items_page_by_column_values(limit: 10, board_id: ${MONDAY_BOARD}, columns: [{column_id: "${colId}", column_values: ${JSON.stringify([String(value)])}}]) { items { id name column_values(ids: ["${MB_PMSTAT}"]) { text } } } }`;
+            const q = `query { items_page_by_column_values(limit: 10, board_id: ${MONDAY_BOARD}, columns: [{column_id: "${colId}", column_values: ${JSON.stringify([String(value)])}}]) { items { id name column_values(ids: ["${MB_PMSTAT}", "${MB_CLIENT}"]) { id text } } } }`;
             const d = await mondayApi(q, {});
             return ((d.items_page_by_column_values || {}).items) || [];
         }
+        const col = (item, id) => (((item.column_values || []).find(c => c.id === id) || {}).text || '').trim();
         let items = await byColumn(MB_PO, po);
         let by = 'PO';
         if (!items.length) { items = await byColumn(MB_JOBREF, jobRef); by = 'JobRef'; }
         if (!items.length) return null;
-        const pmStat = (((items[0].column_values || [])[0] || {}).text || '').trim();
-        return { id: items[0].id, name: items[0].name, pmStat, by, ambiguous: items.length > 1, count: items.length };
+        return { id: items[0].id, name: items[0].name, pmStat: col(items[0], MB_PMSTAT), clients: items.map(it => col(it, MB_CLIENT)), by, ambiguous: items.length > 1, count: items.length };
+    }
+    // Monday "Client" → who pays. "YES" is the board's old label for WeWork-paid.
+    function payerFromClient(client) {
+        const c = String(client || '').trim().toLowerCase();
+        if (c === 'wework' || c === 'yes') return 'WW Paid';
+        if (c === 'member') return 'Member Paid';
+        return '';
+    }
+    // Resolve the row's payer from Monday once (cached on the job). Never throws — on no
+    // match / mixed matches / unset Client the Reference is built without a payer.
+    async function resolvePayer(job) {
+        if (job.payerChecked) return;
+        if (!mondayToken()) { job.payerChecked = true; job.payer = ''; log(`    ⚠ payer: no Monday token set — Reference built without WW/Member Paid`, '#fd0'); return; }
+        try {
+            const hit = await mondayFindItem(formatPO(job.po), job.jobNumber);
+            if (!hit) { log(`    ⓘ payer: no Monday item for ${formatPO(job.po)} / ${job.jobNumber}`, '#fd0'); return; }
+            job.payerChecked = true;
+            const payers = [...new Set(hit.clients.map(payerFromClient))];
+            if (payers.length === 1 && payers[0]) {
+                job.payer = payers[0];
+                log(`    payer: ${job.payer} (Monday Client "${hit.clients[0]}"${hit.ambiguous ? `, ${hit.count} ${hit.by} matches agree` : ''})`, '#8fd');
+            } else {
+                job.payer = '';
+                log(`    ⚠ payer: Monday Client is ${hit.clients.map(c => `"${c || 'blank'}"`).join(', ')} — Reference built without WW/Member Paid, add it manually`, '#f80');
+            }
+        } catch (e) {
+            log(`    ⚠ payer: Monday lookup failed (${e.message}) — Reference built without WW/Member Paid`, '#fd0');
+        }
     }
     async function mondaySetInvoiced(itemId, netAmount, poNumber) {
         const cv = {}; cv[MB_FINANCE] = { label: 'Invoiced' };
@@ -765,7 +794,8 @@
                             job.jobType = info.jobType;
                         }
                         job.siteId = siteIdFrom(job.siteName);
-                        job.reference = buildReference(job.po, job.siteId);
+                        await resolvePayer(job);
+                        job.reference = buildReference(job.po, job.siteId, job.payer);
                         log(`[${i + 1}] ${job.jobNumber} → site "${job.siteName}" (${job.siteId}) | ${job.reference}`, '#0af');
                         await sleep(DELAY);
                         if (!job.invoiceId) {
@@ -847,7 +877,7 @@
                 // which is the primary one on the sheet.
                 if (String(job.jobNumber).toLowerCase() !== String(cands[0]).toLowerCase()) {
                     log(`    ⓘ nothing to invoice on any of ${cands.join(', ')} — reporting against ${cands[0]}`, '#fd0');
-                    try { const first = await resolveJob(cands[0]); job.jobId = first.jobId; job.jobNumber = first.jobNumber; job.siteName = first.siteName; job.siteId = siteIdFrom(job.siteName); job.reference = buildReference(job.po, job.siteId); } catch (x) {}
+                    try { const first = await resolveJob(cands[0]); job.jobId = first.jobId; job.jobNumber = first.jobNumber; job.siteName = first.siteName; job.siteId = siteIdFrom(job.siteName); job.reference = buildReference(job.po, job.siteId, job.payer); } catch (x) {}
                 }
                 job.prepStatus = 'already-invoiced';
                 job.emailStatus = 'skipped';
