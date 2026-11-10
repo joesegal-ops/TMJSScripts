@@ -1,0 +1,18 @@
+# Mac / editor junk
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Never publish data, credentials or local config
+*.env
+*.env.*
+secrets*
+*.csv
+*.tsv
+*.xlsx
+*.json
+!package.json
+
+# Userscripts that must stay private (add paths here, one per line)
+# JL Jobs/example-private.user.js
