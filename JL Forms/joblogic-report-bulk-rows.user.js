@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JobLogic Report Designer — Bulk Row Insert
 // @namespace    com.joesegal.joblogic
-// @version      1.1.0
+// @version      1.1.1
 // @description  Paste tab- or comma-separated data (any number of columns, e.g. Location, Result, Comments) and bulk-insert rows into DataBand1 on Page 1 of the Stimulsoft Report Designer. v1.0.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Form/Designer/*
 // @run-at       document-idle
@@ -313,22 +313,46 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
     const StiText = Stimulsoft.Report.Components.StiText;
     if (!StiText) { log('✗ Stimulsoft.Report.Components.StiText not available.'); return; }
 
-    // Row 1 of DataBand1 (top≈0), sorted left→right, is the template for both
-    // formatting and (when its cell count matches) column positions.
+    // Row 1 of DataBand1 (top≈0), sorted left→right, is the template for formatting.
+    // Cells this script made (TM_*) are never used for column POSITIONS — otherwise a
+    // second run just "matches" the first run's guess.
     const existing = dataBand.components.list;
     const templateRow = existing.filter(c => Math.abs(c.top) < 0.001).sort((a, b) => a.left - b.left);
+    const isOurs = c => /^TM_/.test(c.name || '');
+    const originalRow = templateRow.filter(c => !isOurs(c));
     const fallbackTemplate = templateRow[0] || existing[0] || null;
     if (!fallbackTemplate) log('⚠ No existing template cell found — using bare defaults.');
+
+    // Column header row: the nearest band above DataBand1 that has a line of exactly
+    // nCols text cells (e.g. Location | Outlet Type | Hot | Cold | Mixed | Remedial | Issues).
+    const fmt = cs => cs.map(c => `${(+c.left).toFixed(2)}+${(+c.width).toFixed(2)}`).join(', ');
+    const headerRow = (() => {
+      const bands = page.components.list
+        .filter(b => b !== dataBand && b.components && b.components.list && b.components.list.length && b.top < dataBand.top)
+        .sort((a, b) => b.top - a.top); // nearest above first
+      for (const band of bands) {
+        const byTop = {};
+        band.components.list.forEach(c => { const k = (+c.top).toFixed(2); (byTop[k] = byTop[k] || []).push(c); });
+        const lines = Object.keys(byTop).sort((a, b) => b - a).map(k => byTop[k]); // lowest line (closest to data) first
+        const hit = lines.find(l => l.length === nCols);
+        if (hit) return { band, cells: hit.slice().sort((a, b) => a.left - b.left) };
+      }
+      return null;
+    })();
 
     // Work out each column's {left, width, template}
     let cols;
     if (userWidths) {
-      let x = templateRow.length ? templateRow[0].left : LAYOUT.defaultLeft;
+      const ref = headerRow ? headerRow.cells : (originalRow.length ? originalRow : templateRow);
+      let x = ref.length ? ref[0].left : LAYOUT.defaultLeft;
       cols = userWidths.map((w, i) => { const c = { left: x, width: w, template: templateRow[i] || fallbackTemplate }; x += w; return c; });
       log(`Layout: your widths (${userWidths.join(', ')}).`);
-    } else if (templateRow.length === nCols) {
-      cols = templateRow.map(t => ({ left: t.left, width: t.width, template: t }));
-      log(`Layout: matched the ${nCols} cells in existing row 1.`);
+    } else if (headerRow) {
+      cols = headerRow.cells.map((h, i) => ({ left: h.left, width: h.width, template: templateRow[i] || fallbackTemplate }));
+      log(`Layout: lined up with the ${nCols} header cells in ${headerRow.band.name} (${headerRow.cells.map(c => (c.text && String(c.text.value != null ? c.text.value : c.text)) || c.name).join(' | ')}).`);
+    } else if (originalRow.length === nCols) {
+      cols = originalRow.map(t => ({ left: t.left, width: t.width, template: t }));
+      log(`Layout: matched the ${nCols} original cells in DataBand1 row 1.`);
     } else {
       const start = templateRow.length ? templateRow[0].left : LAYOUT.defaultLeft;
       const end = templateRow.length
@@ -336,8 +360,9 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
         : Math.max(start + 1, dataBand.width - LAYOUT.defaultLeft);
       const w = Math.round(((end - start) / nCols) * 1000) / 1000;
       cols = Array.from({ length: nCols }, (_, i) => ({ left: start + i * w, width: w, template: templateRow[i] || fallbackTemplate }));
-      log(`Layout: row 1 has ${templateRow.length} cells, data has ${nCols} — spreading ${nCols} columns evenly (${w}" each) across ${(end - start).toFixed(2)}". Enter widths to control this.`);
+      log(`Layout: row 1 has ${templateRow.length} cells, data has ${nCols} — spreading ${nCols} columns evenly (${w}" each) across ${(end - start).toFixed(2)}". No header row with ${nCols} cells found — enter widths to control this.`);
     }
+    log(`Columns (left+width, inches): ${fmt(cols)}`);
 
     // Confirm destructive action
     if (clearFirst && existing.length > 0) {
