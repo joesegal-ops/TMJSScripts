@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JobLogic Report Designer — Bulk Row Insert
 // @namespace    com.joesegal.joblogic
-// @version      1.1.1
+// @version      1.1.3
 // @description  Paste tab- or comma-separated data (any number of columns, e.g. Location, Result, Comments) and bulk-insert rows into DataBand1 on Page 1 of the Stimulsoft Report Designer. v1.0.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Form/Designer/*
 // @run-at       document-idle
@@ -113,6 +113,7 @@
     defaultLeft: 0.1, // first column's left edge when there is no template row
   };
   const WIDTHS_KEY = 'jlbr-col-widths';
+  const HEIGHT_KEY = 'jlbr-row-height';
 
   // --- Small UI: floating launcher + modal panel ---
   const STYLE = `
@@ -192,6 +193,11 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
             <input id="jlbr-widths" type="text" style="flex:1;min-width:200px;padding:4px 6px" placeholder="blank = match row 1, else spread evenly · e.g. 2,1,0.8,0.8,0.8,1,1.5">
           </div>
           <div class="row">
+            <label for="jlbr-height">Row height (inches, optional):</label>
+            <input id="jlbr-height" type="text" style="width:90px;padding:4px 6px" placeholder="blank = auto">
+            <span style="color:#777;font-size:12px">auto = original row 1, else header row height</span>
+          </div>
+          <div class="row">
             <label><input type="checkbox" id="jlbr-clear" checked> Clear existing DataBand1 rows first</label>
           </div>
           <div class="row">
@@ -216,6 +222,7 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
     document.getElementById('jlbr-cancel').onclick = closeModal;
     document.getElementById('jlbr-run').onclick = runInsert;
     try { document.getElementById('jlbr-widths').value = localStorage.getItem(WIDTHS_KEY) || ''; } catch (e) {}
+    try { document.getElementById('jlbr-height').value = localStorage.getItem(HEIGHT_KEY) || ''; } catch (e) {}
     modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
   }
 
@@ -297,6 +304,11 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
       if (userWidths.length !== nCols) { log(`✗ You entered ${userWidths.length} widths but the data has ${nCols} columns.`); return; }
     }
 
+    const heightText = document.getElementById('jlbr-height').value.trim();
+    try { localStorage.setItem(HEIGHT_KEY, heightText); } catch (e) {}
+    const userHeight = heightText ? Number(heightText) : null;
+    if (heightText && !(userHeight > 0)) { log('✗ Row height must be a positive number, e.g. 0.3'); return; }
+
     // Access Stimulsoft designer
     const d = window.jsStiDesigner;
     if (!d || !d.designer || !d.designer.report) {
@@ -364,6 +376,15 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
     }
     log(`Columns (left+width, inches): ${fmt(cols)}`);
 
+    // Row height: your value → original (non-script) row 1 → header row → default
+    const tallest = cs => Math.max(...cs.map(c => +c.height || 0));
+    let rowHeight, heightSrc;
+    if (userHeight) { rowHeight = userHeight; heightSrc = 'your value'; }
+    else if (originalRow.length && tallest(originalRow) > 0) { rowHeight = tallest(originalRow); heightSrc = 'original row 1'; }
+    else if (headerRow && tallest(headerRow.cells) > 0) { rowHeight = tallest(headerRow.cells); heightSrc = `header row in ${headerRow.band.name}`; }
+    else { rowHeight = LAYOUT.rowHeight; heightSrc = 'default'; }
+    log(`Row height: ${(+rowHeight).toFixed(2)}" (${heightSrc}).`);
+
     // Confirm destructive action
     if (clearFirst && existing.length > 0) {
       const ok = confirm(`This will remove ${existing.length} existing cells from DataBand1 and replace them with ${rows.length} new rows × ${nCols} columns (${rows.length * nCols} cells). Continue?`);
@@ -389,23 +410,16 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
         c.left = col.left;
         c.width = col.width;
         c.top = top;
-        c.height = LAYOUT.rowHeight;
+        c.height = rowHeight;
         c.text = String(text);
-        if (template) {
-          try { c.border = template.border; } catch (e) {}
-          try { c.font = template.font; } catch (e) {}
-          try { c.horAlignment = template.horAlignment; } catch (e) {}
-          try { c.vertAlignment = template.vertAlignment; } catch (e) {}
-          try { c.brush = template.brush; } catch (e) {}
-          try { c.textBrush = template.textBrush; } catch (e) {}
-        }
+        if (template) copyCellSettings(template, c);
         return c;
       };
 
       const saveEvery = saveMode === '20' ? 20 : null;
 
       for (let i = 0; i < rows.length; i++) {
-        const top = i * LAYOUT.rowHeight;
+        const top = i * rowHeight;
         const idx = i + 1;
         cols.forEach((col, j) => dataBand.components.add(makeCell(`TM_C${j + 1}_${idx}`, col, top, rows[i][j])));
 
@@ -418,8 +432,9 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
         }
       }
 
-      // Expand DataBand height to fit all rows + a little padding
-      dataBand.height = Math.max(dataBand.height, rows.length * LAYOUT.rowHeight + 0.2);
+      // Fit DataBand to the rows: exact when we replaced everything, else only grow
+      const needed = rows.length * rowHeight;
+      dataBand.height = clearFirst ? needed : Math.max(dataBand.height, needed);
 
       // Final re-render
       inner.jsObject.assignReport(report);
@@ -457,6 +472,32 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
   }
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  // Every StiText setting worth carrying over from the template cell (position,
+  // size, name and text are set separately). Objects are cloned so cells don't
+  // share one border/font/margins instance.
+  const CELL_PROPS = [
+    // Appearance
+    'border', 'font', 'brush', 'textBrush', 'horAlignment', 'vertAlignment',
+    'margins', 'angle', 'lineSpacing', 'textOptions', 'textFormat', 'textQuality',
+    'componentStyle', 'useParentStyles', 'evenStyle', 'oddStyle',
+    // Behaviour (Word Wrap, Can Grow, etc.)
+    'wordWrap', 'canGrow', 'canShrink', 'canBreak', 'growToHeight', 'autoWidth',
+    'shrinkFontToFit', 'shrinkFontToFitMinimumSize', 'trimming', 'maxNumberOfLines',
+    'allowHtmlTags', 'hideZeros', 'onlyText', 'linesOfUnderline', 'renderTo',
+    'processAt', 'processingDuplicates', 'excelValue', 'exportAsImage',
+    'printable', 'printOn', 'enabled', 'locked', 'linked', 'shiftMode',
+    'interaction', 'editableText',
+  ];
+  function copyCellSettings(src, dst) {
+    for (const p of CELL_PROPS) {
+      let v;
+      try { v = src[p]; } catch (e) { continue; }
+      if (v === undefined) continue;
+      try { if (v && typeof v === 'object' && typeof v.clone === 'function') v = v.clone(); } catch (e) {}
+      try { dst[p] = v; } catch (e) {}
+    }
+  }
 
   // Inject UI once the designer page is rendered. Poll briefly for jsStiDesigner.
   function waitForDesigner(cb, attempts = 40) {
