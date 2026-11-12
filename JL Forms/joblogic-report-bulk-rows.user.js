@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JobLogic Report Designer — Bulk Row Insert
 // @namespace    com.joesegal.joblogic
-// @version      1.0.13
-// @description  Paste tab- or comma-separated data (3 columns: Location, Result, Comments) and bulk-insert rows into DataBand1 on Page 1 of the Stimulsoft Report Designer. v1.0.2: collapses to a launcher button in the shared dock (drag to reorder).
+// @version      1.1.0
+// @description  Paste tab- or comma-separated data (any number of columns, e.g. Location, Result, Comments) and bulk-insert rows into DataBand1 on Page 1 of the Stimulsoft Report Designer. v1.0.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Form/Designer/*
 // @run-at       document-idle
 // @grant        none
@@ -105,16 +105,14 @@
   const SCRIPT_ID = 'report-bulk-rows';
   const SCRIPT_LABEL = '📋 Report Bulk Rows';
   const SCRIPT_COLOR = '#0b7285';
-  const SCRIPT_DESC = 'Bulk-inserts rows into the Stimulsoft Report Designer. Open a report, paste tab or comma separated data with 3 columns (Location, Result, Comments), then insert.';
+  const SCRIPT_DESC = 'Bulk-inserts rows into the Stimulsoft Report Designer. Open a report, paste tab or comma separated data with any number of columns (e.g. Location, Result, Comments or Location, Outlet Type, Hot, Cold, Mixed, Remedial, Issues), then insert. Column positions come from the existing row 1 in DataBand1 when it has the same number of columns, else from the widths you enter, else they are spread evenly.';
 
-  // --- Column layout (inches, Stimulsoft units) — matches existing row 1 template on Page 1 ---
+  // --- Layout defaults (inches, Stimulsoft units) ---
   const LAYOUT = {
-    loc: { left: 0.1, width: 3.1 },
-    res: { left: 3.2, width: 1.3 },
-    com: { left: 4.5, width: 3.1 },
     rowHeight: 0.2,
-    headerTop: 0, // within DataBand1
+    defaultLeft: 0.1, // first column's left edge when there is no template row
   };
+  const WIDTHS_KEY = 'jlbr-col-widths';
 
   // --- Small UI: floating launcher + modal panel ---
   const STYLE = `
@@ -185,10 +183,14 @@
           <button id="jlbr-close" title="Close">×</button>
         </header>
         <div id="jlbr-body">
-          <label for="jlbr-ta">Paste 3 columns (Location, Result, Comments) — tab- or comma-separated. One row per line.</label>
+          <label for="jlbr-ta">Paste any number of columns — tab- or comma-separated. One row per line. Column count = the widest row.</label>
           <textarea id="jlbr-ta" placeholder="LIFT LOBBY EMLG/1\t{location1.Result}\t{location1.Comments}
 LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
 ..."></textarea>
+          <div class="row" style="flex-wrap:wrap">
+            <label for="jlbr-widths">Column widths (inches, optional):</label>
+            <input id="jlbr-widths" type="text" style="flex:1;min-width:200px;padding:4px 6px" placeholder="blank = match row 1, else spread evenly · e.g. 2,1,0.8,0.8,0.8,1,1.5">
+          </div>
           <div class="row">
             <label><input type="checkbox" id="jlbr-clear" checked> Clear existing DataBand1 rows first</label>
           </div>
@@ -213,6 +215,7 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
     document.getElementById('jlbr-close').onclick = closeModal;
     document.getElementById('jlbr-cancel').onclick = closeModal;
     document.getElementById('jlbr-run').onclick = runInsert;
+    try { document.getElementById('jlbr-widths').value = localStorage.getItem(WIDTHS_KEY) || ''; } catch (e) {}
     modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
   }
 
@@ -277,13 +280,22 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
     const raw = parseRows(taText);
     if (!raw.length) { log('⚠ No data pasted.'); return; }
 
-    // Validate + normalise to [loc, res, com]
-    const rows = raw
-      .map(r => [r[0] || '', r[1] || '', r[2] || ''])
-      .filter(r => r.some(c => String(c).trim() !== ''));
+    // Drop blank lines, then pad every row to the widest row's column count
+    const nonEmpty = raw.filter(r => r.some(c => String(c).trim() !== ''));
+    if (!nonEmpty.length) { log('⚠ All rows empty after parsing.'); return; }
+    const nCols = Math.max(...nonEmpty.map(r => r.length));
+    const rows = nonEmpty.map(r => Array.from({ length: nCols }, (_, i) => r[i] || ''));
+    const short = nonEmpty.filter(r => r.length < nCols).length;
+    log(`Parsed ${rows.length} rows × ${nCols} columns.` + (short ? ` (${short} short row(s) padded with blanks)` : ''));
 
-    if (!rows.length) { log('⚠ All rows empty after parsing.'); return; }
-    log(`Parsed ${rows.length} rows.`);
+    const widthsText = document.getElementById('jlbr-widths').value.trim();
+    try { localStorage.setItem(WIDTHS_KEY, widthsText); } catch (e) {}
+    let userWidths = null;
+    if (widthsText) {
+      userWidths = widthsText.split(/[,\s]+/).filter(Boolean).map(Number);
+      if (userWidths.some(w => !(w > 0))) { log('✗ Column widths must be positive numbers, e.g. 2,1,0.8'); return; }
+      if (userWidths.length !== nCols) { log(`✗ You entered ${userWidths.length} widths but the data has ${nCols} columns.`); return; }
+    }
 
     // Access Stimulsoft designer
     const d = window.jsStiDesigner;
@@ -301,15 +313,35 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
     const StiText = Stimulsoft.Report.Components.StiText;
     if (!StiText) { log('✗ Stimulsoft.Report.Components.StiText not available.'); return; }
 
-    // Grab a template cell from existing DataBand1 (for font/border formatting).
-    // Row 1 (top=0) has all 3 columns; fall back to the first available cell.
+    // Row 1 of DataBand1 (top≈0), sorted left→right, is the template for both
+    // formatting and (when its cell count matches) column positions.
     const existing = dataBand.components.list;
-    const template = existing.find(c => Math.abs(c.top) < 0.001) || existing[0] || null;
-    if (!template) log('⚠ No existing template cell found — using bare defaults.');
+    const templateRow = existing.filter(c => Math.abs(c.top) < 0.001).sort((a, b) => a.left - b.left);
+    const fallbackTemplate = templateRow[0] || existing[0] || null;
+    if (!fallbackTemplate) log('⚠ No existing template cell found — using bare defaults.');
+
+    // Work out each column's {left, width, template}
+    let cols;
+    if (userWidths) {
+      let x = templateRow.length ? templateRow[0].left : LAYOUT.defaultLeft;
+      cols = userWidths.map((w, i) => { const c = { left: x, width: w, template: templateRow[i] || fallbackTemplate }; x += w; return c; });
+      log(`Layout: your widths (${userWidths.join(', ')}).`);
+    } else if (templateRow.length === nCols) {
+      cols = templateRow.map(t => ({ left: t.left, width: t.width, template: t }));
+      log(`Layout: matched the ${nCols} cells in existing row 1.`);
+    } else {
+      const start = templateRow.length ? templateRow[0].left : LAYOUT.defaultLeft;
+      const end = templateRow.length
+        ? Math.max(...templateRow.map(t => t.left + t.width))
+        : Math.max(start + 1, dataBand.width - LAYOUT.defaultLeft);
+      const w = Math.round(((end - start) / nCols) * 1000) / 1000;
+      cols = Array.from({ length: nCols }, (_, i) => ({ left: start + i * w, width: w, template: templateRow[i] || fallbackTemplate }));
+      log(`Layout: row 1 has ${templateRow.length} cells, data has ${nCols} — spreading ${nCols} columns evenly (${w}" each) across ${(end - start).toFixed(2)}". Enter widths to control this.`);
+    }
 
     // Confirm destructive action
     if (clearFirst && existing.length > 0) {
-      const ok = confirm(`This will remove ${existing.length} existing cells from DataBand1 and replace them with ${rows.length} new rows (${rows.length * 3} cells). Continue?`);
+      const ok = confirm(`This will remove ${existing.length} existing cells from DataBand1 and replace them with ${rows.length} new rows × ${nCols} columns (${rows.length * nCols} cells). Continue?`);
       if (!ok) { log('Cancelled.'); return; }
     }
 
@@ -327,9 +359,10 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
       // Build new cells
       const makeCell = (name, col, top, text) => {
         const c = new StiText();
+        const template = col.template;
         c.name = name;
-        c.left = LAYOUT[col].left;
-        c.width = LAYOUT[col].width;
+        c.left = col.left;
+        c.width = col.width;
         c.top = top;
         c.height = LAYOUT.rowHeight;
         c.text = String(text);
@@ -347,12 +380,9 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
       const saveEvery = saveMode === '20' ? 20 : null;
 
       for (let i = 0; i < rows.length; i++) {
-        const [loc, res, com] = rows[i];
         const top = i * LAYOUT.rowHeight;
         const idx = i + 1;
-        dataBand.components.add(makeCell(`TM_Loc_${idx}`, 'loc', top, loc));
-        dataBand.components.add(makeCell(`TM_Res_${idx}`, 'res', top, res));
-        dataBand.components.add(makeCell(`TM_Com_${idx}`, 'com', top, com));
+        cols.forEach((col, j) => dataBand.components.add(makeCell(`TM_C${j + 1}_${idx}`, col, top, rows[i][j])));
 
         if (saveEvery && idx % saveEvery === 0) {
           // Refresh + save intermediate
@@ -368,7 +398,7 @@ LIFT LOBBY EMLG/2\t{location2.Result}\t{location2.Comments}
 
       // Final re-render
       inner.jsObject.assignReport(report);
-      log(`Inserted ${rows.length} rows (${rows.length * 3} cells).`);
+      log(`Inserted ${rows.length} rows (${rows.length * nCols} cells).`);
 
       if (saveMode !== 'none') {
         log('Saving…');
