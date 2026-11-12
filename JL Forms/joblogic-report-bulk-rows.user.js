@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JobLogic Report Designer — Bulk Row Insert
 // @namespace    com.joesegal.joblogic
-// @version      1.1.3
+// @version      1.1.4
 // @description  Paste tab- or comma-separated data (any number of columns, e.g. Location, Result, Comments) and bulk-insert rows into DataBand1 on Page 1 of the Stimulsoft Report Designer. v1.0.2: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Form/Designer/*
 // @run-at       document-idle
@@ -112,6 +112,8 @@
     rowHeight: 0.2,
     defaultLeft: 0.1, // first column's left edge when there is no template row
   };
+  // Read from the @version header (TamperMonkey exposes GM_info even with @grant none)
+  const SCRIPT_VERSION = (() => { try { return GM_info.script.version; } catch (e) { return '?'; } })();
   const WIDTHS_KEY = 'jlbr-col-widths';
   const HEIGHT_KEY = 'jlbr-row-height';
 
@@ -180,7 +182,7 @@
     modal.innerHTML = `
       <div id="jlbr-panel">
         <header>
-          <h3>Insert rows into Page 1 · DataBand1</h3>
+          <h3>Insert rows into Page 1 · DataBand1 <span style="font-weight:400;font-size:12px;color:#888">v${SCRIPT_VERSION}</span></h3>
           <button id="jlbr-close" title="Close">×</button>
         </header>
         <div id="jlbr-body">
