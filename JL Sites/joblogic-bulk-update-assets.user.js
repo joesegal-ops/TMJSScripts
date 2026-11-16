@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Update Assets
 // @namespace    https://go.joblogic.com/
-// @version      1.01
+// @version      1.02
 // @description  Paste rows of "JL Asset Id | Proposed description | Proposed location" (e.g. copied from a Google Sheet) and update each asset's Description / Location through Joblogic's own asset edit screen. Site guard, preview first, verifies each save, downloads a before/after CSV you can paste back in to undo. v1.01: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Asset*
 // @match        https://go.joblogic.com/Site/Detail*
@@ -210,6 +210,8 @@
         }
         const m = JSON.parse(html.slice(start, end + 1));
         if (String(m.Id) !== String(id)) throw new Error(`page model is for asset ${m.Id}, not ${id}`);
+        const t = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+        if (t) m.__token = t[1];   // fresh token, paired with the current session cookie
         return m;
     }
     const view = m => ({ Description: m.Description || '', Location: m.Location || '', Number: m.Number || '',
@@ -244,13 +246,23 @@
         if (!Object.keys(change).length && skipSame) { rec.result = 'already correct'; return rec; }
         if (!apply) { rec.result = 'would update'; return rec; }
 
-        const r = await fetch('/api/Asset/SaveAsset', {
-            method: 'POST', credentials: 'same-origin', body: buildForm(m, change),
-            headers: { 'Accept': 'application/json', '__RequestVerificationToken': verificationToken(), 'X-Requested-With': 'XMLHttpRequest' },
+        const save = (mm) => fetch('/api/Asset/SaveAsset', {
+            method: 'POST', credentials: 'same-origin', body: buildForm(mm, change),
+            headers: { 'Accept': 'application/json', '__RequestVerificationToken': mm.__token || verificationToken(), 'X-Requested-With': 'XMLHttpRequest' },
         });
+        let r = await save(m);
+        if (r.status === 400 || r.status === 403) {   // stale token or the Azure gateway: reload the asset page and try once more
+            await sleep(2500);
+            r = await save(await loadModel(item.id));
+        }
         const text = await r.text();
         rec.saveStatus = r.status;
-        if (!r.ok) { rec.result = 'error'; rec.error = `save returned ${r.status}: ${text.slice(0, 200)}`; return rec; }
+        if (!r.ok) {
+            rec.result = 'error';
+            rec.error = `save returned ${r.status}: ` + (text.trim() ? text.slice(0, 200)
+                : '(empty response: usually an expired session token. Reload this Joblogic page, sign in again if asked, and re-run)');
+            return rec;
+        }
         try { const j = JSON.parse(text); if (j && j.success === false) { rec.result = 'error'; rec.error = 'Joblogic refused the save: ' + (j.Message || JSON.stringify(j.errors || j).slice(0, 200)); return rec; } } catch (e) { /* not JSON */ }
         await sleep(400);
         const after = view(await loadModel(item.id));
