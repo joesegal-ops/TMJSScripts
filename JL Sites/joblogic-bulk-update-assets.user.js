@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Update Assets
 // @namespace    https://go.joblogic.com/
-// @version      1.02
+// @version      1.03
 // @description  Paste rows of "JL Asset Id | Proposed description | Proposed location" (e.g. copied from a Google Sheet) and update each asset's Description / Location through Joblogic's own asset edit screen. Site guard, preview first, verifies each save, downloads a before/after CSV you can paste back in to undo. v1.01: collapses to a launcher button in the shared dock (drag to reorder).
 // @match        https://go.joblogic.com/Asset*
 // @match        https://go.joblogic.com/Site/Detail*
@@ -113,6 +113,8 @@
 
     const SCRIPT_ID = 'bulk-update-assets';
     const SCRIPT_LABEL = '🏢 Bulk Update Assets';
+    // Read from the @version header (TamperMonkey exposes GM_info even with @grant none)
+    const SCRIPT_VERSION = (() => { try { return GM_info.script.version; } catch (e) { return '?'; } })();
     const SCRIPT_COLOR = '#0b7285';
 
     const PACE_MS = 1400;                              // gap between assets (Azure WAF limit)
@@ -135,7 +137,7 @@
     const st = document.createElement('style'); st.textContent = css; document.head.appendChild(st);
     const box = document.createElement('div'); box.id = 'jlba';
     box.innerHTML = `
-      <h3>Bulk update assets</h3>
+      <h3>Bulk update assets <span class="muted" style="font-weight:normal;font-size:12px">v${SCRIPT_VERSION}</span></h3>
       <div class="muted">Paste rows with a header line. Needed columns: <b>JL Asset Id</b> and <b>Proposed description</b>.
       Optional: <b>Proposed location</b>, <b>Proposed number</b>. Copying straight from the "Asset renames" tab works.
       Rows whose description is blank or starts with "[" are skipped.</div>
