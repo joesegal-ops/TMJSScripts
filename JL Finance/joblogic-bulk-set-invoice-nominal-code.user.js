@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Set Invoice Line Nominal Code
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.1
 // @description  On the Invoice list page, walks every invoice in the CURRENT search (same tab / filters / search term, all pages) and sets the Nominal Code on their invoice lines to one you pick. Optionally only replaces lines currently on a given code. Scan for a preview, then Apply (with dry-run). Handles Standard and PPM invoices, draft or approved/generated. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Invoice
+// @match        https://go.joblogic.com/Invoice?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Finance/joblogic-bulk-set-invoice-nominal-code.user.js

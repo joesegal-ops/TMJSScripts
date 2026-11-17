@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Enter checked costs into jobs (Cost Reconciler writer)
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Companion to the Cost Reconciler. Paste the reconciler's exported rows (after you've filtered out the ones you don't want to touch, header row included). Two actions per row, decided by the Status column: (1) NO COSTS / NOT IN JOB -> ADD a new Material line (cost = Net, qty 1, 20% VAT, the job's default uplift, Xero/Cost description + date; quoted/project jobs flagged Chargeable=No are added NON-chargeable, sell 0). (2) INCORRECT with a Line ID -> FIX the existing line's unit cost to Net (sell follows the line's own uplift) UNLESS it has been invoiced, in which case it is skipped. Every fix is re-read to confirm it applied. Dry-run first, then Confirm & write. No engineer is set (assign in JobLogic).
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Finance/joblogic-cost-writer.user.js

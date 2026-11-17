@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         JobLogic → Monday: Upgraded Job Ref
 // @namespace    up-fm.joblogic.monday
-// @version      1.1.1
+// @version      1.2.1
 // @description  When a JobLogic quote has been upgraded to a job, push the upgraded job number to the matching Monday item (via the Apps Script relay). Part of the JobLogic→Monday integration.
 // @match        https://go.joblogic.com/Job/Detail/*
 // @match        https://go.joblogic.com/Quote/Detail/*
@@ -24,12 +24,20 @@
  * SETUP (per browser, once): TamperMonkey menu (the extension icon) → this script →
  *   "Set JL→Monday shared secret" → paste the SHARED_SECRET from the relay's Script Properties.
  * (RELAY_URL below is not sensitive — the relay ignores any request without the correct secret.)
+ * Optional: "Set your name for the action log" — the relay records every Monday write it makes in
+ * the "JL ↔ Monday Action Log" sheet, with this name in the "Run by" column.
  */
 (function () {
   'use strict';
 
   const RELAY_URL = 'https://script.google.com/macros/s/AKfycbzAL-wiWfiHPtES-R4pob4IQF-0vlycVZTc7c8YTF9gthcRV5V7cT_VkQfln9yw8Dq5/exec';
   const SECRET_KEY = 'jlm_shared_secret';
+  const NAME_KEY = 'jlm_run_by';
+  // Which Monday board the relay writes to. Only used to key the "already sent" cache, so switching
+  // boards re-sends instead of skipping everything sent to the old board. Keep in step with the
+  // relay's BOARD_ID.
+  const BOARD_TAG = '5084790211';   // LIVE board (test copy = 5108034019)
+  const LIVE_BOARD = '5084790211';
 
   const log = (...a) => console.log('[JL→Monday]', ...a);
   const rx = (text, re) => { const m = text.match(re); return m ? m[1] : null; };
@@ -38,6 +46,11 @@
     const cur = GM_getValue(SECRET_KEY, '');
     const v = prompt('Paste the JL→Monday SHARED_SECRET (from the relay Script Properties):', cur || '');
     if (v !== null) { GM_setValue(SECRET_KEY, v.trim()); alert('Saved. Reload a JobLogic quote/job page to use it.'); }
+  });
+
+  GM_registerMenuCommand('Set your name for the action log', function () {
+    const v = prompt('Your name, as it should appear in the action log\'s "Run by" column:', GM_getValue(NAME_KEY, '') || '');
+    if (v !== null) { GM_setValue(NAME_KEY, v.trim()); alert('Saved.'); }
   });
 
   GM_registerMenuCommand('Reset JL→Monday sent cache', function () {
@@ -87,11 +100,14 @@
       const quoteNumber       = rx(t, /"QuoteNumber"\s*:\s*"([^"]*)"/);
       if (!jobNumber || !parentJobStringId) return;      // not upgraded yet — nothing to send
 
-      const key = 'jlm:' + quoteId + ':' + jobNumber;
+      // Live board keeps the original key format so upgrades already sent before 1.2.0 aren't re-sent.
+      const key = BOARD_TAG === LIVE_BOARD ? 'jlm:' + quoteId + ':' + jobNumber
+                                           : 'jlm:' + BOARD_TAG + ':' + quoteId + ':' + jobNumber;
       if (GM_getValue(key)) { log('already sent', key); return; }
 
       log('sending', { quoteNumber, parentJobStringId, jobNumber });
-      postToRelay({ secret, jobNumber, parentJobStringId, quoteNumber }, key);
+      const runBy = GM_getValue(NAME_KEY, '') || 'name not set in this browser';
+      postToRelay({ secret, jobNumber, parentJobStringId, quoteNumber, runBy }, key);
     } catch (e) {
       log('error', e);
     }

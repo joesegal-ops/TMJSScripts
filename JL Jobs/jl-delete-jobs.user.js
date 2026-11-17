@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Delete Jobs (list)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Paste a list of Job Numbers and delete them. Resolves each job number, opens Joblogic's own delete-confirmation modal to read exactly what else would be removed (invoices, visits, costs, lines...), then submits that form. Defaults to DRY RUN — a live run needs a typed confirmation, since job deletion is irreversible. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/jl-delete-jobs.user.js

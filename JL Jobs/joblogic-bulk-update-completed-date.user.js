@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Update Completed Date
 // @namespace    http://tampermonkey.net/
-// @version      1.10
+// @version      1.11
 // @description  Paste CSV of JobID,CompletedDate; script sets/updates DateComplete for each job via API. Collapses to a launcher button in the shared dock (drag to reorder).
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-bulk-update-completed-date.user.js

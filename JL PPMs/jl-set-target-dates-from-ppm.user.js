@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         JL: Set Target Completion Dates from PPM Visits
 // @namespace    http://tampermonkey.net/
-// @version      2.13
+// @version      2.14
 // @description  For each job in the filtered Jobs list (all pages), reads PPM Visit Due Date + Duration, then sets Target Completion Date = Due Date + Duration (minutes). Supports dry run and stop. v2.3: collapses to a launcher button in the shared dock (drag to reorder).
 // @author       UP-FM / Claude
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
+// @match        https://go.joblogic.com/PPMContract/Detail/*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/jl-set-target-dates-from-ppm.user.js

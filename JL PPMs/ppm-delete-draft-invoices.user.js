@@ -1,9 +1,14 @@
 // ==UserScript==
 // @name         Joblogic - PPM Delete Draft Invoices
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Paste a list of PPM Contract numbers. Lists every DRAFT invoice on each contract and (after you Preview) deletes them, replicating Joblogic's own delete-modal confirmation. Approved invoices and credits are never touched. Always Preview (dry-run) first. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/PPMContract
+// @match        https://go.joblogic.com/PPMContract?*
+// @match        https://go.joblogic.com/Invoice
+// @match        https://go.joblogic.com/Invoice?*
+// @match        https://go.joblogic.com/PPMInvoice
+// @match        https://go.joblogic.com/PPMInvoice?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-delete-draft-invoices.user.js

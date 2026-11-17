@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - PPM Add Tag to Contract Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Paste a list of PPM Contract numbers + a tag (e.g. "PM0000848  Statutory"). For every job under that contract (PM0000848/001, /002, …) the script adds the tag via the API, preserving any existing tags. Preview (dry-run) before applying. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/PPMContract
+// @match        https://go.joblogic.com/PPMContract?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-add-tag-to-contract-jobs.user.js

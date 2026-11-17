@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Prepend Text to Job Description
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Paste a two-column TSV/CSV of Job Number + text. The script resolves each job and prepends the text to the front of its Description, keeping the existing description intact. Choose the separator, preview with Dry Run, skips jobs that already start with the text. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/jl-prepend-job-description.user.js

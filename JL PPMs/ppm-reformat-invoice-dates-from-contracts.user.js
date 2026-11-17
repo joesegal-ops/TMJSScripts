@@ -1,9 +1,14 @@
 // ==UserScript==
 // @name         Joblogic - PPM Invoice Date & Order No Reformatter
 // @namespace    http://tampermonkey.net/
-// @version      1.2.1
+// @version      1.2.2
 // @description  Paste a list of PPM Contract numbers + one order-number reference. For every DRAFT invoice on each contract, sets Date to Raise = 15th of the month before the line service month, Payment Due = 30 days after the Date to Raise, and overwrites the Customer Order Number as "PPM - {MMMYY} | {ref} - {SITE}". Preview (dry-run) before applying. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/PPMContract
+// @match        https://go.joblogic.com/PPMContract?*
+// @match        https://go.joblogic.com/Invoice
+// @match        https://go.joblogic.com/Invoice?*
+// @match        https://go.joblogic.com/PPMInvoice
+// @match        https://go.joblogic.com/PPMInvoice?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-reformat-invoice-dates-from-contracts.user.js

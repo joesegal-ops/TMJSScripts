@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Engine Allocate (WeWork Allocation Engine v2)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Paste the "Joblogic allocation code" from the WeWork Allocation Engine v2 sheet (menu 6). Resolves each job, re-checks it still has no upcoming visit, matches the engineer, previews everything, then creates the visits (optionally deploying them).
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/jl-engine-allocate.user.js

@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Joblogic - Add Note Everywhere (JL desc + JL note + SF chatter)
 // @namespace    http://tampermonkey.net/
-// @version      1.14
+// @version      1.15
 // @description  Floating panel: type one note, prepend "dd/mm - <note>" to the job's Description, add it as a public Job note, and (if an SF Case ID is on the job) post it to the Salesforce Case Chatter feed. v1.3: collapses to a launcher button in the shared dock (drag to reorder).
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job/Detail/*
 // @match        https://wecompany.lightning.force.com/*
 // @connect      wecompany.my.salesforce.com
 // @grant        GM_setValue

@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Set Job Reference Number
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  Paste (or load) a two-column TSV/CSV of Job Number + value and write column 2 into each job's Reference Number OR Job Ref 1 field. Built for big lists (35k+): indexes every job up front (instant dry run, skips already-correct/frozen/missing jobs), paces under the Azure WAF limit, resumes after Stop/reload, and exports a results CSV with previous values. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/jl-set-job-reference-number.user.js

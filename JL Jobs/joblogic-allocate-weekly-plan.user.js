@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Joblogic - Allocate Engineers from Weekly Plan
 // @namespace    http://tampermonkey.net/
-// @version      1.05
+// @version      1.06
 // @description  Paste a free-text weekly plan (engineer name lines + day-of-week job lines referencing PM/RE job numbers) and a week-start date. Script expands it to one visit per job per listed day, then navigates each job's Visits tab and allocates the (fuzzy-matched) engineer on the computed date — without touching existing visits.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
+// @match        https://go.joblogic.com/Job/Detail/*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-allocate-weekly-plan.user.js

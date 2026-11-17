@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Joblogic - Copy Customer Order Number to Reference Number
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  On the /Job list page: captures the current search filter, walks every page of results, and copies each job's Customer Order Number (OrderNumber) into its Reference Number field (CustomReference) via the API. Jobs with a blank Order Number are skipped, as are jobs that already match. Optional "only fill blank References" guard, Dry Run by default. Also works on a Customer detail page, where it targets all of that customer's jobs.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
+// @match        https://go.joblogic.com/Customer/Detail/*
 // @grant        none
 // @run-at       document-start
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/jl-copy-order-number-to-reference.user.js

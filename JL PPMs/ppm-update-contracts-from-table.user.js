@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - PPM Update Contracts (Tags + Plan Reference)
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.1
 // @description  Paste a TSV of PPM Contract Number / tag(s) to add / new Plan Reference. Preview shows current vs new; Apply saves each contract via Joblogic's own EditDetail call (no popup) — the full contract record is rebuilt from the contract page so every other field is preserved — then re-reads the contract to verify nothing else changed. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/PPMContract
+// @match        https://go.joblogic.com/PPMContract?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-update-contracts-from-table.user.js

@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Assign Forms to Jobs
 // @namespace    com.joesegal.joblogic
-// @version      1.3.0
+// @version      1.3.1
 // @description  Floating panel: paste a tab-separated table of [Job Number, Form Name, Shown On, Req. Visit, Req. Asset] and bulk-assign (or bulk-remove) each form to/from its job via the CompanyForm API. "Required on Visit" / "Required on Asset" come from panel defaults, overridable per row. Works from any go.joblogic.com page (jobs are resolved by number).
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
+// @match        https://go.joblogic.com/CompanyForm*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Forms/joblogic-bulk-assign-forms.user.js

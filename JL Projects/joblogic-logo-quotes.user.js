@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         Joblogic - WeWork Member Logo Quotes (Monday → Quote → Email)
 // @namespace    http://tampermonkey.net/
-// @version      0.2.2
+// @version      0.2.3
 // @description  Pulls the "Members' logos Wework" Monday board, drops Artwork-Rejected items, and builds quotes from the "Logo - WeWork Member" template: one consolidated quote per site for WeWork-paid logos, one quote per logo for Member-paid. Per quote it sets the reference "Members Logos | MMMYY", rewrites the last description lines to "Office Number - Member Name", adds the site contact, sets the "per logo" quantity (sum) and "batch delivery cost" quantity (distinct logged weeks; 1 for member-paid), then Share→Email. Finally flips the Monday Financial Status to "Added To Quote". DRY-RUN by default: it stops at each email for you to review + Send, and only writes back to Monday after the email step. Collapses to a launcher in the shared dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Quote
+// @match        https://go.joblogic.com/Quote?*
+// @match        https://go.joblogic.com/Quote/Create*
+// @match        https://go.joblogic.com/Quote/Detail/*
 // @connect      api.monday.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue

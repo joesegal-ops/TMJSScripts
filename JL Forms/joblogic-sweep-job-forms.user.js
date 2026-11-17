@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Joblogic - Sweep Job → Forms
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.1
 // @description  Record which form VERSION every open job currently holds. Job form-rules store a version-specific FormUniqueGuid, so deploying a new version of a form leaves already-assigned jobs pointing at the old one. This sweep builds the before-picture: one JSONL row per job+form rule, plus a snapshot of the currently-deployed form guids, so a repoint run afterwards knows exactly which jobs to move. Paced under the Azure WAF, resumable, writes part files to Downloads. READ-ONLY — it never changes a job or a form.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
+// @match        https://go.joblogic.com/CompanyForm*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Forms/joblogic-sweep-job-forms.user.js

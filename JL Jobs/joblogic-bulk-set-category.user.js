@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Set Job Category (CSV)
 // @namespace    http://tampermonkey.net/
-// @version      1.12
+// @version      1.13
 // @description  Paste a CSV of job numbers + category names; script updates each job's category via API. v1.3: collapses to a launcher button in the shared dock (drag to reorder).
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-bulk-set-category.user.js

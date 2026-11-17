@@ -1,9 +1,14 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.21
+// @version      1.22
 // @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.21: child-quote rule ignores Expired quotes (expired = never billed, so the SPO is charged). v1.20: SPO 'decide from child quote' toggle - Non-Chargeable when a quote raised from the job is worth more than the SPO cost, else Deliver; recovers from stale anti-forgery tokens. v1.19: Non-Chargeable rows also fix SPOs that are already completed; conflicting rows for one job are skipped; clearer per-job report. v1.18: with a job list on the SPO page, looks up just those jobs (no full crawl); never touches Cancelled POs. v1.17: optional Job/Action TSV - only process listed jobs, and set Non-Chargeable on SPO cost lines where asked; patient page loading (no longer stops at a slow page). v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/PurchaseOrder
+// @match        https://go.joblogic.com/PurchaseOrder?*
+// @match        https://go.joblogic.com/SubContractorPO
+// @match        https://go.joblogic.com/SubContractorPO?*
+// @match        https://go.joblogic.com/SubcontractorPO
+// @match        https://go.joblogic.com/SubcontractorPO?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20POs/joblogic-auto-deliver-pos.user.js

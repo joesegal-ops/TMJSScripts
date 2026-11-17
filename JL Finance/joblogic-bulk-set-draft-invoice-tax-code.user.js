@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Set Draft Invoice Line Tax Code
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  On the Invoice list page, walks every DRAFT invoice in the current search (same tab / filters / search term, all pages) and sets the VAT / tax code on their invoice lines to one you pick. Approved + generated invoices are skipped — Joblogic locks their tax code. Scan for a preview, then Apply (with dry-run). Handles Standard and PPM drafts. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Invoice
+// @match        https://go.joblogic.com/Invoice?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Finance/joblogic-bulk-set-draft-invoice-tax-code.user.js

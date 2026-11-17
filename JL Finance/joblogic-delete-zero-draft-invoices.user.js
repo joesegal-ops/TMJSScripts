@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Delete Zero-Value Draft Invoices
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  On the Invoice list page (Draft Invoices tab), scans ALL pages of draft invoices via the SearchInvoice API and deletes every one with a £0.00 grand total. Respects any filters/search currently applied to the list. Scan first (read-only), then Delete with optional dry run. Collapses to a launcher button in the shared dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Invoice
+// @match        https://go.joblogic.com/Invoice?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Finance/joblogic-delete-zero-draft-invoices.user.js

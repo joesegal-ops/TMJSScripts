@@ -1,9 +1,14 @@
 // ==UserScript==
 // @name         Joblogic - PPM Set Draft Invoice Amount
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Paste a two-column list (PPM Contract No. + New Amount ex VAT). For every DRAFT invoice on each contract, sets the invoice line's net (ex-VAT) value to the given amount; VAT recalculates from the existing tax code. Only touches single-line draft invoices (multi-line/approved are skipped). Preview (dry-run) before applying. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/PPMContract
+// @match        https://go.joblogic.com/PPMContract?*
+// @match        https://go.joblogic.com/Invoice
+// @match        https://go.joblogic.com/Invoice?*
+// @match        https://go.joblogic.com/PPMInvoice
+// @match        https://go.joblogic.com/PPMInvoice?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20PPMs/ppm-set-invoice-amount.user.js

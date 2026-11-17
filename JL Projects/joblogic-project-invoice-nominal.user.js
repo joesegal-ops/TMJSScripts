@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoice Lines → 202 Projects Income
 // @namespace    http://tampermonkey.net/
-// @version      0.1.0
+// @version      0.1.1
 // @description  When a DRAFT invoice is opened — raised from a job (/Invoice/Detail) or a Customer Grouped / consolidated invoice (/CGroupInvoice/Detail) — every line belonging to a job whose type is "Project" is re-coded to "202 - Projects Income". Re-checks after lines are added or edited. Approved invoices, PPM invoices and non-Project lines are never touched. Runs automatically; a toast reports what changed.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Invoice/Detail/*
+// @match        https://go.joblogic.com/CGroupInvoice/Detail/*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoice-nominal.user.js

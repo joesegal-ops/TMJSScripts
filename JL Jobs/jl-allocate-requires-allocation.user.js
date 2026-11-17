@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Allocate Requires-Allocation Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  On the Jobs list, pulls the "Requires Allocation" quick-filter grid, reads the Site Staffing sheet (live, cached), optionally amends it with a free-text labour plan parsed by the Claude API, then picks the best engineer per job (site + trade first, multi-skilled only for basic repairs) and previews every allocation before creating/deploying the visits. Exports CSV at any point. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @connect      docs.google.com
 // @connect      api.anthropic.com
 // @grant        GM_xmlhttpRequest

@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Move PPM Visits to a New Date
 // @namespace    https://go.joblogic.com/
-// @version      5.01
+// @version      5.02
 // @description  On the Jobs list, paste "PMxxxx/nnn - Move to WC|MC: date" lines spanning ANY number of PPM contracts. Not-yet-deployed visits are rescheduled in place (contract due-date); deployed visits get a NEW visit reallocated (Scheduler/AddVisit, same engineer, Not Sent) leaving the original untouched. WC = that Mon–Fri week, MC = 1st of month for 28 days. Resolves each contract automatically, verifies every change, skips ones already at the target. Preview first.
-// @match        https://go.joblogic.com/Job*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-start
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-move-jobs-to-date.user.js
@@ -127,7 +128,7 @@
     }
     // ===== end shared dock =====
 
-    const SCRIPT_VERSION = '5.01';   // keep in sync with @version header
+    const SCRIPT_VERSION = '5.02';   // keep in sync with @version header
     const SCRIPT_ID = 'move-jobs-to-date';
     const SCRIPT_LABEL = '📆 Move PPM Visits to Date';
     const SCRIPT_COLOR = '#0b7285';

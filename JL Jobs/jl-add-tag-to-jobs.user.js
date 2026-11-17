@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Add Tag to Jobs (list)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Paste a TSV/CSV of Job Number + Tag(s). The script resolves each job number and adds the tag(s) via the API, preserving any existing tags. Multiple tags per job allowed (comma/semicolon-separated in the tag cell, or repeat the job on more rows). Preview (dry-run) before applying. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/jl-add-tag-to-jobs.user.js

@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Update Jobs: Description + Tag (TSV)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Paste a TSV/CSV of Job Number, new Description, Tag(s). Replaces each job's Description and adds the tag(s) (existing tags kept) in one save per job. Blank cells leave that field alone. Dry Run preview, Azure-WAF-safe pacing, verifies each save by re-reading the job. Collapses into the shared JL dock.
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/jl-update-jobs-description-tag.user.js

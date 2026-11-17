@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Close Jobs & mark Solved on SF (API)
 // @namespace    http://tampermonkey.net/
-// @version      3.10
+// @version      3.11
 // @description  Paste a list of job numbers; script tags them "Solved on SF" and completes them via API. v3.1: collapses to a launcher button in the shared dock (drag to reorder).
-// @match        https://go.joblogic.com/*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Jobs/joblogic-bulk-close.user.js

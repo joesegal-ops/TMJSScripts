@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.25
-// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID | WW Paid|Member Paid", SITEID auto-derived from the job's site and the payer read from the Monday item's Client column (YES = WW Paid) → set every line on a Project-type job to nominal "202 - Projects Income" → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
-// @match        https://go.joblogic.com/*
+// @version      1.29
+// @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID | WW Paid|Member Paid", SITEID auto-derived from the job's site and the payer read from the Monday item's Client column (YES = WW Paid) → set every line on a Project-type job to nominal "202 - Projects Income" → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Logos: a 3rd column with the UP quote number makes it a member-logo row — payer and the Monday update use every item with that UP Ref Number on the "Members' logos Wework" board (Financial Status → Invoiced, PO Number, moved to the Invoiced group). Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
+// @match        https://go.joblogic.com/Invoice
+// @match        https://go.joblogic.com/Invoice?*
+// @match        https://go.joblogic.com/Invoice/Detail/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @connect      api.monday.com
+// @connect      script.google.com
+// @connect      script.googleusercontent.com
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
 // @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
@@ -126,7 +130,7 @@
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
     // --- Monday write-back (board "Minor Projects - WW Active") ---
-    const MONDAY_BOARD = 5084790211;
+    const MONDAY_BOARD = 5084790211;         // LIVE board (test copy = 5108034019)
     const MB_FINANCE = 'color_mkvy3avs';    // Finance Stat. → "Invoiced"
     const MB_PRICE   = 'numbers_mkmk43k6';  // Price Est. (ex. VAT)
     const MB_PO      = 'text_mky86hyy';      // PO Number (primary match key)
@@ -135,6 +139,53 @@
     const MB_CLIENT  = 'color_mky7yjmx';     // Client — WeWork / YES (old label, = WeWork) / Member → payer on the Reference
     const MONDAY_TOKEN_KEY = 'jl-monday-token';   // Tampermonkey GM storage, set via a prompt (no DOM field → password managers can't clobber it)
     function mondayToken() { try { return GM_getValue(MONDAY_TOKEN_KEY, '') || ''; } catch (e) { return ''; } }
+
+    // --- Action log: every Monday write goes to the "JL ↔ Monday Action Log" Google Sheet via the
+    // Apps Script relay. The relay secret is per-browser (TM storage), never in this public file.
+    const RELAY_URL = 'https://script.google.com/macros/s/AKfycbzAL-wiWfiHPtES-R4pob4IQF-0vlycVZTc7c8YTF9gthcRV5V7cT_VkQfln9yw8Dq5/exec';
+    const LOG_SECRET_KEY = 'jl-monday-log-secret';
+    function logSecret() { try { return GM_getValue(LOG_SECRET_KEY, '') || ''; } catch (e) { return ''; } }
+    const COL_LABEL = { color_mkvy3avs: 'Finance Stat.', numbers_mkmk43k6: 'Price Est.', text_mky86hyy: 'PO Number',
+                        color_mm0ahj9a: 'Financial Status', text_mm15kkjr: 'PO Number', group: 'Group' };
+
+    // --- LOGOS mode (board "Members' logos Wework"). A pasted row with a 3rd column holding
+    // the UP quote number ("Job <tab> PO <tab> UP02773") is a logo row: payer + Monday
+    // write-back use EVERY logo item whose UP Ref Number = that quote, not the projects board.
+    const LOGO_BOARD = 5085864777;
+    const LB_UPREF   = 'text_mkz5518j';         // UP Ref Number (match key — many items share one quote)
+    const LB_FIN     = 'color_mm0ahj9a';        // Financial Status → "Invoiced"
+    const LB_PO      = 'text_mm15kkjr';         // PO Number ← the invoice's Customer Order No
+    const LB_PAYER   = 'single_select2dyoprb';  // "Wework of Member Paid?" → Wework Paid / Member Paid
+    const LB_INVOICED_GROUP = 'group_mm401wkk'; // "Invoiced" group
+    const QUOTE_RE = /^UP\d{4,}$/i;
+    let mondayMeName = null;
+    async function runByName() {      // the Monday token is personal, so its owner = who ran this
+        if (mondayMeName) return mondayMeName;
+        try { const d = await mondayApi('query { me { name } }', {}); mondayMeName = (d.me && d.me.name) || ''; } catch (e) { mondayMeName = ''; }
+        return mondayMeName || 'unknown (Monday token owner)';
+    }
+    // Never throws: a logging failure must not stop the invoice run.
+    async function actionLog(rows) {
+        if (!rows || !rows.length) return;
+        const secret = logSecret();
+        if (!secret) { log('    ⓘ action log: no log secret set in this browser — not recorded in the sheet', '#fd0'); return; }
+        const runBy = await runByName();
+        const base = { script: 'Project Invoicer userscript', runBy, mode: 'apply', boardId: String(MONDAY_BOARD) };
+        const payload = { secret, action: 'log', rows: rows.map(r => Object.assign({ timestamp: new Date().toISOString() }, base, r)) };
+        await new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'POST', url: RELAY_URL, headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify(payload), timeout: 30000,
+                onload: (r) => {
+                    let j = null; try { j = JSON.parse(r.responseText); } catch (e) {}
+                    if (!j || !j.ok) log(`    ⚠ action log: relay said ${j ? (j.error || JSON.stringify(j)) : 'HTTP ' + r.status}`, '#fd0');
+                    resolve();
+                },
+                onerror: () => { log('    ⚠ action log: network error', '#fd0'); resolve(); },
+                ontimeout: () => { log('    ⚠ action log: timeout', '#fd0'); resolve(); },
+            });
+        });
+    }
 
     // With @grant GM_xmlhttpRequest the script runs in TM's sandbox, so page globals
     // (e.g. JL's onClickShareEmail) live on unsafeWindow, not the sandbox `window`.
@@ -497,6 +548,8 @@
         // Only jobs we actually invoiced had their status changed by us.
         if (job.prepStatus !== 'approved') return;
         if (String(job.statusRestore || '').indexOf('done') === 0 || job.statusRestore === 'kept (PM Stat. Complete)') return; // idempotent on resume
+        // Logo jobs are finished work (no PM Stat. to consult) — leave them Invoiced.
+        if (job.quote) { job.statusRestore = 'kept (logo job — left as Invoiced)'; return done(); }
         if (!job.statusBefore) { job.statusRestore = 'skipped (status not captured)'; return done(); }
 
         // PM Stat. decides. Prefer the value read during the Monday write-back; look it
@@ -639,7 +692,7 @@
     async function mondayFindItem(po, jobRef) {
         async function byColumn(colId, value) {
             if (!value) return [];
-            const q = `query { items_page_by_column_values(limit: 10, board_id: ${MONDAY_BOARD}, columns: [{column_id: "${colId}", column_values: ${JSON.stringify([String(value)])}}]) { items { id name column_values(ids: ["${MB_PMSTAT}", "${MB_CLIENT}"]) { id text } } } }`;
+            const q = `query { items_page_by_column_values(limit: 10, board_id: ${MONDAY_BOARD}, columns: [{column_id: "${colId}", column_values: ${JSON.stringify([String(value)])}}]) { items { id name column_values(ids: ["${MB_PMSTAT}", "${MB_CLIENT}", "${MB_FINANCE}", "${MB_PRICE}", "${MB_PO}"]) { id text } } } }`;
             const d = await mondayApi(q, {});
             return ((d.items_page_by_column_values || {}).items) || [];
         }
@@ -648,7 +701,8 @@
         let by = 'PO';
         if (!items.length) { items = await byColumn(MB_JOBREF, jobRef); by = 'JobRef'; }
         if (!items.length) return null;
-        return { id: items[0].id, name: items[0].name, pmStat: col(items[0], MB_PMSTAT), clients: items.map(it => col(it, MB_CLIENT)), by, ambiguous: items.length > 1, count: items.length };
+        const before = {}; [MB_FINANCE, MB_PRICE, MB_PO].forEach(id => { before[id] = col(items[0], id); });
+        return { id: items[0].id, name: items[0].name, pmStat: col(items[0], MB_PMSTAT), clients: items.map(it => col(it, MB_CLIENT)), before, by, ambiguous: items.length > 1, count: items.length };
     }
     // Monday "Client" → who pays. "YES" is the board's old label for WeWork-paid.
     function payerFromClient(client) {
@@ -659,9 +713,36 @@
     }
     // Resolve the row's payer from Monday once (cached on the job). Never throws — on no
     // match / mixed matches / unset Client the Reference is built without a payer.
+    // LOGOS: every item on the logos board carrying this UP Ref Number.
+    async function logoFindItems(quote) {
+        const q = `query { items_page_by_column_values(limit: 200, board_id: ${LOGO_BOARD}, columns: [{column_id: "${LB_UPREF}", column_values: ${JSON.stringify([String(quote).toUpperCase()])}}]) { items { id name group { id title } column_values(ids: ["${LB_FIN}", "${LB_PO}", "${LB_PAYER}"]) { id text } } } }`;
+        const d = await mondayApi(q, {});
+        const col = (item, id) => (((item.column_values || []).find(c => c.id === id) || {}).text || '').trim();
+        return (((d.items_page_by_column_values || {}).items) || []).map(it => ({
+            id: it.id, name: it.name, group: (it.group || {}).title || '', groupId: (it.group || {}).id || '',
+            fin: col(it, LB_FIN), po: col(it, LB_PO), payer: col(it, LB_PAYER),
+        }));
+    }
+    function payerFromLogo(v) {
+        const c = String(v || '').trim().toLowerCase();
+        if (c === 'wework paid') return 'WW Paid';
+        if (c === 'member paid') return 'Member Paid';
+        return '';
+    }
     async function resolvePayer(job) {
         if (job.payerChecked) return;
         if (!mondayToken()) { job.payerChecked = true; job.payer = ''; log(`    ⚠ payer: no Monday token set — Reference built without WW/Member Paid`, '#fd0'); return; }
+        if (job.quote) {
+            try {
+                const items = await logoFindItems(job.quote);
+                job.payerChecked = true;
+                if (!items.length) { job.payer = ''; log(`    ⚠ payer: no logo items with UP Ref ${job.quote} — Reference built without WW/Member Paid`, '#fd0'); return; }
+                const payers = [...new Set(items.map(it => payerFromLogo(it.payer)))];
+                if (payers.length === 1 && payers[0]) { job.payer = payers[0]; log(`    payer: ${job.payer} (${items.length} logo item(s) on ${job.quote})`, '#8fd'); }
+                else { job.payer = ''; log(`    ⚠ payer: logo items on ${job.quote} are ${[...new Set(items.map(it => it.payer || 'blank'))].join(' + ')} — Reference built without WW/Member Paid, add it manually`, '#f80'); }
+            } catch (e) { log(`    ⚠ payer: logos lookup failed (${e.message}) — Reference built without WW/Member Paid`, '#fd0'); }
+            return;
+        }
         try {
             const hit = await mondayFindItem(formatPO(job.po), job.jobNumber);
             if (!hit) { log(`    ⓘ payer: no Monday item for ${formatPO(job.po)} / ${job.jobNumber}`, '#fd0'); return; }
@@ -682,8 +763,43 @@
         const cv = {}; cv[MB_FINANCE] = { label: 'Invoiced' };
         if (netAmount != null && !isNaN(netAmount)) cv[MB_PRICE] = String(netAmount);
         if (poNumber) cv[MB_PO] = String(poNumber);
+        mondaySetInvoiced.lastValues = cv;
         const q = `mutation { change_multiple_column_values(board_id: ${MONDAY_BOARD}, item_id: ${itemId}, column_values: ${JSON.stringify(JSON.stringify(cv))}) { id } }`;
         return mondayApi(q, {});
+    }
+
+    // LOGOS write-back: every item on the quote → Financial Status "Invoiced", PO Number ←
+    // Customer Order No, and moved to the "Invoiced" group. Never throws.
+    async function pushLogoItems(job) {
+        const jobRef = `${job.jobNumber} / ${job.quote}`;
+        try {
+            const items = await logoFindItems(job.quote);
+            if (!items.length) throw new Error(`no logo items with UP Ref ${job.quote}`);
+            let orderNo = job.orderNumber || '';
+            if (!orderNo) { try { const info = await fetchInvoiceInfo(job.jobId, job.invoiceId); orderNo = info.orderNumber; job.orderNumber = orderNo; if (job.net == null) job.net = info.net; } catch (e) {} }
+            const poForMonday = String(orderNo || '').trim() || String(job.po || '').trim();
+            let ok = 0; const errs = [];
+            for (const it of items) {
+                try {
+                    const cv = {}; cv[LB_FIN] = { label: 'Invoiced' }; if (poForMonday) cv[LB_PO] = poForMonday;
+                    await mondayApi(`mutation { change_multiple_column_values(board_id: ${LOGO_BOARD}, item_id: ${it.id}, column_values: ${JSON.stringify(JSON.stringify(cv))}) { id } }`, {});
+                    if (it.groupId !== LB_INVOICED_GROUP) await mondayApi(`mutation { move_item_to_group(item_id: ${it.id}, group_id: "${LB_INVOICED_GROUP}") { id } }`, {});
+                    ok++;
+                    await actionLog([
+                        { action: 'write', boardId: String(LOGO_BOARD), itemId: it.id, itemName: it.name, jobRef, column: 'Financial Status', oldValue: it.fin, newValue: 'Invoiced', result: 'ok', detail: `invoice ${job.invoiceNumber || job.invoiceId || ''}` },
+                        poForMonday ? { action: 'write', boardId: String(LOGO_BOARD), itemId: it.id, itemName: it.name, jobRef, column: 'PO Number', oldValue: it.po, newValue: poForMonday, result: 'ok', detail: '' } : null,
+                        it.groupId !== LB_INVOICED_GROUP ? { action: 'move', boardId: String(LOGO_BOARD), itemId: it.id, itemName: it.name, jobRef, column: 'Group', oldValue: it.group, newValue: 'Invoiced', result: 'ok', detail: '' } : null,
+                    ].filter(Boolean));
+                } catch (e) { errs.push(`${it.name}: ${e.message}`); }
+                await sleep(200);
+            }
+            if (errs.length) { job.mondayStatus = 'error'; job.mondayError = `${ok}/${items.length} logo items updated; ` + errs.join('; '); log(`    ✗ Monday logos: ${job.mondayError}`, '#f55'); }
+            else { job.mondayStatus = `done (${ok} logo item${ok === 1 ? '' : 's'})`; log(`    Monday logos: ${ok} item(s) on ${job.quote} → Invoiced${poForMonday ? `, PO "${poForMonday}"` : ''}, moved to Invoiced`, '#0fa'); }
+        } catch (e) {
+            job.mondayStatus = 'error'; job.mondayError = e.message;
+            log(`    ✗ Monday logos: ${e.message}`, '#f55');
+            await actionLog([{ action: 'set Invoiced', boardId: String(LOGO_BOARD), jobRef, result: 'error', detail: e.message }]);
+        }
     }
 
     // Push one finished job to Monday. Never throws — logs and records status on the job.
@@ -693,16 +809,20 @@
         if (!s.pushMonday) { job.mondayStatus = 'off'; }
         else if (String(job.mondayStatus).indexOf('done') === 0) { /* already pushed — resume-safe */ return; }
         else if (job.prepStatus !== 'approved' && job.prepStatus !== 'already-invoiced') { job.mondayStatus = 'skipped (not approved)'; }
+        else if (job.quote) { await pushLogoItems(job); }
         else {
+            const po = formatPO(job.po);
+            const jobRef = `${job.jobNumber}${po ? ' / ' + po : ''}`;
+            let hit = null;
             try {
-                const po = formatPO(job.po);
-                const hit = await mondayFindItem(po, job.jobNumber);
+                hit = await mondayFindItem(po, job.jobNumber);
                 if (!hit) throw new Error(`no Monday item for ${po} / ${job.jobNumber}`);
                 if (!hit.ambiguous) job.pmStat = hit.pmStat; // read by restoreJobStatus()
                 if (hit.ambiguous) {
                     // Multiple board items match → don't guess. Skip and flag for manual handling.
                     job.mondayStatus = `skipped (⚠ ${hit.count} ${hit.by} matches — update manually)`;
                     log(`    ⚠ Monday: ${hit.count} items match ${hit.by} "${hit.by === 'PO' ? po : job.jobNumber}" — SKIPPED, update manually`, '#fd0');
+                    await actionLog([{ action: 'set Invoiced', jobRef, result: 'skipped', detail: `${hit.count} items match ${hit.by} — update manually` }]);
                 } else {
                     // Make sure we have the net + the invoice's Customer Order Number.
                     let net = (job.net != null) ? job.net : null;
@@ -713,6 +833,11 @@
                     // Write the Customer Order Number verbatim (whatever it contains); fall back to the pasted PO only if it's blank.
                     const poForMonday = String(orderNo || '').trim() || String(job.po || '').trim();
                     await mondaySetInvoiced(hit.id, net, poForMonday);
+                    const wrote = mondaySetInvoiced.lastValues || {};
+                    await actionLog(Object.keys(wrote).map(id => ({
+                        action: 'write', itemId: hit.id, itemName: hit.name, jobRef, column: COL_LABEL[id] || id,
+                        oldValue: hit.before[id] || '', newValue: id === MB_FINANCE ? wrote[id].label : wrote[id],
+                        result: 'ok', detail: `invoice ${job.invoiceNumber || job.invoiceId || ''}, matched by ${hit.by}`.trim() })));
                     job.mondayItemId = hit.id;
                     job.mondayStatus = `done (by ${hit.by})`;
                     log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}${poForMonday ? `, PO "${poForMonday}"` : ''}`, '#0fa');
@@ -721,6 +846,8 @@
                 job.mondayStatus = 'error';
                 job.mondayError = e.message;
                 log(`    ✗ Monday: ${e.message}`, '#f55');
+                await actionLog([{ action: 'set Invoiced', itemId: hit ? hit.id : '', itemName: hit ? hit.name : '', jobRef,
+                                   result: 'error', detail: e.message }]);
             }
         }
         const cur = loadState(); if (cur) { cur.jobs[i] = job; saveState(cur); renderResults(cur); }
@@ -748,7 +875,9 @@
             if (!jobNumbers.length) return;
             const jobNumber = jobNumbers[0];
             if (parts.length < 2) { rows.push({ jobNumber, jobNumbers, po: '', bad: true }); return; }
-            rows.push({ jobNumber, jobNumbers, po: parts[1] });
+            // Optional 3rd column = UP quote number → logos row (see LOGO_BOARD).
+            const quote = (parts[2] && QUOTE_RE.test(parts[2])) ? parts[2].toUpperCase() : '';
+            rows.push({ jobNumber, jobNumbers, po: parts[1], quote });
         });
         return rows;
     }
@@ -1180,7 +1309,7 @@
             pushMonday: wantMonday,
             idx: 0,
             jobs: rows.map(r => ({
-                jobNumber: r.jobNumber, jobNumbers: r.jobNumbers || [r.jobNumber], po: r.po, bad: !!r.bad,
+                jobNumber: r.jobNumber, jobNumbers: r.jobNumbers || [r.jobNumber], po: r.po, bad: !!r.bad, quote: r.quote || '',
                 jobId: null, siteName: '', siteId: '', reference: '',
                 invoiceId: null, invoiceNumber: '', net: null, orderNumber: '',
                 prepStatus: 'pending', emailStatus: '', sentAt: '', error: '', skipped: null, strayDrafts: null,
@@ -1193,6 +1322,8 @@
         setRunningUI(true);
         log(`Processing ${s.jobs.length} job(s), one at a time: create → approve → email${wantMonday ? ' → Monday' : ''} → next.`, '#0af');
         if (wantMonday) log('Monday update ON — each invoiced job sets its board item to "Invoiced" + Price Est. (matched by PO, then Job Ref).', '#0af');
+        const nLogo = s.jobs.filter(j => j.quote).length;
+        if (nLogo) log(`LOGOS: ${nLogo} row(s) carry a UP quote — payer + Monday use the "Members' logos Wework" board (all items with that UP Ref → Financial Status "Invoiced", moved to Invoiced).`, '#c9f');
         log(s.autoSend ? 'AUTO-SEND is ON — emails will be sent without pausing.' : 'DRY-RUN — each email is composed and paused for your review.', s.autoSend ? '#f80' : '#ff0');
         if (s.skipEmail) log('SKIP EMAIL is ON — invoices will be created & approved only.', '#ff0');
         drive();
@@ -1238,7 +1369,7 @@
                 j.error || '',
             ].filter(Boolean).join(' | ');
             lines.push([
-                j.jobNumber, formatPO(j.po), j.siteName, j.siteId, j.reference,
+                j.jobNumber + (j.quote ? ` (${j.quote})` : ''), formatPO(j.po), j.siteName, j.siteId, j.reference,
                 j.invoiceId || '', j.invoiceNumber || '', (j.net != null ? j.net : ''), status, j.sentAt || '', monday,
                 j.pmStat || '', j.statusRestore === 'error' ? ('ERROR: ' + (j.statusError || '')) : (j.statusRestore || ''), note,
             ].map(x => String(x == null ? '' : x).replace(/\t/g, ' ').replace(/\r?\n/g, ' ')).join('\t'));
@@ -1273,7 +1404,7 @@
 
         const help = document.createElement('div');
         help.style.cssText = 'color:#9fb;margin-bottom:8px;line-height:1.4;';
-        help.innerHTML = 'Paste one row per job: <b>Job Number</b> then a <b>tab</b> then <b>PO number</b> (paste straight from the sheet). If a job cell has two numbers, the first is used. A header row is fine — it\'s skipped automatically.<br>Ref becomes <b>PROJ | PO-XXXX - SITEID</b> (SITEID = first 6 letters of the site, no spaces).';
+        help.innerHTML = 'Paste one row per job: <b>Job Number</b> then a <b>tab</b> then <b>PO number</b> (paste straight from the sheet). If a job cell has two numbers, the first is used. A header row is fine — it\'s skipped automatically.<br>Ref becomes <b>PROJ | PO-XXXX - SITEID</b> (SITEID = first 6 letters of the site, no spaces).<br><b>Logos:</b> add a 3rd column with the <b>UP quote</b> (Job ⇥ PO ⇥ UP02773) — Monday then updates every item with that UP Ref on the Members\' logos board.';
 
         inputArea = document.createElement('textarea');
         inputArea.placeholder = 'PM0000579/001\tPO-01041292\nPM0000580/001\tPO-01041293';
@@ -1318,6 +1449,26 @@
         });
         opts.appendChild(mondayBtn); opts.appendChild(mondayStat);
         refreshMondayStat();
+        const logStat = document.createElement('span');
+        logStat.style.cssText = 'font-size:11px;';
+        const refreshLogStat = () => {
+            const has = !!logSecret();
+            logStat.textContent = has ? '📒 logging on' : '📒 not logging';
+            logStat.style.color = has ? '#7d7' : '#fd0';
+        };
+        const logBtn = mkBtn('Set log secret', '#334');
+        logBtn.style.padding = '4px 10px';
+        logBtn.title = 'Paste the action-log secret (the relay SHARED_SECRET). Monday writes are then recorded in the "JL ↔ Monday Action Log" sheet.';
+        logBtn.addEventListener('click', () => {
+            const t = prompt('Paste the action-log secret' + (logSecret() ? '\n(blank = keep current, "clear" = remove):' : ':'), '');
+            if (t === null) return;
+            const v = t.trim();
+            if (v === '') return;
+            if (v.toLowerCase() === 'clear') { GM_deleteValue(LOG_SECRET_KEY); log('Log secret cleared.', '#fd0'); refreshLogStat(); return; }
+            GM_setValue(LOG_SECRET_KEY, v); log('Log secret saved.', '#0fa'); refreshLogStat();
+        });
+        opts.appendChild(logBtn); opts.appendChild(logStat);
+        refreshLogStat();
 
         // Controls
         const ctl = document.createElement('div');

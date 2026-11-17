@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Print Job Reports (Merged PDF)
 // @namespace    http://tampermonkey.net/
-// @version      1.13
+// @version      1.14
 // @description  On /Job with a filter applied, iterates all jobs across all pages, downloads each Job Report (Share > Download), and saves a single merged PDF. v1.3: collapses to a launcher button in the shared dock (drag to reorder).
-// @match        https://go.joblogic.com/Job*
+// @match        https://go.joblogic.com/Job
+// @match        https://go.joblogic.com/Job?*
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @connect      cdn.jsdelivr.net
