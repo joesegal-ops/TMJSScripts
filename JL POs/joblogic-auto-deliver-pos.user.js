@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Auto-Deliver POs for Closed Jobs
 // @namespace    http://tampermonkey.net/
-// @version      1.19
-// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.19: Non-Chargeable rows also fix SPOs that are already completed; conflicting rows for one job are skipped; clearer per-job report. v1.18: with a job list on the SPO page, looks up just those jobs (no full crawl); never touches Cancelled POs. v1.17: optional Job/Action TSV - only process listed jobs, and set Non-Chargeable on SPO cost lines where asked; patient page loading (no longer stops at a slow page). v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
+// @version      1.21
+// @description  Reviews open/undelivered POs, checks whether the linked job is closed/completed, and marks the PO as delivered. v1.21: child-quote rule ignores Expired quotes (expired = never billed, so the SPO is charged). v1.20: SPO 'decide from child quote' toggle - Non-Chargeable when a quote raised from the job is worth more than the SPO cost, else Deliver; recovers from stale anti-forgery tokens. v1.19: Non-Chargeable rows also fix SPOs that are already completed; conflicting rows for one job are skipped; clearer per-job report. v1.18: with a job list on the SPO page, looks up just those jobs (no full crawl); never touches Cancelled POs. v1.17: optional Job/Action TSV - only process listed jobs, and set Non-Chargeable on SPO cost lines where asked; patient page loading (no longer stops at a slow page). v1.16: sell estimate treats quoted-value jobs and Non-Chargeable rates as £0 sell. v1.15: estimates the job sell each PO will add (cost + selling-rate uplift) and flags already-invoiced jobs. v1.14: also works on the Subcontractor Purchase Orders page (marks SPOs as completed). v1.13: shows the running version in the panel header. v1.12: paces requests under the Azure gateway rate limit, caches job lookups and retries WAF 403s.
 // @match        https://go.joblogic.com/*
 // @grant        none
 // @run-at       document-idle
@@ -103,7 +103,7 @@
     // ===== end shared dock =====
 
     // Read from the metadata block so the on-screen version can never drift from @version.
-    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.19');
+    const SCRIPT_VERSION = ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '1.21');
     const SCRIPT_ID = 'auto-deliver-pos';
     const SCRIPT_LABEL = '📦 Auto Deliver POs';
     const SCRIPT_COLOR = '#4c9f01';
@@ -230,6 +230,16 @@
         listArea.style.cssText = 'width:100%;box-sizing:border-box;height:70px;margin-top:4px;background:#111;color:#eee;border:1px solid #444;border-radius:4px;font-family:monospace;font-size:11px;padding:4px;';
         controlsDiv.appendChild(listLabel);
         controlsDiv.appendChild(listArea);
+
+        const quoteLabel = document.createElement('label');
+        quoteLabel.style.cssText = 'display:block;margin-top:6px;font-size:11px;cursor:pointer;';
+        const quoteCheck = document.createElement('input');
+        quoteCheck.type = 'checkbox';
+        quoteCheck.id = 'jl-autodeliver-quote-rule';
+        quoteCheck.checked = false;
+        quoteLabel.appendChild(quoteCheck);
+        quoteLabel.appendChild(document.createTextNode(' SPOs: decide from child quote - Non-Chargeable if a quote raised from the job is worth more than the SPO cost, else Deliver (job-list rows still win)'));
+        controlsDiv.appendChild(quoteLabel);
 
         logArea = document.createElement('div');
         logArea.style.cssText = 'flex:1;overflow-y:auto;max-height:50vh;background:#111;padding:8px;border-radius:4px;white-space:pre-wrap;line-height:1.5;';
@@ -452,8 +462,35 @@
                 continue;
             }
 
+            // Joblogic occasionally starts rejecting the page's anti-forgery token with an
+            // empty 400 mid-session (seen 2026-11-17; a page reload fixes it). Fetch a fresh
+            // token once and retry the same request with it.
+            if (resp.status === 400 && !bodyText && !opts.__tokenRefreshed && opts.headers && opts.headers.__RequestVerificationToken) {
+                var fresh = await refreshCSRFToken();
+                if (fresh) {
+                    opts.__tokenRefreshed = true;
+                    opts.headers.__RequestVerificationToken = fresh;
+                    if (opts.body instanceof FormData && opts.body.has('__RequestVerificationToken')) opts.body.set('__RequestVerificationToken', fresh);
+                    log('  Refreshed anti-forgery token - retrying ' + label, '#fa0');
+                    continue;
+                }
+            }
+
             throw new Error(label + ' HTTP ' + resp.status);
         }
+    }
+
+    // Re-read the anti-forgery token from a fresh copy of the current page and store it
+    // back on the page so later getCSRFToken() calls pick it up.
+    async function refreshCSRFToken() {
+        try {
+            var html = await (await fetch(location.pathname, { credentials: 'same-origin' })).text();
+            var inp = new DOMParser().parseFromString(html, 'text/html').querySelector('input[name="__RequestVerificationToken"]');
+            if (!inp || !inp.value) return null;
+            var mine = document.querySelector('input[name="__RequestVerificationToken"]');
+            if (mine) mine.value = inp.value;
+            return inp.value;
+        } catch (e) { return null; }
     }
 
     // Look up job status by job number
@@ -757,6 +794,41 @@
         return out;
     }
 
+    // --- CHILD-QUOTE RULE (mirrors the "SPO costs" sheet) ---
+    // Child quote = a quote raised FROM the SPO's job (quote.ParentJobStringId = job). If its
+    // sell ex VAT is more than the SPO cost, the work was billed through the quote, so the
+    // SPO cost goes in Non-Chargeable; otherwise it is delivered as normal. Expired quotes
+    // are ignored (never billed, so the SPO must be charged - Joe 2026-11-17; the sheet
+    // counted them). Rejected quotes show £0 so never trigger anyway.
+    // Source: the job's Related Work tab, /Job/GetRelatedWorks?jobId=.
+    // Verified vs the sheet on M0000493, R0000095, RE0001006, RE0006477, RE0005670, M0000091.
+    var childQuoteCache = new Map();
+    async function getChildQuotes(jobId, jobNo) {
+        if (childQuoteCache.has(jobId)) return childQuoteCache.get(jobId);
+        var html = await jlFetch('/Job/GetRelatedWorks?jobId=' + jobId, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } }, 'Related work');
+        var model = extractJsObject(html, 'var dataRelatedQuotes');
+        if (!model) throw new Error('could not read related quotes for ' + jobNo);
+        var quotes = (model.Quotes || []).filter(function (q) { return String(q.ParentJobStringId || '').toUpperCase() === String(jobNo).toUpperCase(); })
+            .map(function (q) { return { number: q.QuoteNumber, status: q.StatusDescription || '', sell: parseMoney(q.QuoteValueExcludingVat) }; });
+        childQuoteCache.set(jobId, quotes);
+        return quotes;
+    }
+
+    // Returns { action: 'nonchg'|'deliver', reason }.
+    async function decideFromChildQuote(po, job, spoCost) {
+        var jobId = po.jobId || job.id;
+        if (!jobId) return { action: 'deliver', reason: 'no job id - defaulting to Deliver' };
+        var quotes = await getChildQuotes(jobId, po.jobNo);
+        if (!quotes.length) return { action: 'deliver', reason: 'no child quote' };
+        var list = quotes.map(function (q) { return q.number + ' ' + q.status + ' ' + fmtMoney(q.sell); }).join(', ');
+        var counted = quotes.filter(function (q) { return !/expired/i.test(q.status); });
+        if (!counted.length) return { action: 'deliver', reason: 'child quote ' + list + ' - expired, so charged' };
+        var best = counted.reduce(function (a, q) { return q.sell > a.sell ? q : a; });
+        return best.sell > spoCost
+            ? { action: 'nonchg', reason: 'child quote ' + list + ' > cost ' + fmtMoney(spoCost) }
+            : { action: 'deliver', reason: 'child quote ' + list + ' not above cost ' + fmtMoney(spoCost) };
+    }
+
     // --- SET SPO COST LINES NON-CHARGEABLE ---
     // Same request the job Costs tab "Edit Subcontractor Cost" form sends when Chargeable
     // type = Non-Chargeable. Body rebuilt from GetEditSubcontractorCostMetadata; verified
@@ -843,6 +915,8 @@
         var spo = isSubcontractorPage();
         var doneLabel = spo ? 'Completed' : 'Fully Delivered';
         var showImpact = document.getElementById('jl-autodeliver-sell-impact').checked;
+        var quoteRule = document.getElementById('jl-autodeliver-quote-rule').checked;
+        childQuoteCache = new Map();
         var jobList = null;
         try { jobList = parseJobList(document.getElementById('jl-autodeliver-joblist').value); }
         catch (e) { log('ERROR: ' + e.message, '#f55'); running = false; startBtn.style.display = 'inline-block'; stopBtn.style.display = 'none'; return; }
@@ -861,6 +935,8 @@
         log('Request pacing: 1 per ' + MIN_REQUEST_INTERVAL + 'ms (~' + Math.round(60000 / MIN_REQUEST_INTERVAL) + '/min) to stay under the gateway rate limit', '#888');
         log('Skip partially delivered: ' + skipPartial, '#888');
         log('Page: ' + (spo ? 'Subcontractor POs (will mark as Completed)' : 'Supplier POs (will mark as Fully Delivered)'), '#888');
+        if (quoteRule) log(spo ? 'Child-quote rule ON: Non-Chargeable when a quote raised from the job is worth more than the SPO cost, else Deliver' : 'Child-quote rule is for SPOs only - ignored on this page', spo ? '#0af' : '#fa0');
+        if (!spo) quoteRule = false;
         if (jobList) {
             var cnt = { deliver: 0, nonchg: 0, skip: 0 };
             jobList.entries.forEach(function (e) { cnt[e.action]++; });
@@ -936,6 +1012,7 @@
             var errors = 0;
             var impactCost = 0, impactSell = 0, impactUnknown = 0, impactInvoicedSell = 0, impactInvoicedJobs = 0;
             var impactNonChargeable = 0, impactNonChargeableCost = 0;
+            var ruleNonChg = 0, ruleDeliver = 0;
             var nonChgSet = 0, nonChgPOs = 0, fixedDone = 0, fixedDoneLines = 0, fixedDoneSell = 0, invoicedLeft = 0;
 
             for (var i = 0; i < targetPOs.length; i++) {
@@ -969,13 +1046,28 @@
                         continue;
                     }
 
+                    // Child-quote rule decides any outstanding SPO the job list hasn't.
+                    if (quoteRule && !po.listAction && !po.alreadyComplete) {
+                        try {
+                            var oc = await getOutstandingPOCost(po.id, true);
+                            var dec = await decideFromChildQuote(po, job, oc.cost);
+                            po.listAction = dec.action;
+                            po.ruleReason = dec.reason;
+                            if (dec.action === 'nonchg') ruleNonChg++; else ruleDeliver++;
+                        } catch (e) {
+                            if (e.message === 'stopped') throw e;
+                            log('PO -> ' + po.jobNo + ' - could not apply child-quote rule (' + e.message + '), skipping', '#f55');
+                            errors++;
+                            continue;
+                        }
+                    }
                     var wantNonChg = po.listAction === 'nonchg';
                     if (wantNonChg && !spo) {
                         log('PO -> ' + po.jobNo + ' - Non-Chargeable requested but only supported for subcontractor POs, skipping', '#fa0');
                         continue;
                     }
 
-                    log('PO ' + (po.poNumber || po.id.substring(0, 8) + '...') + ' -> ' + po.jobNo + ' [' + job.statusDescription + '] - ' + (spo ? 'completion' : 'delivery') + ': ' + po.rawStatus + (wantNonChg ? '  [list: Non-Chargeable]' : po.listAction ? '  [list: Deliver]' : ''), '#aaf');
+                    log('PO ' + (po.poNumber || po.id.substring(0, 8) + '...') + ' -> ' + po.jobNo + ' [' + job.statusDescription + '] - ' + (spo ? 'completion' : 'delivery') + ': ' + po.rawStatus + (po.ruleReason ? '  [rule: ' + (wantNonChg ? 'Non-Chargeable' : 'Deliver') + ' - ' + po.ruleReason + ']' : wantNonChg ? '  [list: Non-Chargeable]' : po.listAction ? '  [list: Deliver]' : ''), '#aaf');
 
                     // Already completed by someone else: no completion, just fix the cost line(s).
                     if (po.alreadyComplete) {
@@ -1070,7 +1162,8 @@
             log('POs skipped (job still open): ' + skippedJobOpen, '#888');
             log('POs skipped (no job/not found): ' + skippedNoJob, '#888');
             log('Errors: ' + errors, errors > 0 ? '#f55' : '#0fa');
-            if (jobList) {
+            if (quoteRule) log('Child-quote rule: ' + ruleNonChg + ' PO(s) -> Non-Chargeable, ' + ruleDeliver + ' -> Deliver', '#0af');
+            if (jobList || quoteRule) {
                 log('POs ' + (dryRun ? 'that would be ' : '') + 'completed + set Non-Chargeable: ' + nonChgPOs + (dryRun ? '' : ' (' + nonChgSet + ' cost line(s) changed)'), '#0af');
                 log('Already-completed SPOs ' + (dryRun ? 'that would be ' : '') + 'switched to Non-Chargeable: ' + fixedDone + ' (' + fixedDoneLines + ' line(s), ' + fmtMoney(fixedDoneSell) + ' sell removed)', '#0af');
                 if (invoicedLeft) log('Cost lines left alone because they are already invoiced: ' + invoicedLeft, '#f90');
