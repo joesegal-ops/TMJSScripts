@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.31
+// @version      1.32
 // @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID | WW Paid|Member Paid", SITEID auto-derived from the job's site and the payer read from the Monday item's Client column (YES = WW Paid) → set every line on a Project-type job to nominal "202 - Projects Income" → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Logos: a 3rd column with the UP quote number makes it a member-logo row — payer and the Monday update use every item with that UP Ref Number on the "Members' logos Wework" board (Financial Status → Invoiced, PO Number, moved to the Invoiced group). Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/Invoice
 // @match        https://go.joblogic.com/Invoice?*
@@ -11,8 +11,6 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @connect      api.monday.com
-// @connect      script.google.com
-// @connect      script.googleusercontent.com
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
 // @updateURL    https://raw.githubusercontent.com/joesegal-ops/TMJSScripts/main/JL%20Projects/joblogic-project-invoicer.user.js
@@ -140,14 +138,6 @@
     const MONDAY_TOKEN_KEY = 'jl-monday-token';   // Tampermonkey GM storage, set via a prompt (no DOM field → password managers can't clobber it)
     function mondayToken() { try { return GM_getValue(MONDAY_TOKEN_KEY, '') || ''; } catch (e) { return ''; } }
 
-    // --- Action log: every Monday write goes to the "JL ↔ Monday Action Log" Google Sheet via the
-    // Apps Script relay. The relay secret is per-browser (TM storage), never in this public file.
-    const RELAY_URL = 'https://script.google.com/macros/s/AKfycbzAL-wiWfiHPtES-R4pob4IQF-0vlycVZTc7c8YTF9gthcRV5V7cT_VkQfln9yw8Dq5/exec';
-    const LOG_SECRET_KEY = 'jl-monday-log-secret';
-    function logSecret() { try { return GM_getValue(LOG_SECRET_KEY, '') || ''; } catch (e) { return ''; } }
-    const COL_LABEL = { color_mkvy3avs: 'Finance Stat.', numbers_mkmk43k6: 'Price Est.', text_mky86hyy: 'PO Number',
-                        color_mm0ahj9a: 'Financial Status', text_mm15kkjr: 'PO Number', group: 'Group' };
-
     // --- LOGOS mode (board "Members' logos Wework"). A pasted row with a 3rd column holding
     // the UP quote number ("Job <tab> PO <tab> UP02773") is a logo row: payer + Monday
     // write-back use EVERY logo item whose UP Ref Number = that quote, not the projects board.
@@ -158,34 +148,6 @@
     const LB_PAYER   = 'single_select2dyoprb';  // "Wework of Member Paid?" → Wework Paid / Member Paid
     const LB_INVOICED_GROUP = 'group_mm401wkk'; // "Invoiced" group
     const QUOTE_RE = /^UP\d{4,}$/i;
-    let mondayMeName = null;
-    async function runByName() {      // the Monday token is personal, so its owner = who ran this
-        if (mondayMeName) return mondayMeName;
-        try { const d = await mondayApi('query { me { name } }', {}); mondayMeName = (d.me && d.me.name) || ''; } catch (e) { mondayMeName = ''; }
-        return mondayMeName || 'unknown (Monday token owner)';
-    }
-    // Never throws: a logging failure must not stop the invoice run.
-    async function actionLog(rows) {
-        if (!rows || !rows.length) return;
-        const secret = logSecret();
-        if (!secret) { log('    ⓘ action log: no log secret set in this browser — not recorded in the sheet', '#fd0'); return; }
-        const runBy = await runByName();
-        const base = { script: 'Project Invoicer userscript', runBy, mode: 'apply', boardId: String(MONDAY_BOARD) };
-        const payload = { secret, action: 'log', rows: rows.map(r => Object.assign({ timestamp: new Date().toISOString() }, base, r)) };
-        await new Promise((resolve) => {
-            GM_xmlhttpRequest({
-                method: 'POST', url: RELAY_URL, headers: { 'Content-Type': 'application/json' },
-                data: JSON.stringify(payload), timeout: 30000,
-                onload: (r) => {
-                    let j = null; try { j = JSON.parse(r.responseText); } catch (e) {}
-                    if (!j || !j.ok) log(`    ⚠ action log: relay said ${j ? (j.error || JSON.stringify(j)) : 'HTTP ' + r.status}`, '#fd0');
-                    resolve();
-                },
-                onerror: () => { log('    ⚠ action log: network error', '#fd0'); resolve(); },
-                ontimeout: () => { log('    ⚠ action log: timeout', '#fd0'); resolve(); },
-            });
-        });
-    }
 
     // With @grant GM_xmlhttpRequest the script runs in TM's sandbox, so page globals
     // (e.g. JL's onClickShareEmail) live on unsafeWindow, not the sandbox `window`.
@@ -789,11 +751,6 @@
                     await mondayApi(`mutation { change_multiple_column_values(board_id: ${LOGO_BOARD}, item_id: ${it.id}, column_values: ${JSON.stringify(JSON.stringify(cv))}) { id } }`, {});
                     if (it.groupId !== LB_INVOICED_GROUP) await mondayApi(`mutation { move_item_to_group(item_id: ${it.id}, group_id: "${LB_INVOICED_GROUP}") { id } }`, {});
                     ok++;
-                    await actionLog([
-                        { action: 'write', boardId: String(LOGO_BOARD), itemId: it.id, itemName: it.name, jobRef, column: 'Financial Status', oldValue: it.fin, newValue: 'Invoiced', result: 'ok', detail: `invoice ${job.invoiceNumber || job.invoiceId || ''}` },
-                        poForMonday ? { action: 'write', boardId: String(LOGO_BOARD), itemId: it.id, itemName: it.name, jobRef, column: 'PO Number', oldValue: it.po, newValue: poForMonday, result: 'ok', detail: '' } : null,
-                        it.groupId !== LB_INVOICED_GROUP ? { action: 'move', boardId: String(LOGO_BOARD), itemId: it.id, itemName: it.name, jobRef, column: 'Group', oldValue: it.group, newValue: 'Invoiced', result: 'ok', detail: '' } : null,
-                    ].filter(Boolean));
                 } catch (e) { errs.push(`${it.name}: ${e.message}`); }
                 await sleep(200);
             }
@@ -802,7 +759,6 @@
         } catch (e) {
             job.mondayStatus = 'error'; job.mondayError = e.message;
             log(`    ✗ Monday logos: ${e.message}`, '#f55');
-            await actionLog([{ action: 'set Invoiced', boardId: String(LOGO_BOARD), jobRef, result: 'error', detail: e.message }]);
         }
     }
 
@@ -826,7 +782,6 @@
                     // Multiple board items match → don't guess. Skip and flag for manual handling.
                     job.mondayStatus = `skipped (⚠ ${hit.count} ${hit.by} matches — update manually)`;
                     log(`    ⚠ Monday: ${hit.count} items match ${hit.by} "${hit.by === 'PO' ? po : job.jobNumber}" — SKIPPED, update manually`, '#fd0');
-                    await actionLog([{ action: 'set Invoiced', jobRef, result: 'skipped', detail: `${hit.count} items match ${hit.by} — update manually` }]);
                 } else {
                     // Make sure we have the net + the invoice's Customer Order Number.
                     let net = (job.net != null) ? job.net : null;
@@ -837,11 +792,6 @@
                     // Write the Customer Order Number verbatim (whatever it contains); fall back to the pasted PO only if it's blank.
                     const poForMonday = String(orderNo || '').trim() || String(job.po || '').trim();
                     await mondaySetInvoiced(hit.id, net, poForMonday);
-                    const wrote = mondaySetInvoiced.lastValues || {};
-                    await actionLog(Object.keys(wrote).map(id => ({
-                        action: 'write', itemId: hit.id, itemName: hit.name, jobRef, column: COL_LABEL[id] || id,
-                        oldValue: hit.before[id] || '', newValue: id === MB_FINANCE ? wrote[id].label : wrote[id],
-                        result: 'ok', detail: `invoice ${job.invoiceNumber || job.invoiceId || ''}, matched by ${hit.by}`.trim() })));
                     job.mondayItemId = hit.id;
                     job.mondayStatus = `done (by ${hit.by})`;
                     log(`    Monday: "${hit.name}" → Invoiced${net != null ? `, Price Est. £${net}` : ' (net not found)'}${poForMonday ? `, PO "${poForMonday}"` : ''}`, '#0fa');
@@ -850,8 +800,6 @@
                 job.mondayStatus = 'error';
                 job.mondayError = e.message;
                 log(`    ✗ Monday: ${e.message}`, '#f55');
-                await actionLog([{ action: 'set Invoiced', itemId: hit ? hit.id : '', itemName: hit ? hit.name : '', jobRef,
-                                   result: 'error', detail: e.message }]);
             }
         }
         const cur = loadState(); if (cur) { cur.jobs[i] = job; saveState(cur); renderResults(cur); }
@@ -1459,26 +1407,6 @@
         });
         opts.appendChild(mondayBtn); opts.appendChild(mondayStat);
         refreshMondayStat();
-        const logStat = document.createElement('span');
-        logStat.style.cssText = 'font-size:11px;';
-        const refreshLogStat = () => {
-            const has = !!logSecret();
-            logStat.textContent = has ? '📒 logging on' : '📒 not logging';
-            logStat.style.color = has ? '#7d7' : '#fd0';
-        };
-        const logBtn = mkBtn('Set log secret', '#334');
-        logBtn.style.padding = '4px 10px';
-        logBtn.title = 'Paste the action-log secret (the relay SHARED_SECRET). Monday writes are then recorded in the "JL ↔ Monday Action Log" sheet.';
-        logBtn.addEventListener('click', () => {
-            const t = prompt('Paste the action-log secret' + (logSecret() ? '\n(blank = keep current, "clear" = remove):' : ':'), '');
-            if (t === null) return;
-            const v = t.trim();
-            if (v === '') return;
-            if (v.toLowerCase() === 'clear') { GM_deleteValue(LOG_SECRET_KEY); log('Log secret cleared.', '#fd0'); refreshLogStat(); return; }
-            GM_setValue(LOG_SECRET_KEY, v); log('Log secret saved.', '#0fa'); refreshLogStat();
-        });
-        opts.appendChild(logBtn); opts.appendChild(logStat);
-        refreshLogStat();
 
         // Controls
         const ctl = document.createElement('div');
