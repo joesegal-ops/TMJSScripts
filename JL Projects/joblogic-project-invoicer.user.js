@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.30
+// @version      1.31
 // @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID | WW Paid|Member Paid", SITEID auto-derived from the job's site and the payer read from the Monday item's Client column (YES = WW Paid) → set every line on a Project-type job to nominal "202 - Projects Income" → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Logos: a 3rd column with the UP quote number makes it a member-logo row — payer and the Monday update use every item with that UP Ref Number on the "Members' logos Wework" board (Financial Status → Invoiced, PO Number, moved to the Invoiced group). Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/Invoice
 // @match        https://go.joblogic.com/Invoice?*
@@ -254,7 +254,8 @@
         // Prefer an exact JobNumber match; else take the first hit.
         const exact = jobs.find(x => String(x.JobNumber).toLowerCase() === jobNumber.toLowerCase());
         const job = exact || jobs[0];
-        return { jobId: job.Id, jobNumber: job.JobNumber, siteName: job.SiteName || '', jobType: job.TypeDescription || '' };
+        return { jobId: job.Id, jobNumber: job.JobNumber, siteName: job.SiteName || '', jobType: job.TypeDescription || '',
+                 status: job.StatusDescription || job.JobStatusDescription || '' };
     }
 
     async function createInvoice(jobId) {
@@ -924,6 +925,12 @@
                             job.jobNumber = info.jobNumber;
                             job.siteName = info.siteName;
                             job.jobType = info.jobType;
+                            job.jlStatus = info.status;
+                        }
+                        // Logo rows: a job already "Invoiced" in JL has nothing to bill — skip
+                        // straight to the Monday move instead of creating + deleting an empty draft.
+                        if (job.quote && !job.invoiceId && String(job.jlStatus || '').trim().toLowerCase() === 'invoiced') {
+                            throw new Error('no lines to invoice (job already Invoiced in JL)');
                         }
                         job.siteId = siteIdFrom(job.siteName);
                         await resolvePayer(job);
