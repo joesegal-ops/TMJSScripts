@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Project Invoicer (bulk create → approve → email)
 // @namespace    http://tampermonkey.net/
-// @version      1.29
+// @version      1.30
 // @description  Paste a list of Jobs + PO numbers (a job cell may hold several comma-separated job numbers — each is tried in order until one has something to invoice, and the empty £0 draft Joblogic leaves behind for an already-invoiced job is deleted automatically). Works through them ONE AT A TIME (create invoice → set Customer Order Number to "PROJ | PO-XXXX - SITEID | WW Paid|Member Paid", SITEID auto-derived from the job's site and the payer read from the Monday item's Client column (YES = WW Paid) → set every line on a Project-type job to nominal "202 - Projects Income" → approve → email → then updates the matching Monday item (Finance Stat → "Invoiced", Price Est. ← invoice net) → next), so Stop always leaves you at a known job and Start resumes from there. Default DRY-RUN: composes each email and stops for you to review + Send; tick "Auto-send" to send unattended. Logos: a 3rd column with the UP quote number makes it a member-logo row — payer and the Monday update use every item with that UP Ref Number on the "Members' logos Wework" board (Financial Status → Invoiced, PO Number, moved to the Invoiced group). Outputs a TSV you can paste straight into Google Sheets. Collapses to a launcher in the shared dock.
 // @match        https://go.joblogic.com/Invoice
 // @match        https://go.joblogic.com/Invoice?*
@@ -193,7 +193,10 @@
 
     // --- STATE (persisted across navigations) ---
     function loadState() { try { return JSON.parse(localStorage.getItem(STATE_KEY)); } catch (e) { return null; } }
-    function saveState(s) { localStorage.setItem(STATE_KEY, JSON.stringify(s)); }
+    function saveState(s) { if (s) s.updatedAt = Date.now(); localStorage.setItem(STATE_KEY, JSON.stringify(s)); }
+    // A "running" run with no activity for this long is treated as abandoned: it is NOT
+    // auto-opened/resumed on page load (open the panel and press Start to resume it).
+    const STALE_RUN_MS = 30 * 60 * 1000;
     function clearState() { localStorage.removeItem(STATE_KEY); }
 
     // --- UI refs ---
@@ -1575,7 +1578,13 @@
         createUI();
         // Resume the run after a navigation (drive() figures out prep vs. email).
         const s = loadState();
-        if (s && s.running) {
+        if (s && s.running && !(s.updatedAt && Date.now() - s.updatedAt < STALE_RUN_MS)) {
+            // Left over from an old/abandoned run — keep the panel closed, don't resume.
+            s.running = false; localStorage.setItem(STATE_KEY, JSON.stringify(s));
+            setRunningUI(false);
+            setProgress(`Unfinished run found (${s.jobs.length} job(s), stopped at ${s.idx + 1}). Press Start to resume it, or Reset to clear.`);
+            renderResults(s);
+        } else if (s && s.running) {
             // Auto-open the panel so the user sees progress.
             if (panel && panel.style.display === 'none') { const btn = document.getElementById('jl-launch-' + SCRIPT_ID); if (btn) btn.click(); }
             setTimeout(drive, 800);
