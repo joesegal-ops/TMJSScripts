@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Sweep Job → Forms
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1
+// @version      1.2.0
 // @description  Record which form VERSION every open job currently holds. Job form-rules store a version-specific FormUniqueGuid, so deploying a new version of a form leaves already-assigned jobs pointing at the old one. This sweep builds the before-picture: one JSONL row per job+form rule, plus a snapshot of the currently-deployed form guids, so a repoint run afterwards knows exactly which jobs to move. Paced under the Azure WAF, resumable, writes part files to Downloads. READ-ONLY — it never changes a job or a form.
 // @match        https://go.joblogic.com/Job
 // @match        https://go.joblogic.com/Job?*
@@ -100,7 +100,7 @@
         return btn;
     }
     // ===== end shared dock =====
-    const VERSION = '1.1.0';
+    const VERSION = '1.2.0';
     const SCRIPT_ID = 'sweep-job-forms';
     const SCRIPT_LABEL = '🧾 Sweep Job → Forms';
     const SCRIPT_COLOR = '#2f5d62';
@@ -140,9 +140,32 @@
         for (let left = ms; left > 0 && !stopRequested; left -= step) await sleep(Math.min(step, left));
     }
 
-    function getCsrf(doc = document) {
+    // The DOM's antiforgery token is minted at page load and **goes stale after ~30 min**.
+    // A stale one makes JobFormsSearch answer HTTP 400 with an EMPTY BODY — no JSON, no message,
+    // which reads exactly like a dead session. Refreshing it costs a ~7.6 s /CompanyForm fetch,
+    // so do it on a timer, not once per failure: reactively, under 4 retries, that page fetch
+    // runs up to 4x per job and collapses throughput (measured 2026-11-17).
+    const TOKEN_TTL_MS = 10 * 60 * 1000;
+    let _token = '', _tokenAt = 0;
+
+    function domCsrf(doc = document) {
         const el = doc.querySelector('input[name="__RequestVerificationToken"]');
         return el ? el.value : '';
+    }
+
+    async function fetchToken() {
+        const html = await fetch('/CompanyForm', { credentials: 'same-origin' }).then(r => r.text());
+        const m = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/);
+        if (!m) throw SessionError('No antiforgery token on /CompanyForm — logged out?');
+        _token = m[1]; _tokenAt = Date.now();
+        return _token;
+    }
+
+    /** Current token, refreshed when older than the TTL. `force` re-mints it now. */
+    async function getCsrf(force) {
+        if (!_token) { _token = domCsrf(); _tokenAt = Date.now(); }
+        if (force || !_token || Date.now() - _tokenAt > TOKEN_TTL_MS) await fetchToken();
+        return _token;
     }
 
     function downloadText(filename, text, mime) {
@@ -334,18 +357,44 @@
     // =======================================================================
     // Joblogic calls
     // =======================================================================
-    async function postForm(url, fields) {
+    async function postForm(url, fields, _retried) {
         const fd = new FormData();
         for (const k in fields) fd.append(k, fields[k]);
+        const started = Date.now();
         const resp = await jlFetch(url, {
             method: 'POST',
-            headers: { 'X-Requested-With': 'XMLHttpRequest', '__RequestVerificationToken': getCsrf() },
+            headers: { 'X-Requested-With': 'XMLHttpRequest', '__RequestVerificationToken': await getCsrf() },
             body: fd
         });
+        const body = await resp.text();
+        noteLatency(Date.now() - started);
+        // Stale token: HTTP 400 with nothing in the body. Re-mint once and retry before
+        // concluding anything about the session — this is NOT a logout.
+        if ((resp.status === 400 || !body) && !_retried) {
+            await getCsrf(true);
+            return postForm(url, fields, true);
+        }
         if (!/json/i.test(resp.headers.get('content-type') || '')) {
             throw SessionError('Joblogic returned a page instead of JSON — session expired?');
         }
-        return resp.json();
+        return JSON.parse(body);
+    }
+
+    // Joblogic throttles a long run by getting SLOWER, not by erroring: a successful
+    // JobFormsSearch measured 0.7 s early and 12.1 s after ~7,200 calls, with zero errors
+    // raised throughout. So latency, not the error count, is the health signal — widen the
+    // pace when it climbs and say so, rather than grinding on at four jobs per ten minutes.
+    const SLOW_MS = 4000, VERY_SLOW_MS = 9000;
+    let slowStreak = 0;
+    function noteLatency(ms) {
+        if (ms > VERY_SLOW_MS) slowStreak += 2;
+        else if (ms > SLOW_MS) slowStreak += 1;
+        else slowStreak = Math.max(0, slowStreak - 1);
+        if (slowStreak >= 6) {
+            currentInterval = Math.min(MAX_INTERVAL, currentInterval + 400);
+            setProgressNote(`server slowing (${(ms / 1000).toFixed(1)}s/call) — pace now ${currentInterval} ms`);
+            slowStreak = 0;
+        }
     }
 
     // Every job on the chosen tab. SearchJsonData honours big pages, so this is ~2 calls
@@ -361,7 +410,7 @@
                 headers: {
                     'Content-Type': 'application/json',
                     'X-Requested-With': 'XMLHttpRequest',
-                    '__RequestVerificationToken': getCsrf()
+                    '__RequestVerificationToken': await getCsrf()
                 },
                 body: JSON.stringify({
                     SearchTerm: '', SelectedTab: tab,
@@ -413,7 +462,7 @@
                 headers: {
                     'Content-Type': 'application/json',
                     'X-Requested-With': 'XMLHttpRequest',
-                    '__RequestVerificationToken': getCsrf()
+                    '__RequestVerificationToken': await getCsrf()
                 },
                 body: JSON.stringify({ formUniqueGuid: '', PageIndex: page, PageSize: INCOMPLETE_PAGE_SIZE, SearchTerm: '' })
             });
