@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JobLogic Electronic Forms — Add Standard Field
 // @namespace    com.joesegal.joblogic
-// @version      1.0.1
-// @description  Adds one standard question (e.g. RemedialsRequired) to many custom form templates at once. Deployed templates are locked, so for each form it creates a new version, saves the edited definition and deploys it — keeping the ORIGINAL form name so no "- V2" rename or duplicate appears. Dry run first; "Run first only" does a single form so you can check it on mobile before the rest.
+// @version      1.1.0
+// @description  Adds a standard question SET (the Remedials + H&S preset, or one field you type) to many custom form templates at once. Deployed templates are locked, so for each form it creates a new version, saves the edited definition and deploys it — keeping the ORIGINAL form name so no "- V2" rename or duplicate appears. Dry run first; "Run first only" does a single form so you can check it on mobile before the rest.
 // @match        https://go.joblogic.com/CompanyForm*
 // @run-at       document-idle
 // @grant        none
@@ -101,6 +101,24 @@
 
     const SCRIPT_ID = 'add-form-field';
     const SCRIPT_LABEL = '➕ Add Standard Field';
+
+    // The agreed PPM standard (see JL API BigQuery Connection/FORM_FIELD_SPEC.md).
+    // PAGE LEVEL, so the visibleIf expressions carry NO `row.` prefix — the per-row
+    // RemedialActions columns on the 21 Water Temperature forms use `{row.…}` and are a
+    // different question at a different grain. Copying their form here silently breaks
+    // every conditional: the expression never matches and the comment never appears,
+    // which is already the live state of "Water Temperature Monitoring - No Assets".
+    const PRESET_REMEDIALS_HS = [
+        { type: 'boolean', name: 'VisitRemedialsRequired', title: 'Remedials Required?', isRequired: true },
+        { type: 'comment', name: 'VisitRemedialDetail', title: 'What is the remedial?',
+          isRequired: true, visibleIf: '{VisitRemedialsRequired} = true' },
+        { type: 'dropdown', name: 'VisitRemedialPriority', title: 'Remedial priority',
+          isRequired: true, visibleIf: '{VisitRemedialsRequired} = true',
+          choices: ['Urgent - P1', 'High - P2', 'Medium - P3', 'Low - P4', 'Routine - P5'] },
+        { type: 'boolean', name: 'HealthSafetyRisk', title: 'Is this a Health and Safety Risk?', isRequired: true },
+        { type: 'comment', name: 'HealthSafetyDetail', title: 'Describe the risk',
+          isRequired: true, visibleIf: '{HealthSafetyRisk} = true' }
+    ];
     const SCRIPT_COLOR = '#6b3fa0';
     const SCRIPT_DESC = 'Adds one standard question to many custom form templates. Paste the form names, Dry run to see the plan, then "Run first only" to do a single form and check it on an engineer\'s mobile before running the rest. Each form gets a new version carrying its ORIGINAL name, so nothing is renamed to "- V2".';
 
@@ -226,29 +244,59 @@
         return out;
     }
 
-    // Append the new question to the END of the LAST page, so it reads as a closing question.
-    function addField(def, field) {
+    // Append the new questions to the END of the LAST page, in order, so they read as
+    // closing questions. Order matters: a field's visibleIf must refer to one already above it.
+    function addFields(def, fields) {
         const copy = JSON.parse(JSON.stringify(def));
         if (!Array.isArray(copy.pages) || !copy.pages.length) throw new Error('definition has no pages');
         const page = copy.pages[copy.pages.length - 1];
         page.elements = page.elements || [];
-        page.elements.push(field);
+        fields.forEach(f => page.elements.push(JSON.parse(JSON.stringify(f))));
         return copy;
+    }
+
+    const hasField = (def, name) =>
+        allFieldNames(def).some(n => n.toLowerCase() === String(name).toLowerCase());
+
+    /** The fields of the set this form does not already carry, in the set's own order. */
+    const missingFields = (def, fields) => fields.filter(f => !hasField(def, f.name));
+
+    /**
+     * Every {Token} a field's visibleIf leans on must exist on the form once the set is
+     * added, or the question silently never shows. Checked before anything is written.
+     */
+    function brokenConditionals(def, fields) {
+        const after = allFieldNames(def).concat(fields.map(f => f.name)).map(n => n.toLowerCase());
+        const bad = [];
+        for (const f of fields) {
+            if (!f.visibleIf) continue;
+            for (const m of String(f.visibleIf).matchAll(/\{([^}]+)\}/g)) {
+                const token = m[1].trim();
+                if (/^row\./i.test(token)) { bad.push(f.name + ' → ' + m[0] + ' (row-scoped, but this field is page level)'); continue; }
+                if (!after.includes(token.toLowerCase())) bad.push(f.name + ' → ' + m[0] + ' (no such field)');
+            }
+        }
+        return bad;
     }
 
     // =======================================================================
     // The run: one form = NewVersion -> Save -> Deploy -> verify
     // =======================================================================
-    async function processForm(tpl, field, opts, say) {
+    async function processForm(tpl, fields, opts, say) {
         // 1. read the current definition
         const d = await detail(tpl.id);
         if (!d.j?.success) throw new Error('Detail failed (HTTP ' + d.status + ')');
         const def = JSON.parse(d.j.AdditionalData.JsonData || '{}');
 
-        if (allFieldNames(def).some(n => n.toLowerCase() === field.name.toLowerCase()))
-            return { status: 'skipped', note: 'already has ' + field.name };
+        // Add only what is missing, so a re-run after a part-failure tops up rather than
+        // duplicating, and a form that already has some of the set still gets the rest.
+        const todo = missingFields(def, fields);
+        if (!todo.length) return { status: 'skipped', note: 'already has all ' + fields.length + ' field(s)' };
 
-        const updated = addField(def, field);
+        const broken = brokenConditionals(def, todo);
+        if (broken.length) throw new Error('would create a conditional that never fires: ' + broken.join('; '));
+
+        const updated = addFields(def, todo);
 
         // 2. new version, carrying the ORIGINAL name
         const nv = await newVersion(tpl.id, tpl.name, opts);
@@ -272,10 +320,14 @@
         // 6. verify from the server rather than trusting the deploy response
         const check = await detail(draft.Id);
         const a = check.j?.AdditionalData;
-        const ok = a && a.IsFormDeployed && allFieldNames(JSON.parse(a.JsonData || '{}'))
-            .some(n => n.toLowerCase() === field.name.toLowerCase());
-        if (!ok) throw new Error('deployed but verification failed — check this form by hand');
-        return { status: 'done', note: 'v' + a.Version + ' deployed as "' + a.Description + '"' };
+        const live = a && a.JsonData ? JSON.parse(a.JsonData) : null;
+        const absent = live ? todo.filter(f => !hasField(live, f.name)).map(f => f.name) : todo.map(f => f.name);
+        if (!a || !a.IsFormDeployed || absent.length)
+            throw new Error('deployed but verification failed'
+                + (absent.length ? ' — missing on the server: ' + absent.join(', ') : '')
+                + ' — check this form by hand');
+        return { status: 'done', note: 'v' + a.Version + ' deployed as "' + a.Description + '" (+'
+                 + todo.length + ' field' + (todo.length === 1 ? '' : 's') + ')' };
     }
 
     // =======================================================================
@@ -323,6 +375,11 @@
         };
 
         const r1 = mkRow();
+        const r0 = mkRow();
+        const presetCb = mkCheck(r0, 'Use the Remedials + H&S standard (5 fields)', true,
+            'VisitRemedialsRequired, VisitRemedialDetail, VisitRemedialPriority, HealthSafetyRisk, '
+            + 'HealthSafetyDetail — all page level, per FORM_FIELD_SPEC.md. Untick to add one field of your own.');
+
         const nameIn = mkField(r1, 'Field name (data key)', 'RemedialsRequired', 1);
         const r2 = mkRow();
         const titleIn = mkField(r2, 'Question shown to the engineer', 'Remedials Required?', 1);
@@ -335,7 +392,11 @@
         depHdr.textContent = 'Deploy options — these decide what happens to open jobs';
         panel.append(depHdr);
         const r4 = mkRow();
-        const depAffectCb = mkCheck(r4, 'Assign to existing open jobs', true, 'Deploy: affectToExistingJobs — the dialog default. Pushes the form onto every incomplete job.');
+        // OFF by default, unlike Joblogic's own dialog. Its "assign to all existing incomplete
+        // jobs" reaches only ~3k of the 12.6k open jobs, so it half-does the job and hides that
+        // it did. Deploy for future jobs only, then repoint deliberately with
+        // joblogic-repoint-job-forms.user.js, which works off the real job population.
+        const depAffectCb = mkCheck(r4, 'Assign to existing open jobs', false, 'Deploy: affectToExistingJobs. Joblogic\u2019s dialog defaults this ON; it is OFF here on purpose — it only reaches the ~3k "incomplete" jobs, not the 12.6k open ones. Leave off and use the Repoint script afterwards.');
         const depVisitsCb = mkCheck(r4, 'Redeploy incomplete visits', true, 'Deploy: isReDeployIncompleteVisits');
         const r5 = mkRow();
         const nvRemoveCb = mkCheck(r5, 'Remove old version from jobs', false, 'NewVersion: AffectToExistingJobs — strips the OLD version off existing jobs. Off by default: untested against part-filled forms.');
@@ -377,6 +438,18 @@
         jlRegisterPanel(panel, SCRIPT_ID, SCRIPT_LABEL, SCRIPT_COLOR, SCRIPT_DESC);
 
         let running = false, stopRequested = false;
+        const syncPreset = () => {
+            const on = presetCb.checked;
+            [nameIn, titleIn, requiredCb, defaultCb].forEach(el => {
+                el.disabled = on;
+                const box = el.closest ? el.closest('label') : null;
+                if (box) box.style.opacity = on ? '0.45' : '1';
+                el.style.opacity = on ? '0.45' : '1';
+            });
+        };
+        presetCb.addEventListener('change', syncPreset);
+        syncPreset();
+
         const say = (msg, color) => {
             const line = document.createElement('div');
             if (color) line.style.color = color;
@@ -390,12 +463,15 @@
             stopBtn.disabled = !on; stopBtn.style.opacity = on ? '1' : '0.5';
         };
 
-        const readField = () => {
+        const readFields = () => {
+            if (presetCb && presetCb.checked) return PRESET_REMEDIALS_HS;
             const f = { type: 'boolean', name: nameIn.value.trim(), title: titleIn.value.trim() };
             if (requiredCb.checked) f.isRequired = true;
             if (defaultCb.checked) f.defaultValue = false;
-            return f;
+            return [f];
         };
+        const describeFields = (fs) => fs.map(f => f.name + ' [' + f.type + ']'
+            + (f.isRequired ? ' REQ' : '') + (f.visibleIf ? ' if ' + f.visibleIf : '')).join('\n   · ');
         const readOpts = () => ({
             depAffectExistingJobs: depAffectCb.checked, depRedeployVisits: depVisitsCb.checked,
             nvRemoveFromJobs: nvRemoveCb.checked, nvRedeployVisits: nvVisitsCb.checked
@@ -417,8 +493,10 @@
         }
 
         async function run(mode) {
-            const field = readField();
-            if (!field.name || !field.title) { say('✗ field name and question text are both needed', '#ff8f8f'); return; }
+            const fields = readFields();
+            if (fields.some(f => !f.name || !f.title)) { say('✗ field name and question text are both needed', '#ff8f8f'); return; }
+            say('Field set (' + fields.length + '):', '#9fb6c4');
+            say('   · ' + describeFields(fields), '#9fb6c4');
             const names = readNames();
             if (!names.length) { say('✗ paste the form names first', '#ff8f8f'); return; }
             setRunning(true); stopRequested = false;
@@ -434,14 +512,16 @@
                 if (!matched.length) { say('Nothing to do.', '#e8b339'); return; }
 
                 // Which already have the field?
-                say('Checking which already have ' + field.name + '…');
+                say('Checking which already have the set…');
                 const todo = [], already = [];
                 for (const t of matched) {
                     if (stopRequested) break;
                     const d = await detail(t.id);
                     if (!d.j?.success) { say('✗ ' + t.name + ' — could not read definition', '#ff8f8f'); continue; }
                     const def = JSON.parse(d.j.AdditionalData.JsonData || '{}');
-                    (allFieldNames(def).some(n => n.toLowerCase() === field.name.toLowerCase()) ? already : todo).push(t);
+                    const miss = missingFields(def, fields);
+                    t.missing = miss.map(f => f.name);
+                    (miss.length ? todo : already).push(t);
                     status.textContent = 'checked ' + (todo.length + already.length) + ' / ' + matched.length;
                 }
                 if (already.length) say(already.length + ' already have it — they will be left alone.', '#9fb6c4');
@@ -449,7 +529,8 @@
 
                 if (mode === 'dry') {
                     say('— DRY RUN, nothing written —', '#7bd88f');
-                    todo.forEach(t => say('   would edit: ' + t.name + '  (v' + t.ver + ')'));
+                    todo.forEach(t => say('   would edit: ' + t.name + '  (v' + t.ver + ')  +'
+                        + (t.missing || []).length + ': ' + (t.missing || []).join(', ')));
                     const o = readOpts();
                     say('Deploy would use: assign to existing open jobs = ' + o.depAffectExistingJobs
                         + ', redeploy incomplete visits = ' + o.depRedeployVisits, '#9fb6c4');
@@ -465,7 +546,7 @@
                     const t = queue[i];
                     status.textContent = (i + 1) + ' / ' + queue.length + ' — ' + t.name;
                     try {
-                        const res = await processForm(t, field, opts, say);
+                        const res = await processForm(t, fields, opts, say);
                         if (res.status === 'skipped') { skipped++; say('· ' + t.name + ' — ' + res.note, '#9fb6c4'); }
                         else { done++; say('✔ ' + t.name + ' — ' + res.note, '#7bd88f'); }
                     } catch (e) {
@@ -492,7 +573,8 @@
             const o = readOpts();
             if (confirm('Edit and DEPLOY every listed form for real.\n\n'
                 + 'Assign to existing open jobs: ' + (o.depAffectExistingJobs ? 'YES' : 'no') + '\n'
-                + 'Required question: ' + (requiredCb.checked ? 'YES — engineers cannot complete a visit without answering' : 'no') + '\n\n'
+                + 'Fields: ' + readFields().map(f => f.name).join(', ') + '\n'
+                + 'Required question: ' + (readFields().some(f => f.isRequired) ? 'YES — engineers cannot complete a visit without answering' : 'no') + '\n\n'
                 + 'Run "Run first only" and check a visit on mobile before doing this. Continue?')) run('all');
         });
         stopBtn.addEventListener('click', () => { stopRequested = true; status.textContent = 'stopping after this form…'; });
