@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Bulk Link Assets to Jobs
 // @namespace    https://go.joblogic.com/
-// @version      1.00
-// @description  Paste rows of "JL Job Id | JL Asset Id" (e.g. the Job matches tab of an asset-matching Google Sheet) and add each asset to its job, the same way the job's Assets tab does (move across, Save). Site guard, confidence filter, preview first, verifies each save, downloads a log CSV. Remove mode takes the same rows off again.
+// @version      1.01
+// @description  Paste rows of "JL Job Id | JL Asset Id" (e.g. the Job matches tab of an asset-matching Google Sheet) and add each asset to its job, the same way the job's Assets tab does (move across, Save). Site guard, confidence filter, preview first, verifies each save, downloads a log CSV. Remove mode takes the same rows off again. v1.01: also adds the ids in an "Extra assets" column (jobs that name several rooms or cubicles).
 // @match        https://go.joblogic.com/Job*
 // @grant        none
 // @run-at       document-idle
@@ -126,6 +126,7 @@
     const NUM_H = ['job number'];
     const CONF_H = ['confidence'];
     const DESC_H = ['asset description'];
+    const EXTRA_H = ['extra assets', 'extra jl asset ids'];
 
     // ------------------------------------------------------------------ UI
     const css = `
@@ -142,7 +143,7 @@
     box.innerHTML = `
       <h3>Link assets to jobs <span class="muted" style="font-weight:normal;font-size:12px">v${SCRIPT_VERSION}</span></h3>
       <div class="muted">Paste rows with a header line. Needed columns: <b>JL Job Id</b> and <b>JL Asset Id</b>.
-      Optional: <b>Job Number</b>, <b>Asset description</b>, <b>Confidence</b> (used by the filter below). Copying the whole "Job matches" tab works;
+      Optional: <b>Job Number</b>, <b>Asset description</b>, <b>Confidence</b> (used by the filter below), <b>Extra assets</b> (more asset ids for the same job, in [brackets]). Copying the whole "Job matches" tab works;
       rows with no asset id are skipped.</div>
       <textarea id="jlla-in" placeholder="Job Number\tJL Job Id\tJL Asset Id\tConfidence"></textarea>
       <div class="row">Only allow jobs on site ID: <input id="jlla-site" size="10" placeholder="e.g. 16957546">
@@ -171,7 +172,7 @@
         const split = l => delim === '\t' ? l.split('\t') : l.match(/("([^"]|"")*"|[^,]*)(,|$)/g).map(c => c.replace(/,$/, '').replace(/^"|"$/g, '').replace(/""/g, '"'));
         const head = split(lines[0]).map(h => h.trim().toLowerCase());
         const find = names => { for (const n of names) { const i = head.indexOf(n); if (i >= 0) return i; } return -1; };
-        const jc = find(JOB_H), ac = find(ASSET_H), nc = find(NUM_H), cc = find(CONF_H), dc = find(DESC_H);
+        const jc = find(JOB_H), ac = find(ASSET_H), nc = find(NUM_H), cc = find(CONF_H), dc = find(DESC_H), ec = find(EXTRA_H);
         if (jc < 0 || ac < 0) throw new Error('Header row needs "JL Job Id" and "JL Asset Id" columns.');
         const confs = [...document.querySelectorAll('.jlla-conf:checked')].map(x => x.value);
         const items = [], seen = new Set(); let noAsset = 0, filtered = 0;
@@ -181,10 +182,12 @@
             if (!/^\d+$/.test(job || '')) continue;
             if (!/^\d+$/.test(asset || '')) { noAsset++; continue; }
             if (cc >= 0 && mode() === 'add' && !confs.includes((c[cc] || '').toLowerCase())) { filtered++; continue; }   // remove (undo) takes every row
-            const k = job + ':' + asset;
-            if (seen.has(k)) continue;
-            seen.add(k);
-            items.push({ job, asset, num: nc >= 0 ? c[nc] : '', desc: dc >= 0 ? c[dc] : '', conf: cc >= 0 ? c[cc] : '' });
+            const base = { job, num: nc >= 0 ? c[nc] : '', conf: cc >= 0 ? c[cc] : '' };
+            const add = (id, desc) => { const k = job + ':' + id; if (!seen.has(k)) { seen.add(k); items.push(Object.assign({ asset: id, desc }, base)); } };
+            add(asset, dc >= 0 ? c[dc] : '');
+            // "Extra assets": "Office 07-114 [13371234]; Meeting Room 8A (08-08A) [13371546]" - ids in square brackets
+            // (new spaces not yet in Joblogic show their asset number instead and are skipped)
+            if (ec >= 0) for (const m of (c[ec] || '').matchAll(/([^;\[]*)\[(\d+)\]/g)) add(m[2], m[1].trim() + ' (extra)');
         }
         return { items, noAsset, filtered };
     }
