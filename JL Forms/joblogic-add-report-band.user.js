@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Add Report Summary Band
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
-// @description  Appends the Remedials + H&S fields to a custom form's Report Designer summary band, below whatever is already there, then saves. The report layout only exists inside the Stimulsoft designer at runtime — there is no endpoint that hands it over — so this runs ON the designer page, one form at a time. It computes placement from the band's existing contents rather than a fixed offset, because every form's layout differs: a fixed offset lands on top of the signature block. The report is NOT version-locked: a deployed, locked form saves fine (verified 2026-11-20), so this can run as a separate pass after the surveys are deployed and the jobs repointed.
+// @version      1.1.0
+// @description  Appends the Remedials + H&S fields to a custom form's Report Designer summary band, below whatever is already there, then saves. The report layout only exists inside the Stimulsoft designer at runtime — there is no endpoint that hands it over — so this runs ON the designer page, one form at a time. It computes placement from the band's existing contents rather than a fixed offset, because every form's layout differs: a fixed offset lands on top of the signature block. The report is NOT version-locked: a deployed, locked form saves fine (verified 2026-11-20), so this can run as a separate pass after the surveys are deployed and the jobs repointed. Reports come in two shapes: banded ones get the fields appended to the summary band; flat hand-laid-out ones (no bands at all, every page full) get a new SUMMARY FRONT PAGE carrying the logo, date, company, form name, site and the five fields.
 // @match        https://go.joblogic.com/Form/Designer/*
 // @grant        none
 // @run-at       document-idle
@@ -155,17 +155,26 @@
         return bottom;
     }
 
-    /** Left margin and usable width, taken from what the band already uses. */
-    function bandMetrics(band) {
+    /**
+     * Left margin and usable width. Start from what the band already uses, but fall back to
+     * the PAGE width when the band's own content is narrow — a band holding two small boxes
+     * on an 8.5" page reported 2.4", which would squeeze the block into a third of the sheet.
+     */
+    function bandMetrics(band, page) {
         let left = null, right = null;
         for (let i = 0; i < band.components.count; i++) {
             const r = band.components.getByIndex(i).clientRectangle;
             left = left === null ? r.x : Math.min(left, r.x);
             right = right === null ? r.x + r.width : Math.max(right, r.x + r.width);
         }
-        if (left === null) { left = 0.6; right = 7.3; }
-        if (right - left < 3) right = left + 6.1;      // degenerate band — use a sane width
-        return { left, width: right - left };
+        if (left === null) left = 0.6;
+        const pageW = page && page.width ? page.width : 0;
+        // usable width on the page, allowing the same margin on the right as on the left
+        const pageUsable = pageW ? Math.max(0, pageW - left * 2) : 0;
+        let width = (right === null) ? 0 : right - left;
+        if (pageUsable > width) width = pageUsable;    // prefer the page over a narrow band
+        if (width < 3) width = 6.1;                    // nothing sensible to go on
+        return { left, width };
     }
 
     const already = (band) => {
@@ -174,13 +183,13 @@
         return false;
     };
 
-    function addBand(rep, band, say) {
+    function addBand(rep, band, say, page) {
         const S = window.Stimulsoft;
         const Rect = S.System && S.System.Drawing && S.System.Drawing.Rectangle;
         const Text = S.Report.Components.StiText;
         if (!Rect || !Text) throw new Error('Stimulsoft classes not found on this page');
 
-        const { left, width } = bandMetrics(band);
+        const { left, width } = bandMetrics(band, page);
         const labelW = Math.min(2.6, width * 0.42);
         const valueL = left + labelW + 0.2;
         const valueW = Math.max(1.5, width - labelW - 0.2);
@@ -210,6 +219,112 @@
         band.height = top0 + HEAD_H + 0.1 + ROWS.length * ROW_STEP + PAD_BELOW;
         say('placed at y=' + top0.toFixed(2) + ', band height now ' + band.height.toFixed(2)
             + ' (left ' + left.toFixed(2) + ', width ' + width.toFixed(2) + ')');
+    }
+
+    // =======================================================================
+    // Flat reports: build a summary FRONT page
+    // =======================================================================
+    // Not every report is banded. The per-site certificate reports are hand-laid-out: flat
+    // StiText/StiImage straight on the page, no bands anywhere, 13 pages each and every page
+    // full to within a fraction of an inch. There is nowhere to append to, so the fields get
+    // their own page at the front, styled from the report's own header so it does not look
+    // bolted on.
+    const COMPANY_LINE = 'Untitled Projects Management Ltd';
+
+    const isBanded = (page) => {
+        for (let i = 0; i < page.components.count; i++) {
+            const c = page.components.getByIndex(i);
+            if (c && c.components && c.components.count !== undefined) return true;
+        }
+        return false;
+    };
+
+    const newGuid = () => {
+        let s = '';
+        for (let i = 0; i < 32; i++) s += '0123456789abcdef'[Math.floor(Math.random() * 16)];
+        return s;
+    };
+
+    /**
+     * Build the front page by editing the report JSON, not the object model: the pages
+     * collection has no insert() and components have no clone(), so a JSON copy is both the
+     * only way to put a page FIRST and the only exact way to carry the logo's ImageBytes over.
+     */
+    function buildSummaryPage(rep, formName, say) {
+        const j = JSON.parse(rep.saveToJsonString());
+        const keys = Object.keys(j.Pages).sort((a, b) => +a - +b);
+        const src = j.Pages[keys[0]];
+        const sc = src.Components || {};
+        const list = Object.keys(sc).map(k => sc[k]).filter(Boolean);
+
+        const textOf = (c) => (c && c.Text && c.Text.Value != null) ? String(c.Text.Value) : '';
+        const logo = list.find(c => c.Ident === 'StiImage' && c.ImageBytes);
+        const dateC = list.find(c => /UTCNonFormated/i.test(textOf(c)));
+        const siteC = list.find(c => /\{Site\.Name\}/i.test(textOf(c)));
+        // style templates: a bold label, and a plain value
+        const labelT = list.find(c => c.Ident === 'StiText' && /:\s*$/.test(textOf(c)))
+                    || list.find(c => c.Ident === 'StiText');
+        const valueT = dateC || siteC || labelT;
+        if (!labelT) throw new Error('no text component to copy styling from');
+
+        const clone = o => JSON.parse(JSON.stringify(o));
+        const rect = (x, y, w, h) => [x, y, w, h].join(',');
+        const out = {}; let n = 0;
+        const put = o => { out[String(n++)] = o; };
+        const mk = (tpl, name, value, x, y, w, h, opts) => {
+            const t = clone(tpl);
+            t.Name = name; t.Guid = newGuid();
+            t.ClientRectangle = rect(x, y, w, h);
+            t.Text = { Value: value };
+            delete t.TextFormat;            // our values are plain text, not dates
+            t.Type = 'Expression';
+            t.CanGrow = true; t.WordWrap = true;
+            if (opts && opts.align) t.HorAlignment = opts.align;
+            put(t);
+        };
+
+        const W = parseFloat(src.PageWidth) || 10.2;
+        const right = Math.max(6, W - 1);      // keep clear of the right margin
+        const bodyW = right - 1;
+
+        if (logo) { const g = clone(logo); g.Name = 'SumLogo'; g.Guid = newGuid();
+                    g.ClientRectangle = rect(0, 0, 3.6, 1.4); put(g); }
+        if (dateC) {
+            mk(labelT, 'SumDateLbl', 'DATE:', right - 4, 0.2, 1.1, 0.5, { align: 'Center' });
+            const dv = clone(dateC); dv.Name = 'SumDateVal'; dv.Guid = newGuid();
+            dv.ClientRectangle = rect(right - 2.9, 0.2, 2.9, 0.5); put(dv);   // keeps its UTC format
+        }
+        mk(labelT, 'SumCompany', COMPANY_LINE, 1, 1.6, bodyW, 0.4, { align: 'Center' });
+        mk(labelT, 'SumFormName', formName, 1, 2.1, bodyW, 0.4, { align: 'Center' });
+        mk(labelT, 'SumSiteLbl', 'SITE:', 1, 2.7, 1.5, 0.4, { align: 'Left' });
+        if (siteC) { const sv = clone(siteC); sv.Name = 'SumSiteVal'; sv.Guid = newGuid();
+                     sv.ClientRectangle = rect(2.6, 2.7, bodyW - 1.6, 0.4); put(sv); }
+        else mk(valueT, 'SumSiteVal', '{Site.Name}', 2.6, 2.7, bodyW - 1.6, 0.4, { align: 'Left' });
+
+        mk(labelT, 'SumHeading', HEADING, 1, 3.4, bodyW, 0.45, { align: 'Center' });
+        ROWS.forEach((r, i) => {
+            const y = 4.0 + i * 0.55;
+            mk(labelT, 'SumLbl' + i, r.label, 1, y, 3.2, 0.45, { align: 'Left' });
+            mk(valueT, 'SumVal' + i, r.expr, 4.3, y, bodyW - 3.3, 0.45, { align: 'Left' });
+        });
+
+        const page = { Ident: 'StiPage', Name: 'SummaryPage', Guid: newGuid(),
+            Interaction: { Ident: 'StiInteraction' },
+            Border: src.Border, Brush: src.Brush, Components: out,
+            PaperSize: src.PaperSize, Orientation: src.Orientation,
+            PageWidth: src.PageWidth, PageHeight: src.PageHeight,
+            Watermark: src.Watermark, Margins: src.Margins };
+
+        const old = keys.map(k => j.Pages[k]);
+        const rebuilt = { '0': page };
+        old.forEach((p, i) => { rebuilt[String(i + 1)] = p; });
+        j.Pages = rebuilt;
+
+        say('front page built: ' + n + ' components'
+            + (logo ? ', logo copied' : ', NO LOGO FOUND')
+            + (dateC ? ', date copied' : ', no date field found')
+            + (siteC ? ', site copied' : ', site synthesised'));
+        return j;
     }
 
     /** Rebuild the designer view from the model — it does NOT redraw on its own. */
@@ -277,15 +392,42 @@
     function inspect() {
         const rep = getReport();
         if (!rep) { log('Report Designer is not open — click Report Designer first, then try again.', '#e2a33c'); return null; }
+        const page0 = rep.pages.getByIndex(0);
+
+        // Already done? Either shape leaves a marker behind.
+        if (String(page0.name || '') === 'SummaryPage') {
+            log('Page 1 is already a SummaryPage — nothing to do.', '#9fb6c4'); return null;
+        }
+
         const { band } = summaryBand(rep);
-        if (!band) { log('This report has no ReportSummaryBand. It needs one adding by hand first.', '#ff6b6b'); return null; }
-        log('Summary band "' + band.name + '": ' + band.components.count + ' component(s), height '
-            + Number(band.height).toFixed(2));
-        const m = bandMetrics(band);
-        log('existing content ends at y=' + contentBottom(band).toFixed(2)
-            + '; margin ' + m.left.toFixed(2) + ', usable width ' + m.width.toFixed(2));
-        if (already(band)) { log('Already carries ' + PREFIX + '* components — nothing to do.', '#9fb6c4'); return null; }
-        return { rep, band };
+        if (band) {
+            log('Banded report. Summary band "' + band.name + '": ' + band.components.count
+                + ' component(s), height ' + Number(band.height).toFixed(2));
+            const m = bandMetrics(band, rep.pages.getByIndex(0));
+            log('existing content ends at y=' + contentBottom(band).toFixed(2)
+                + '; margin ' + m.left.toFixed(2) + ', usable width ' + m.width.toFixed(2));
+            if (already(band)) { log('Already carries ' + PREFIX + '* components — nothing to do.', '#9fb6c4'); return null; }
+            return { mode: 'band', rep, band };
+        }
+
+        // No bands anywhere — flat, hand-laid-out report.
+        if (isBanded(page0)) { log('Bands exist but no summary band — not handled, do this one by hand.', '#ff6b6b'); return null; }
+        let full = 0, maxFree = 0;
+        for (let p = 0; p < rep.pages.count; p++) {
+            const pg = rep.pages.getByIndex(p);
+            let bottom = 0;
+            for (let i = 0; i < pg.components.count; i++) {
+                const r = pg.components.getByIndex(i).clientRectangle;
+                bottom = Math.max(bottom, r.y + r.height);
+            }
+            const free = pg.height - bottom;
+            maxFree = Math.max(maxFree, free);
+            if (free < 1) full++;
+        }
+        log('Flat report: ' + rep.pages.count + ' page(s), no bands. ' + full + ' of them are full'
+            + ' (most free space on any page: ' + maxFree.toFixed(2) + '").');
+        log('Will add a SUMMARY FRONT PAGE: logo, date, company, form name, site, and the five fields.', '#9fb6c4');
+        return { mode: 'page', rep };
     }
 
     async function run() {
@@ -295,19 +437,29 @@
             const formId = formIdFromUrl();
             if (!formId) { log('Could not read the form id from the URL.', '#ff6b6b'); return; }
 
-            setStatus('adding…');
-            addBand(ctx.rep, ctx.band, (m) => log('  ' + m, '#9fb6c4'));
-            const fresh = refreshDesigner(ctx.rep);
+            const name = (document.title || 'report').replace(/ - Designer$/, '');
+            let fresh;
+            if (ctx.mode === 'band') {
+                setStatus('appending to the summary band…');
+                addBand(ctx.rep, ctx.band, (m) => log('  ' + m, '#9fb6c4'), ctx.rep.pages.getByIndex(0));
+                fresh = refreshDesigner(ctx.rep);
+                const { band } = summaryBand(fresh);
+                log('Band now has ' + band.components.count + ' component(s), height '
+                    + Number(band.height).toFixed(2) + '.', '#0fa');
+            } else {
+                setStatus('building the summary front page…');
+                const json = buildSummaryPage(ctx.rep, name, (m) => log('  ' + m, '#9fb6c4'));
+                const S = window.Stimulsoft;
+                fresh = new S.Report.StiReport();
+                fresh.load(JSON.stringify(json));
+                getDesigner().report = fresh;
+                log('Report now has ' + fresh.pages.count + ' page(s); page 1 is "'
+                    + fresh.pages.getByIndex(0).name + '".', '#0fa');
+            }
 
             setStatus('saving…');
-            await saveReport(fresh, formId, (document.title || 'report').replace(/ - Designer$/, ''));
+            await saveReport(fresh, formId, name);
             log('Saved. Reload the page to confirm it stuck.', '#0fa');
-
-            // Verify from the model we just serialised, then tell the user to reload —
-            // the only real proof is a fresh load, so don't claim more than that.
-            const { band } = summaryBand(fresh);
-            log('Band now has ' + band.components.count + ' component(s), height '
-                + Number(band.height).toFixed(2) + '.', '#0fa');
             setStatus('done');
         } catch (e) {
             log('Failed: ' + e.message, '#ff6b6b');
