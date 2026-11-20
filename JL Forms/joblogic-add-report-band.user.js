@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Joblogic - Add Report Summary Band
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.1
 // @description  Appends the Remedials + H&S fields to a custom form's Report Designer summary band, below whatever is already there, then saves. The report layout only exists inside the Stimulsoft designer at runtime — there is no endpoint that hands it over — so this runs ON the designer page, one form at a time. It computes placement from the band's existing contents rather than a fixed offset, because every form's layout differs: a fixed offset lands on top of the signature block. The report is NOT version-locked: a deployed, locked form saves fine (verified 2026-11-20), so this can run as a separate pass after the surveys are deployed and the jobs repointed. Reports come in two shapes: banded ones get the fields appended to the summary band; flat hand-laid-out ones (no bands at all, every page full) get a new SUMMARY FRONT PAGE carrying the logo, date, company, form name, site and the five fields.
 // @match        https://go.joblogic.com/Form/Designer/*
 // @grant        none
@@ -277,6 +277,12 @@
             t.ClientRectangle = rect(x, y, w, h);
             t.Text = { Value: value };
             delete t.TextFormat;            // our values are plain text, not dates
+            // NEVER set Margins on a component. Adding `Margins: "0.07,0,0.07,0"` to pad the
+            // text off the border made Stimulsoft's loader DROP every component carrying it —
+            // silently, 18 components down to 7, with SaveFormDesigner still reporting
+            // {success:true}. The only signal was the preview coming back short. If padding is
+            // ever wanted, move the ClientRectangle instead.
+            delete t.Margins;
             t.Type = 'Expression';
             t.CanGrow = true; t.WordWrap = true;
             if (opts && opts.align) t.HorAlignment = opts.align;
