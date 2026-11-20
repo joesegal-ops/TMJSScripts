@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Joblogic - Add Report Summary Band
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  Appends the Remedials + H&S fields to a custom form's Report Designer summary band, below whatever is already there, then saves. The report layout only exists inside the Stimulsoft designer at runtime — there is no endpoint that hands it over — so this runs ON the designer page, one form at a time. It computes placement from the band's existing contents rather than a fixed offset, because every form's layout differs: a fixed offset lands on top of the signature block. Only works on an UNLOCKED (undeployed) draft, so add the report band before deploying, not after.
+// @version      1.0.1
+// @description  Appends the Remedials + H&S fields to a custom form's Report Designer summary band, below whatever is already there, then saves. The report layout only exists inside the Stimulsoft designer at runtime — there is no endpoint that hands it over — so this runs ON the designer page, one form at a time. It computes placement from the band's existing contents rather than a fixed offset, because every form's layout differs: a fixed offset lands on top of the signature block. The report is NOT version-locked: a deployed, locked form saves fine (verified 2026-11-20), so this can run as a separate pass after the surveys are deployed and the jobs repointed.
 // @match        https://go.joblogic.com/Form/Designer/*
 // @grant        none
 // @run-at       document-idle
@@ -103,7 +103,7 @@
     const SCRIPT_ID = 'add-report-band';
     const SCRIPT_LABEL = '📄 Add Report Band';
     const SCRIPT_COLOR = '#5a4a8c';
-    const SCRIPT_DESC = 'Adds the Remedials + H&S fields to this form’s Report Designer summary band, placed below whatever is already in it. Open the Report Designer first. Only works on an undeployed draft.';
+    const SCRIPT_DESC = 'Adds the Remedials + H&S fields to this form’s Report Designer summary band, placed below whatever is already in it. Open the Report Designer first. Works on deployed forms — only the survey is version-locked.';
 
     // The five fields, and where each one reads from. Joblogic builds the report dictionary
     // from the form definition, so these exist as soon as the survey side is saved:
@@ -339,7 +339,7 @@
         blurb.style.cssText = 'color:#9fb6c4;margin-bottom:8px;line-height:1.5;';
         blurb.textContent = 'Open the Report Designer tab first. Inspect says what it would do; '
             + 'Add appends the five fields below the band’s existing content and saves. '
-            + 'Works only on an undeployed draft — add the band before deploying.';
+            + 'Works on deployed forms too — the report is not version-locked.';
 
         statusLine = document.createElement('div');
         statusLine.style.cssText = 'color:#0fa;margin-bottom:8px;';
